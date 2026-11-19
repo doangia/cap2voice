@@ -11,11 +11,17 @@ __pycache__/
 .venv/
 venv/
 *.egg-info/
+.cache/
+.coverage
+htmlcov/
 
 # Windows
 Thumbs.db
 Desktop.ini
 $RECYCLE.BIN/
+
+# macOS
+.DS_Store
 
 # Editors
 .vscode/
@@ -33,3 +39,9 @@ logs/
 **/mmmojo*.dll
 **/WeChatOCR*
 **/Weixin/
+
+# Vietphrase dictionaries — GPL-3.0 data from the upstream userscript repo
+# (duongden/script-vietphrase-translator). NOT bundled with this repo:
+# download separately, see server/vietphrase/README.md.
+server/vietphrase/data/
+server/vietphrase/.cache/
