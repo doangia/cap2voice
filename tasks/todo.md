@@ -42,14 +42,14 @@
 **Description:** Implement `WeChatOcr::new(&Path, &Path)`, `wait_connection(Duration)`, and `ocr_file(&Path, Duration)` in `crates/wcocr-rs/src/ocr.rs` using `Condvar::wait_timeout_while` so hung OCR workers fail fast with `OcrError::RequestTimeout` instead of deadlocking, and verify direct Rust OCR against the local WeChat 4.x installation on Danh's PC.
 
 **Done means (Acceptance criteria):**
-- [ ] `WeChatOcr` returns `Err(OcrError::InvalidPath)` when `wxocr.dll` or Weixin directory is missing (`AC-OCR-3`).
-- [ ] Unit test simulating an unresponsive task slot verifies `Err(OcrError::RequestTimeout)` returns within `timeout + 100 ms` (`AC-OCR-4`).
-- [ ] `#[ignore]` real-PC integration test recognizes Chinese lines from `test-zh-custom.png` via local Weixin `4.0.2.28` + plugin `8022` with `errcode == 0` (`AC-OCR-1`, `AC-OCR-2`).
+- [x] `WeChatOcr` returns `Err(OcrError::InvalidPath)` when `wxocr.dll` or Weixin directory is missing (`AC-OCR-3`).
+- [x] Unit test simulating an unresponsive task slot verifies `Err(OcrError::RequestTimeout)` returns within `timeout + 100 ms` (`AC-OCR-4`).
+- [x] `#[ignore]` real-PC integration test recognizes Chinese lines from `test-zh-custom.png` via local Weixin `4.0.2.28` + plugin `8022` with `errcode == 0` (`AC-OCR-1`, `AC-OCR-2`).
 
 **Verification:**
-- [ ] Automated tests pass: `cargo test -p wcocr-rs`
-- [ ] Build & lint pass: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] Real PC check: Run `cargo test -p wcocr-rs -- --ignored --nocapture` with `WXOCR=%APPDATA%\Tencent\xwechat\XPlugin\plugins\WeChatOcr\8022\extracted\wxocr.dll` and `WXDIR=C:\Program Files\Tencent\Weixin\4.0.2.28`; paste recognized Chinese text blocks and elapsed OCR ms into the test log (also note whether `pic_data` in-memory works or stays deferred to temp file).
+- [x] Automated tests pass: `cargo test -p wcocr-rs`
+- [x] Build & lint pass: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings`
+- [x] Real PC check: Run `cargo test -p wcocr-rs -- --ignored --nocapture` with `WXOCR=%APPDATA%\Tencent\xwechat\XPlugin\plugins\WeChatOcr\8022\extracted\wxocr.dll` and `WXDIR=C:\Program Files\Tencent\Weixin\4.0.2.28`; paste recognized Chinese text blocks and elapsed OCR ms into the test log (also note whether `pic_data` in-memory works or stays deferred to temp file).
 
 **Dependencies:** Task 1
 

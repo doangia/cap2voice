@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 pub mod mojo;
+pub mod ocr;
 pub mod proto;
+
+pub use ocr::{CharDetail, OcrResult, TextBlock, WeChatOcr};
 
 /// Typed errors returned by the `wcocr-rs` OCR wrapper.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
