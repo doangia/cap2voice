@@ -7,11 +7,14 @@ description = "Windows desktop subtitle OCR, translation, and Vietnamese TTS ove
 
 [dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 toml = "0.8"
 wcocr-rs = { path = "../wcocr-rs" }
 xcap = "0.9.10"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Registry"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Registry", "Win32_System_Threading"] }

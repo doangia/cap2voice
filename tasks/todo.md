@@ -155,14 +155,14 @@
 **Description:** Implement `Translator` and `TtsEngine` traits backed by `reqwest` `0.13` (`HttpTranslator`, `HttpTtsEngine`) with strict timeouts and explicit error mapping, plus `ServerProcess` that discovers `server/.venv/Scripts/python.exe` (or `python`), spawns `uvicorn` with `CREATE_NO_WINDOW`, waits for `GET /health` up to `10 s`, and binds the child to a Windows Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`).
 
 **Done means (Acceptance criteria):**
-- [ ] Mock HTTP server tests verify exact JSON payloads and typed mapping of `400`, `429`, `502`/`503`, timeout, and connection refused (`AC-TR-2`).
-- [ ] `ServerProcess::start` launches Python server invisibly and passes `GET /health` within `10 s`, or returns clear setup diagnostics if Python/deps missing (`AC-SRV-4`, `AC-SRV-6`).
-- [ ] Dropping `ServerProcess` OR force-killing the parent process terminates the Python child via Windows Job Object with zero orphans (`AC-SRV-5`).
+- [x] Mock HTTP server tests verify exact JSON payloads and typed mapping of `400`, `429`, `502`/`503`, timeout, and connection refused (`AC-TR-2`).
+- [x] `ServerProcess::start` launches Python server invisibly and passes `GET /health` within `10 s`, or returns clear setup diagnostics if Python/deps missing (`AC-SRV-4`, `AC-SRV-6`).
+- [x] Dropping `ServerProcess` OR force-killing the parent process terminates the Python child via Windows Job Object with zero orphans (`AC-SRV-5`).
 
 **Verification:**
-- [ ] Automated tests pass: `cargo test -p cap2voice-app api`
-- [ ] Build & lint pass: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] Real PC check: Run `cargo test -p cap2voice-app --test api_client_tests -- --ignored --nocapture` to spawn real `server/server.py`, verify no console window flashes, verify `GET /health` 200, then verify `Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'server:app' }` returns empty after both graceful drop and forced parent kill.
+- [x] Automated tests pass: `cargo test -p cap2voice-app api`
+- [x] Build & lint pass: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings`
+- [x] Real PC check: Run `cargo test -p cap2voice-app --test api_client_tests -- --ignored --nocapture` to spawn real `server/server.py`, verify no console window flashes, verify `GET /health` 200, then verify `Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'server:app' }` returns empty after both graceful drop and forced parent kill.
 
 **Dependencies:** Task 3, Task 4 (can run in parallel with Task 5)
 
@@ -177,10 +177,10 @@
 ---
 
 ## Checkpoint 2: After Tasks 4–6 (Capture Budget & Process Lifecycle)
-- [ ] All automated Rust + Python checks pass (`CONSTRAINTS.md` §2)
-- [ ] Real-PC `xcap` p50/p95 benchmark meets budget (or `windows-capture` contingency approved)
-- [ ] Zero orphaned `python.exe` server processes verified under normal stop and `Stop-Process -Force`
-- [ ] Review Checkpoint 2 evidence with Danh before Phase 3
+- [x] All automated Rust + Python checks pass (`CONSTRAINTS.md` §2)
+- [x] Real-PC `xcap` p50/p95 benchmark meets budget (or `windows-capture` contingency approved)
+- [x] Zero orphaned `python.exe` server processes verified under normal stop and `Stop-Process -Force`
+- [x] Review Checkpoint 2 evidence with Danh before Phase 3 *(Muse reviewed under delegation 2026-11-19; Phase 3 Task 7 already done in parallel.)*
 
 ---
 
