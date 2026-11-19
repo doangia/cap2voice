@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/wcocr-rs"]
+members = ["crates/wcocr-rs", "crates/cap2voice-app"]
 resolver = "2"
 
 [workspace.package]

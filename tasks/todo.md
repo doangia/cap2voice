@@ -102,14 +102,14 @@
 **Description:** Add `crates/cap2voice-app` to the Cargo workspace with typed `AppConfig` covering all 5 Settings sections, atomic temp-file + rename persistence to `%APPDATA%\cap2voice\config.toml`, corrupt-file backup (`config.toml.bak`) with explicit error reporting, and a Windows `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\cap2voice` autostart helper.
 
 **Done means (Acceptance criteria):**
-- [ ] `AppConfig` serializes/deserializes cleanly via TOML with exact defaults from `docs/spec.md` (`10 fps`, `vi-VN-NamMinhNeural`, volume `0.75`, font `18 px`, opacity `0.85`, dedupe `0.93`, pixel-diff `0.02`, port `18765`, close-to-tray `true`, autostart `false`, default hotkeys `Ctrl+Alt+S/R/H/M`) (`AC-SET-3`).
-- [ ] Corrupt TOML triggers typed `ConfigLoadWarning`, copies broken file to `config.toml.bak`, and never silently destroys user data (`AC-SET-6`).
-- [ ] Windows autostart helper writes and deletes `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\cap2voice` cleanly (`AC-SET-5`).
+- [x] `AppConfig` serializes/deserializes cleanly via TOML with exact defaults from `docs/spec.md` (`10 fps`, `vi-VN-NamMinhNeural`, volume `0.75`, font `18 px`, opacity `0.85`, dedupe `0.93`, pixel-diff `0.02`, port `18765`, close-to-tray `true`, autostart `false`, default hotkeys `Ctrl+Alt+S/R/H/M`) (`AC-SET-3`).
+- [x] Corrupt TOML triggers typed `ConfigLoadWarning`, copies broken file to `config.toml.bak`, and never silently destroys user data (`AC-SET-6`).
+- [x] Windows autostart helper writes and deletes `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\cap2voice` cleanly (`AC-SET-5`).
 
 **Verification:**
-- [ ] Automated tests pass: `cargo test -p cap2voice-app config`
-- [ ] Build & lint pass: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] Real PC check: Run ignored Windows registry test on Danh's PC verifying `Get-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run` adds then removes `cap2voice` without requiring admin/UAC, and confirm atomic write + `.bak` creation in a temp `%APPDATA%` path.
+- [x] Automated tests pass: `cargo test -p cap2voice-app config`
+- [x] Build & lint pass: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings`
+- [x] Real PC check: Run ignored Windows registry test on Danh's PC verifying `Get-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run` adds then removes `cap2voice` without requiring admin/UAC, and confirm atomic write + `.bak` creation in a temp `%APPDATA%` path.
 
 **Dependencies:** Task 1
 
