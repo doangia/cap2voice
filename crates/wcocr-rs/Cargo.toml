@@ -1,0 +1,16 @@
+[package]
+name = "wcocr-rs"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Internal Rust library crate wrapping WeChat 4.x OCR via mmmojo IPC"
+
+[lib]
+name = "wcocr_rs"
+crate-type = ["rlib"]
+
+[dependencies]
+libloading = "0.8"
+prost = "0.13"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
