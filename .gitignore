@@ -1,0 +1,33 @@
+# Rust
+/target/
+**/target/
+*.pdb
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Windows
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Editors
+.vscode/
+.idea/
+
+# App runtime outputs — never commit
+*.mp3
+*.wav
+logs/
+*.log
+.env
+
+# WeChat OCR engine — personal use only, loaded from the local Weixin
+# install at runtime. NEVER commit engine binaries.
+**/mmmojo*.dll
+**/WeChatOCR*
+**/Weixin/
