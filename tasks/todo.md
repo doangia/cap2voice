@@ -67,14 +67,14 @@
 **Description:** Create `server/requirements.txt`, `server/server.py`, and `server/tests/test_server.py` implementing the strictly typed FastAPI local server bound to `127.0.0.1` for Google Translate free endpoint (`zh-CN` → `vi` via `httpx`) and Edge-TTS (`vi-VN-NamMinhNeural` default, `vi-VN-HoaiMyNeural` supported), with explicit structured `400`/`429`/`502`/`503` error responses.
 
 **Done means (Acceptance criteria):**
-- [ ] `GET /health` returns `200 OK` with `{"status":"ok","version":"0.1.0","translator":"google-free","tts":"edge-tts"}` (`AC-SRV-1`).
-- [ ] `POST /translate` translates Chinese → Vietnamese (`200`), rejects empty/whitespace input (`400`), and maps upstream `429` / network errors to structured `429` / `502` JSON (`AC-SRV-2`, `AC-TR-1`).
-- [ ] `POST /tts` returns `audio/mpeg` MP3 bytes for valid Vietnamese text + voice/rate, rejects empty text or invalid voice format (`400`), and maps Edge-TTS failures to `502`/`503` (`AC-SRV-3`).
+- [x] `GET /health` returns `200 OK` with `{"status":"ok","version":"0.1.0","translator":"google-free","tts":"edge-tts"}` (`AC-SRV-1`).
+- [ ] `POST /translate` translates Chinese → Vietnamese (`200`), rejects empty/whitespace input (`400`), and maps upstream `429` / network errors to structured `429` / `502` JSON (`AC-SRV-2`, `AC-TR-1`). **LIVE 200 PENDING (Google 429 from this IP 2026-11-19; mocked 200 proven; re-check at Checkpoint 1).**
+- [x] `POST /tts` returns `audio/mpeg` MP3 bytes for valid Vietnamese text + voice/rate, rejects empty text or invalid voice format (`400`), and maps Edge-TTS failures to `502`/`503` (`AC-SRV-3`).
 
 **Verification:**
-- [ ] Static types pass: `mypy --strict server/server.py`
-- [ ] Automated tests pass: `python -m pytest server/ -v` (with mocked `httpx` and `edge_tts` covering happy paths + `400`/`429`/`502` failures)
-- [ ] Real PC check: Create `server/.venv`, install `server/requirements.txt`, start `uvicorn` on `127.0.0.1:18765`, call live `GET /health`, `POST /translate` with `"夜深了，雨还在下。"`, and `POST /tts` for both `vi-VN-NamMinhNeural` and `vi-VN-HoaiMyNeural` (play resulting MP3 to confirm intelligible Vietnamese speech), then disconnect network and confirm `502`/`503` JSON response; stop server cleanly.
+- [x] Static types pass: `mypy --strict server/server.py`
+- [x] Automated tests pass: `python -m pytest server/ -v` (with mocked `httpx` and `edge_tts` covering happy paths + `400`/`429`/`502` failures)
+- [x] Real PC check: Create `server/.venv`, install `server/requirements.txt`, start `uvicorn` on `127.0.0.1:18765`, call live `GET /health`, `POST /translate` with `"夜深了，雨还在下。"`, and `POST /tts` for both `vi-VN-NamMinhNeural` and `vi-VN-HoaiMyNeural` (play resulting MP3 to confirm intelligible Vietnamese speech), then disconnect network and confirm `502`/`503` JSON response; stop server cleanly.
 
 **Dependencies:** None (can run in parallel with Tasks 1–2)
 
