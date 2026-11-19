@@ -129,14 +129,14 @@
 **Description:** Implement `FrameCapturer` trait, DPI/monitor-aware `CaptureRegion` validation, `XcapCapturer` (`xcap` 0.9.10), and `PixelDiffGate` (grayscale downsampled pixel-change ratio with first-frame bypass), plus a real-PC 100-frame benchmark proving whether `xcap` meets the `<= 50 ms` p95 budget or requires the `windows-capture` `2.0.1` fallback.
 
 **Done means (Acceptance criteria):**
-- [ ] Unit tests prove `PixelDiffGate` bypasses on frame 1, skips `>= 99%` identical static frames (`AC-CAP-4`), and triggers immediately on subtitle pixel change (`AC-CAP-5`).
-- [ ] Disconnected monitor or out-of-bounds region returns explicit `CaptureError::MonitorUnavailable` / `OutOfBounds` without panicking (`AC-CAP-7`).
-- [ ] Real-PC 100-frame benchmark logs p50/p95 capture latency (`<= 30 ms` median / `<= 50 ms` p95 target — `AC-CAP-6`) and saves a verification PNG crop matching physical coordinates (`AC-CAP-3`).
+- [x] Unit tests prove `PixelDiffGate` bypasses on frame 1, skips `>= 99%` identical static frames (`AC-CAP-4`), and triggers immediately on subtitle pixel change (`AC-CAP-5`).
+- [x] Disconnected monitor or out-of-bounds region returns explicit `CaptureError::MonitorUnavailable` / `OutOfBounds` without panicking (`AC-CAP-7`).
+- [x] Real-PC 100-frame benchmark logs p50/p95 capture latency (`<= 30 ms` median / `<= 50 ms` p95 target — `AC-CAP-6`) and saves a verification PNG crop matching physical coordinates (`AC-CAP-3`).
 
 **Verification:**
-- [ ] Automated tests pass: `cargo test -p cap2voice-app capture`
-- [ ] Build & lint pass: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] Real PC check (FAIL-FAST GATE): Run `cargo test -p cap2voice-app --test capture_bench -- --ignored --nocapture` on Danh's display (including scaled DPI check); inspect saved crop PNG and record p50/p95 ms in test log. If p95 > `50 ms`, stop and ask Danh to approve switching `FrameCapturer` to `windows-capture` `2.0.1`.
+- [x] Automated tests pass: `cargo test -p cap2voice-app capture`
+- [x] Build & lint pass: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings`
+- [x] Real PC check (FAIL-FAST GATE): Run `cargo test -p cap2voice-app --test capture_bench -- --ignored --nocapture` on Danh's display (including scaled DPI check); inspect saved crop PNG and record p50/p95 ms in test log. If p95 > `50 ms`, stop and ask Danh to approve switching `FrameCapturer` to `windows-capture` `2.0.1`.
 
 **Dependencies:** Task 4
 

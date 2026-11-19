@@ -6,9 +6,11 @@ license.workspace = true
 description = "Windows desktop subtitle OCR, translation, and Vietnamese TTS overlay"
 
 [dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 toml = "0.8"
+xcap = "0.9.10"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Registry"] }
