@@ -191,14 +191,14 @@
 **Description:** Wrap `wcocr-rs` behind `OcrEngine` using reused `%TEMP%\cap2voice\frame.png`, auto-detect Weixin 4.x and `WeChatOcr` plugin paths with clear Vietnamese errors on missing install, sort `TextBlock`s top-to-bottom / left-to-right, filter to CJK + digits + punctuation (returning `None` on zero CJK chars), and implement `TextDeduplicator` with normalized Levenshtein (`>= 0.93`) plus 5-frame blank reset.
 
 **Done means (Acceptance criteria):**
-- [ ] Path auto-discovery finds latest `wxocr.dll` and Weixin 4.x folder, respects Settings overrides, and returns explicit error when missing (`AC-OCR-3`).
-- [ ] Unit tests verify top-to-bottom/left-to-right line sorting, CJK+digit retention with Latin noise removal, and `None` when zero CJK ideographs exist (`AC-OCR-5`).
-- [ ] Unit tests verify fuzzy deduplicator suppresses similarity `>= 0.93`, emits `< 0.93`, and resets memory after 5 consecutive blank/non-CJK frames (`AC-OCR-6`).
+- [x] Path auto-discovery finds latest `wxocr.dll` and Weixin 4.x folder, respects Settings overrides, and returns explicit error when missing (`AC-OCR-3`).
+- [x] Unit tests verify top-to-bottom/left-to-right line sorting, CJK+digit retention with Latin noise removal, and `None` when zero CJK ideographs exist (`AC-OCR-5`).
+- [x] Unit tests verify fuzzy deduplicator suppresses similarity `>= 0.93`, emits `< 0.93`, and resets memory after 5 consecutive blank/non-CJK frames (`AC-OCR-6`).
 
 **Verification:**
-- [ ] Automated tests pass: `cargo test -p cap2voice-app ocr`
-- [ ] Build & lint pass: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] Real PC check: Run `cargo test -p cap2voice-app --test ocr_filter_tests -- --ignored --nocapture` confirming auto-discovery resolves `C:\Program Files\Tencent\Weixin\4.0.2.28` and plugin `8022` `wxocr.dll` and extracts filtered Chinese lines from real fixture subtitle image.
+- [x] Automated tests pass: `cargo test -p cap2voice-app ocr`
+- [x] Build & lint pass: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings`
+- [x] Real PC check: Run `cargo test -p cap2voice-app --test ocr_filter_tests -- --ignored --nocapture` confirming auto-discovery resolves `C:\Program Files\Tencent\Weixin\4.0.2.28` and plugin `8022` `wxocr.dll` and extracts filtered Chinese lines from real fixture subtitle image.
 
 **Dependencies:** Task 2, Task 4
 

@@ -10,6 +10,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 toml = "0.8"
+wcocr-rs = { path = "../wcocr-rs" }
 xcap = "0.9.10"
 
 [target.'cfg(windows)'.dependencies]
