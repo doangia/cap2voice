@@ -390,15 +390,24 @@
 **Description:** Add the Windows notification area tray icon (`tray-icon` + `muda` menu) with exact 5 Vietnamese context-menu items (`Hiện cửa sổ`, `Bắt đầu dịch`, `Dừng`, `Cài đặt`, `Thoát`), intercept `CloseRequested` (`X`) to hide the overlay while keeping pipeline + TTS active in background, destroy tray icon cleanly on `Thoát`, and wire configurable global hotkeys (`Ctrl+Alt+S/R/H/M`) via `global-hotkey`.
 
 **Done means (Acceptance criteria):**
-- [ ] Tray icon appears on launch with right-click menu containing exact 5 items: `Hiện cửa sổ`, `Bắt đầu dịch`, `Dừng`, `Cài đặt`, `Thoát` (`AC-TRAY-1`).
+- [x] Tray icon appears on launch with right-click menu containing exact 5 items: `Hiện cửa sổ`, `Bắt đầu dịch`, `Dừng`, `Cài đặt`, `Thoát` (`AC-TRAY-1`).
 - [ ] With close-to-tray enabled, clicking `X` hides overlay while OCR, translation, TTS playback, and subtitle logging continue uninterrupted; `Hiện cửa sổ` / tray click restores overlay showing latest line (`AC-TRAY-2`, `AC-TRAY-3`, `AC-TRAY-4`).
 - [ ] `Thoát` stops pipeline, kills Python server (0 orphans), removes tray icon with zero ghost icon, and exits `0` (`AC-TRAY-5`, `AC-SRV-5`).
 - [ ] Global hotkeys trigger Start/Stop, Select Region, Show/Hide, and Mute even when Chrome or VLC has foreground focus (`AC-SET-7`).
 
 **Verification:**
-- [ ] Automated tests pass: `cargo test -p cap2voice-app` (hotkey parser & close-to-tray state transitions)
-- [ ] Build & lint pass: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo build --release`
+- [x] Automated tests pass: `cargo test -p cap2voice-app` (hotkey parser & close-to-tray state transitions)
+- [x] Build & lint pass: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo build --release`
 - [ ] Real PC check: Screenshot right-click tray menu; start live video translation → click `X` → confirm overlay hides while Vietnamese TTS keeps speaking and log grows → trigger `Ctrl+Alt+M` & `Ctrl+Alt+S` while Chrome is focused → restore via `Hiện cửa sổ` → click `Thoát` and verify zero ghost tray icon and zero `python.exe` server processes.
+**Ghi chú kiểm chứng 2026-11-20 22:10–22:36 (Muse tự làm trực tiếp, không qua agent — t10 hết quota):**
+- Code: `crates/cap2voice-app/src/ui/{icon,tray,hotkeys}.rs` mới + `mod.rs` tích hợp + `tray-icon 0.20.1` / `global-hotkey 0.6.4` / `muda 0.16.1` (resolve từ crates.io). Icon khay vẽ bằng code (32x32 RGBA: nền #1A56DB, vạch trắng + vạch xanh #4ADE80), không file asset.
+- fmt/clippy/test exit 0 hết; tổng **147 test pass** (130 sau Task 12 + 17 mới: icon 5, tray 5, hotkey 7), 11 ignored. Release exe 11.920.384 byte (+2,9% so với Task 12, trong ngưỡng +15%).
+- 2 test ignored chạy bằng `hc exec` (desktop) đều PASS: tạo tray icon + set_running, đăng ký 4 hotkey. Chạy qua SSH FAIL giả (lỗi "requires an interactive window station" — SSH không có desktop; bài học cũ, không phải lỗi code).
+- Live GUI (màn hình thật 1920x1080): menu khay chuột phải hiện đúng 5 mục theo thứ tự, `Dừng` mờ khi idle (ảnh `~/workspace/cap2voice-task13-review/tray-menu.png`). Icon nằm trong menu ^ (overflow), không hiện trực tiếp trên thanh taskbar (Windows 11 mặc định).
+- **CHƯA nghiệm thu live (Danh chọn "để lại sau" lúc 22:39):** bấm X ẩn xuống khay khi đang dịch, hotkey Ctrl+Alt+H/S/M với Chrome foreground, `Hiện cửa sổ` khôi phục, `Thoát` sạch (ghost icon + orphan python). Cú bấm `Bắt đầu dịch` từ menu khay lúc 22:29 chưa xác nhận được (log không tạo, frame.png cũ 21:49) — lúc đó Danh đang dùng máy, có thể click trượt hoặc bị can thiệp.
+- **Câu hỏi mở để điều tra khi làm tiếp:** cửa sổ overlay của app lúc 22:32 liệt kê được 1 cửa sổ `title=''` visible=False rect=26,26,1466,779 (không khớp overlay 620x178, không có tiêu đề `cap2voice`) — chưa rõ là cửa sổ chính eframe hay viewport nào; `FindWindow("cap2voice")` không tìm thấy, `MainWindowHandle` = 0. Cần kiểm tra lại khi làm tiếp (có thể do Danh bấm X trước đó, hoặc eframe/winit đặt title khác).
+- Sự cố hạ tầng trong lúc test: VM restart ~22:30 + Herdr rớt 2 lần (22:27, 22:39) làm chết cả ffplay lẫn app đang chạy nền; lần cuối app chết thì không còn process python orphan (Job Object dọn đúng).
+
 
 **Dependencies:** Task 10, Task 12
 

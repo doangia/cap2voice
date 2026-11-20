@@ -8,7 +8,9 @@ description = "Windows desktop subtitle OCR, translation, and Vietnamese TTS ove
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 eframe = { version = "0.35", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
+global-hotkey = "0.6"
 image = { version = "0.25", default-features = false, features = ["png"] }
+muda = "0.16"
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
 rodio = { version = "0.23", default-features = false, features = ["playback", "symphonia-mp3"] }
 serde = { version = "1", features = ["derive"] }
@@ -16,6 +18,7 @@ serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 toml = "0.8"
+tray-icon = "0.20"
 wcocr-rs = { path = "../wcocr-rs" }
 xcap = "0.9.10"
 

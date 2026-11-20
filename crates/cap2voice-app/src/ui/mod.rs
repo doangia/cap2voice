@@ -1,9 +1,12 @@
 //! Desktop UI modules (`eframe` 0.35 shell, composite fonts, floating overlay).
 
 pub mod fonts;
+pub mod hotkeys;
+pub mod icon;
 pub mod overlay;
 pub mod region;
 pub mod settings;
+pub mod tray;
 
 use crate::api::{
     check_health, discover_server_dir, HealthError, HealthStatus, HttpTranslator, HttpTtsEngine,
@@ -23,6 +26,8 @@ use crate::pipeline::{
     PipelineStatus, SubtitleLogger,
 };
 use eframe::egui;
+use global_hotkey::GlobalHotKeyEvent;
+use hotkeys::{HotkeyAction, HotkeyManager};
 use overlay::{
     apply_exclude_from_capture_hwnd, overlay_overlaps_region, render_overlay_ui,
     DisplayAffinityError, OverlayCommand, OverlayState, PositionTracker, ServerUiStatus,
@@ -40,6 +45,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
+use tray::{should_cancel_close, tray_action_for_menu_event, TrayIconHandle, TrayMenuAction};
+use tray_icon::{menu::MenuEvent, TrayIconEvent};
 
 fn configured_window_level(config: &AppConfig) -> egui::WindowLevel {
     if config.display.always_on_top {
@@ -58,6 +65,7 @@ pub fn build_native_options(config: &AppConfig) -> eframe::NativeOptions {
         .with_decorations(false)
         .with_transparent(true)
         .with_resizable(true)
+        .with_visible(!config.general.start_minimized_to_tray)
         .with_window_level(configured_window_level(config));
 
     if let Some(pos) = &config.display.overlay_position {
@@ -209,6 +217,13 @@ pub struct Cap2VoiceApp {
     pipeline_handle: Option<PipelineHandle>,
     pipeline_rx: Option<watch::Receiver<PipelineSnapshot>>,
     repaint_forwarder: Option<tokio::task::JoinHandle<()>>,
+    tray: Option<TrayIconHandle>,
+    hotkeys: Option<HotkeyManager>,
+    tray_action_rx: Option<mpsc::Receiver<TrayMenuAction>>,
+    hotkey_event_rx: Option<mpsc::Receiver<GlobalHotKeyEvent>>,
+    quit_requested: bool,
+    overlay_visible: bool,
+    last_tray_running_state: Option<bool>,
 }
 
 fn spawn_server_startup(
@@ -333,6 +348,106 @@ impl Cap2VoiceApp {
         );
         let initial_outer_pos = bootstrap.config.display.overlay_position.clone();
 
+        let mut tray_startup_notices: Vec<String> = Vec::new();
+        let tray = match TrayIconHandle::new() {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                tray_startup_notices
+                    .push(format!("Không tạo được biểu tượng khay hệ thống: {err}"));
+                None
+            }
+        };
+        let hotkeys = match HotkeyManager::register_all(&bootstrap.config.hotkeys) {
+            Ok(manager) => Some(manager),
+            Err(err) => {
+                tray_startup_notices.push(format!("Không đăng ký được phím tắt: {err}"));
+                None
+            }
+        };
+        if !tray_startup_notices.is_empty() {
+            state.ui_notice = Some(tray_startup_notices.join(" "));
+        }
+
+        let (tray_action_tx, tray_action_rx) = mpsc::channel::<TrayMenuAction>();
+        let (hotkey_event_tx, hotkey_event_rx) = mpsc::channel::<GlobalHotKeyEvent>();
+        let ctx_for_threads = cc.egui_ctx.clone();
+        let mut forwarder_errors: Vec<String> = Vec::new();
+        let menu_spawn = std::thread::Builder::new()
+            .name("cap2voice-tray-menu".to_string())
+            .spawn({
+                let tx = tray_action_tx.clone();
+                let ctx_wake = ctx_for_threads.clone();
+                move || {
+                    for event in MenuEvent::receiver().iter() {
+                        if let Some(action) = tray_action_for_menu_event(&event) {
+                            if tx.send(action).is_err() {
+                                break;
+                            }
+                            ctx_wake.request_repaint();
+                        }
+                    }
+                }
+            });
+        if let Err(err) = menu_spawn {
+            forwarder_errors.push(format!("luồng menu khay hệ thống: {err}"));
+        }
+        let click_spawn = std::thread::Builder::new()
+            .name("cap2voice-tray-click".to_string())
+            .spawn({
+                let tx = tray_action_tx;
+                let ctx_wake = ctx_for_threads.clone();
+                move || {
+                    for event in TrayIconEvent::receiver().iter() {
+                        let restore = match &event {
+                            TrayIconEvent::Click {
+                                button,
+                                button_state,
+                                ..
+                            } => {
+                                *button == tray_icon::MouseButton::Left
+                                    && *button_state == tray_icon::MouseButtonState::Up
+                            }
+                            TrayIconEvent::DoubleClick { .. } => true,
+                            _ => false,
+                        };
+                        if restore {
+                            if tx.send(TrayMenuAction::ShowWindow).is_err() {
+                                break;
+                            }
+                            ctx_wake.request_repaint();
+                        }
+                    }
+                }
+            });
+        if let Err(err) = click_spawn {
+            forwarder_errors.push(format!("luồng click khay hệ thống: {err}"));
+        }
+        let hotkey_spawn = std::thread::Builder::new()
+            .name("cap2voice-hotkeys".to_string())
+            .spawn({
+                let tx = hotkey_event_tx;
+                let ctx_wake = ctx_for_threads;
+                move || {
+                    for event in GlobalHotKeyEvent::receiver().iter() {
+                        if tx.send(event).is_err() {
+                            break;
+                        }
+                        ctx_wake.request_repaint();
+                    }
+                }
+            });
+        if let Err(err) = hotkey_spawn {
+            forwarder_errors.push(format!("luồng phím tắt: {err}"));
+        }
+        if !forwarder_errors.is_empty() {
+            let detail = forwarder_errors.join("; ");
+            state.ui_notice = Some(match &state.ui_notice {
+                Some(existing) => format!("{existing} Không khởi động được {detail}."),
+                None => format!("Không khởi động được {detail}."),
+            });
+        }
+        let start_minimized_to_tray = bootstrap.config.general.start_minimized_to_tray;
+
         Self {
             runtime,
             config_path: bootstrap.config_path,
@@ -358,10 +473,48 @@ impl Cap2VoiceApp {
             pipeline_handle: None,
             pipeline_rx: None,
             repaint_forwarder: None,
+            tray,
+            hotkeys,
+            tray_action_rx: Some(tray_action_rx),
+            hotkey_event_rx: Some(hotkey_event_rx),
+            quit_requested: false,
+            overlay_visible: !start_minimized_to_tray,
+            last_tray_running_state: None,
         }
     }
 
-    fn poll_background_channels(&mut self) {
+    fn poll_background_channels(&mut self, ctx: &egui::Context) {
+        let tray_actions: Vec<TrayMenuAction> = match &self.tray_action_rx {
+            Some(rx) => {
+                let mut actions = Vec::new();
+                while let Ok(action) = rx.try_recv() {
+                    actions.push(action);
+                }
+                actions
+            }
+            None => Vec::new(),
+        };
+        for action in tray_actions {
+            self.dispatch_tray_action(ctx, action);
+        }
+        let hotkey_actions: Vec<HotkeyAction> = match &self.hotkey_event_rx {
+            Some(rx) => {
+                let mut actions = Vec::new();
+                while let Ok(event) = rx.try_recv() {
+                    if let Some(manager) = &self.hotkeys {
+                        if let Some(action) = manager.action_for_event(&event) {
+                            actions.push(action);
+                        }
+                    }
+                }
+                actions
+            }
+            None => Vec::new(),
+        };
+        for action in hotkey_actions {
+            self.dispatch_hotkey_action(ctx, action);
+        }
+
         if let Some(rx) = &self.server_rx {
             match rx.try_recv() {
                 Ok(Ok(srv)) => {
@@ -855,6 +1008,7 @@ impl Cap2VoiceApp {
                 ctx.request_repaint();
             }
             SettingsCommand::Save(new_config) => {
+                let prev_hotkeys = self.config.hotkeys.clone();
                 let exe_res = std::env::current_exe().map_err(|err| ConfigError::Io {
                     path: PathBuf::from("cap2voice-app.exe"),
                     detail: err.to_string(),
@@ -908,6 +1062,9 @@ impl Cap2VoiceApp {
                             self.server_rx =
                                 Some(spawn_server_startup(&self.runtime, port, ctx.clone()));
                         }
+                        if prev_hotkeys != self.config.hotkeys {
+                            self.reregister_hotkeys();
+                        }
                         ctx.request_repaint();
                     }
                     Err(err_msg) => {
@@ -916,6 +1073,80 @@ impl Cap2VoiceApp {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    fn show_overlay(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        self.overlay_visible = true;
+        ctx.request_repaint();
+    }
+
+    fn hide_overlay(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        self.overlay_visible = false;
+        ctx.request_repaint();
+    }
+
+    fn dispatch_tray_action(&mut self, ctx: &egui::Context, action: TrayMenuAction) {
+        match action {
+            TrayMenuAction::ShowWindow => self.show_overlay(ctx),
+            TrayMenuAction::StartTranslation => self.handle_start_pipeline(ctx),
+            TrayMenuAction::StopTranslation => self.handle_stop_pipeline(ctx),
+            TrayMenuAction::OpenSettings => self.open_settings_window(ctx),
+            TrayMenuAction::Quit => {
+                self.quit_requested = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+    }
+
+    fn dispatch_hotkey_action(&mut self, ctx: &egui::Context, action: HotkeyAction) {
+        match action {
+            HotkeyAction::ToggleStartStop => {
+                if self.state.is_running() {
+                    self.handle_stop_pipeline(ctx);
+                } else {
+                    self.handle_start_pipeline(ctx);
+                }
+            }
+            HotkeyAction::SelectRegion => {
+                if !self.overlay_visible {
+                    self.show_overlay(ctx);
+                }
+                self.open_region_selector(ctx, RegionSelectionTarget::LiveConfig);
+            }
+            HotkeyAction::ToggleOverlay => {
+                if self.overlay_visible {
+                    self.hide_overlay(ctx);
+                } else {
+                    self.show_overlay(ctx);
+                }
+            }
+            HotkeyAction::ToggleMute => self.handle_toggle_mute(),
+        }
+    }
+
+    fn sync_tray_menu_state(&mut self) {
+        let running = self.state.is_running();
+        if self.last_tray_running_state != Some(running) {
+            self.last_tray_running_state = Some(running);
+            if let Some(tray) = &self.tray {
+                tray.set_running(running);
+            }
+        }
+    }
+
+    fn reregister_hotkeys(&mut self) {
+        match HotkeyManager::register_all(&self.config.hotkeys) {
+            Ok(manager) => {
+                self.hotkeys = Some(manager);
+            }
+            Err(err) => {
+                self.hotkeys = None;
+                self.state.ui_notice = Some(format!("Không đăng ký được phím tắt: {err}"));
             }
         }
     }
@@ -989,7 +1220,15 @@ impl eframe::App for Cap2VoiceApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        self.poll_background_channels();
+        let ctx = ui.ctx().clone();
+        if ui.input(|i| i.viewport().close_requested())
+            && should_cancel_close(self.config.general.close_to_tray, self.quit_requested)
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.hide_overlay(&ctx);
+        }
+        self.poll_background_channels(&ctx);
+        self.sync_tray_menu_state();
         self.check_wda_fallback(frame, ui);
 
         if self.region_selector.is_none() {
@@ -1008,7 +1247,6 @@ impl eframe::App for Cap2VoiceApp {
             }
         }
 
-        let ctx = ui.ctx().clone();
         if let Some(monitor) = self
             .region_selector
             .as_ref()
@@ -1088,6 +1326,8 @@ impl eframe::App for Cap2VoiceApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.tray.take();
+        self.hotkeys.take();
         if let Some(pending_pos) = self.position_tracker.take_pending() {
             self.save_overlay_position(pending_pos);
         }
