@@ -68,7 +68,7 @@
 
 **Done means (Acceptance criteria):**
 - [x] `GET /health` returns `200 OK` with `{"status":"ok","version":"0.1.0","translator":"google-free","tts":"edge-tts"}` (`AC-SRV-1`).
-- [ ] `POST /translate` translates Chinese → Vietnamese (`200`), rejects empty/whitespace input (`400`), and maps upstream `429` / network errors to structured `429` / `502` JSON (`AC-SRV-2`, `AC-TR-1`). **LIVE 200 PENDING (Google 429 from this IP 2026-11-19; mocked 200 proven; re-check at Checkpoint 1).**
+- [ ] `POST /translate` translates Chinese → Vietnamese (`200`), rejects empty/whitespace input (`400`), and maps upstream `429` / network errors to structured `429` / `502` JSON (`AC-SRV-2`, `AC-TR-1`). **LIVE 200 PENDING (Google 429 from this IP 2026-11-19; mocked 200 proven; re-checked 2026-11-20 12:10, still 429 — rate limit persists >12h; re-check at Checkpoint 1).**
 - [x] `POST /tts` returns `audio/mpeg` MP3 bytes for valid Vietnamese text + voice/rate, rejects empty text or invalid voice format (`400`), and maps Edge-TTS failures to `502`/`503` (`AC-SRV-3`).
 
 **Verification:**

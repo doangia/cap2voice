@@ -29,8 +29,6 @@ jobs:
 
   python:
     runs-on: windows-latest
-    # The server lands later; skip until its requirements exist.
-    if: hashFiles('server/requirements.txt') != ''
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
