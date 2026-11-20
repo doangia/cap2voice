@@ -216,14 +216,14 @@
 **Description:** Implement pure-logic `BoundedAudioQueue` (max 3 pending items; drops oldest unplayed item when full without cutting off active speech) and `AudioPlayer` on a dedicated `rodio` `0.23` worker thread with real-time gain (`0.0..=1.0`, default `0.75`), instant `stop_and_clear()`, and explicit audio-device error reporting.
 
 **Done means (Acceptance criteria):**
-- [ ] Unit tests prove FIFO ordering and bounded capacity (pushing 5 items while 1 plays keeps only the newest 3 pending items, dropping oldest unplayed — `AC-TTS-3`).
-- [ ] `set_volume` scales sink loudness linearly (`0%`–`100%`, default `75%` — `AC-TTS-5`), and `stop_and_clear` halts active audio within `200 ms` and empties queue (`AC-TTS-4`).
-- [ ] Audio device or MP3 decode failures return typed `AudioError` surfaced to UI status rather than panicking (`AC-TTS-7`).
+- [x] Unit tests prove FIFO ordering and bounded capacity (pushing 5 items while 1 plays keeps only the newest 3 pending items, dropping oldest unplayed — `AC-TTS-3`).
+- [x] `set_volume` scales sink loudness linearly (`0%`–`100%`, default `75%` — `AC-TTS-5`), and `stop_and_clear` halts active audio within `200 ms` and empties queue (`AC-TTS-4`).
+- [x] Audio device or MP3 decode failures return typed `AudioError` surfaced to UI status rather than panicking (`AC-TTS-7`).
 
 **Verification:**
-- [ ] Automated tests pass: `cargo test -p cap2voice-app audio`
-- [ ] Build & lint pass: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] Real PC check: Run `cargo test -p cap2voice-app --test audio_queue_tests -- --ignored --nocapture` playing two real Vietnamese MP3 clips sequentially through PC speakers verifying zero overlap, audible volume change, and immediate halt on `stop_and_clear()` (`AC-TTS-1`, `AC-TTS-4`).
+- [x] Automated tests pass: `cargo test -p cap2voice-app audio`
+- [x] Build & lint pass: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings`
+- [x] Real PC check: Run `cargo test -p cap2voice-app --test audio_queue_tests -- --ignored --nocapture` playing two real Vietnamese MP3 clips sequentially through PC speakers verifying zero overlap, audible volume change, and immediate halt on `stop_and_clear()` (`AC-TTS-1`, `AC-TTS-4`).
 
 **Dependencies:** Task 4 (can run in parallel with Task 7)
 
