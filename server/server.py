@@ -3,22 +3,28 @@
 Exposes three strictly typed endpoints used by the Rust application:
 
 * ``GET /health``  — readiness probe managed by ``ServerProcess``.
-* ``POST /translate`` — Google Translate free endpoint (zh-CN -> vi).
+* ``POST /translate`` — offline Vietphrase dictionary translation (zh -> vi).
 * ``POST /tts`` — Edge-TTS synthesis (vi text -> MP3 bytes).
 
-Every upstream failure is mapped to a structured JSON body
-``{"error": ..., "detail": ...}``; nothing is silently swallowed. This module
-is deliberately temporary and is replaced by native Rust in V2.
+Translation runs fully offline through ``server.vietphrase`` (a port of the
+GPL-3.0 ``duongden/script-vietphrase-translator`` userscript; dictionaries are
+fetched separately, see ``server/vietphrase/README.md``). It replaced the
+Google Translate free endpoint on 2026-11-20 because Google returned HTTP 429
+from this IP for ~2 days. When the dictionaries are missing, ``/translate``
+answers 503 with the exact command that fetches them. Every upstream failure
+is mapped to a structured JSON body ``{"error": ..., "detail": ...}``; nothing
+is silently swallowed. This module is deliberately temporary and is replaced
+by native Rust in V2.
 """
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import AsyncIterator
 from typing import Protocol
 
 import aiohttp
-import httpx
 from edge_tts import Communicate
 from edge_tts.exceptions import EdgeTTSException
 from edge_tts.typing import TTSChunk
@@ -33,9 +39,6 @@ DEFAULT_PORT = 18765
 DEFAULT_VOICE = "vi-VN-NamMinhNeural"
 SUPPORTED_VOICES = frozenset({DEFAULT_VOICE, "vi-VN-HoaiMyNeural"})
 DEFAULT_RATE = "+0%"
-
-GOOGLE_TRANSLATE_URL = "https://translate.googleapis.com/translate_a/single"
-HTTP_CLIENT_TIMEOUT_SECONDS = 8.0
 
 _RATE_PATTERN = re.compile(r"[+-]\d{1,3}%")
 
@@ -64,8 +67,8 @@ def invalid_input(detail: str) -> ApiError:
     return ApiError(400, "invalid_input", detail)
 
 
-def rate_limited(detail: str) -> ApiError:
-    return ApiError(429, "rate_limited", detail)
+def translator_unavailable(detail: str) -> ApiError:
+    return ApiError(503, "translator_unavailable", detail)
 
 
 def upstream_error(detail: str, status_code: int = 502) -> ApiError:
@@ -86,70 +89,63 @@ class TtsRequest(BaseModel):
     rate: str = DEFAULT_RATE
 
 
+class Translator(Protocol):
+    """Synchronous Chinese-to-Vietnamese translator boundary."""
+
+    def translate(self, text: str) -> str: ...
+
+
 class CommunicateFactory(Protocol):
     """Callable boundary around ``edge_tts.Communicate`` for injection in tests."""
 
     def __call__(self, text: str, voice: str, *, rate: str) -> Communicate: ...
 
 
-async def get_http_client() -> AsyncIterator[httpx.AsyncClient]:
-    async with httpx.AsyncClient(timeout=HTTP_CLIENT_TIMEOUT_SECONDS) as client:
-        yield client
-
-
 def get_communicate_factory() -> CommunicateFactory:
     return Communicate
 
 
-def extract_translation(payload: object) -> str:
-    """Read the first translated segment from Google's nested list response."""
-    if not isinstance(payload, list) or not payload:
-        return ""
+def _load_vietphrase_translator() -> Translator:
+    """Load the Vietphrase dictionaries and build the translator.
 
-    first_group: object = payload[0]
-    if not isinstance(first_group, list) or not first_group:
-        return ""
+    This module is loaded two ways: as top-level ``server`` by uvicorn
+    (``--app-dir server``) and as ``server.server`` by pytest from the repo
+    root, so the package path is resolved from ``__package__`` at runtime.
+    The dictionaries live in ``server/vietphrase/data`` and are not bundled
+    with the repo (GPL-3.0 upstream data); ``load_default_dictionaries``
+    raises ``RuntimeError`` with the exact fetch command when they are
+    missing.
+    """
+    import importlib
+    from typing import cast
 
-    first_segment: object = first_group[0]
-    if not isinstance(first_segment, list) or not first_segment:
-        return ""
+    package = "server.vietphrase" if __package__ else "vietphrase"
+    module = importlib.import_module(package)
+    return cast(
+        Translator, module.VietPhraseTranslator(module.load_default_dictionaries())
+    )
 
-    translated: object = first_segment[0]
-    return translated if isinstance(translated, str) else ""
+
+_translator: Translator | None = None
+_translator_lock = asyncio.Lock()
 
 
-async def fetch_google_translation(client: httpx.AsyncClient, text: str) -> str:
-    """Call Google's free endpoint, mapping every failure mode to ``ApiError``."""
-    try:
-        response = await client.get(
-            GOOGLE_TRANSLATE_URL,
-            params={
-                "client": "gtx",
-                "sl": "zh-CN",
-                "tl": "vi",
-                "dt": "t",
-                "q": text,
-            },
-        )
-    except httpx.TimeoutException as exc:
-        raise upstream_error("translation upstream timed out") from exc
-    except httpx.RequestError as exc:
-        raise upstream_error("translation upstream unreachable") from exc
+async def get_translator() -> Translator:
+    """Return the shared offline translator, loading it once on first use.
 
-    if response.status_code == 429:
-        raise rate_limited("Google Translate rate limit reached")
-    if response.status_code != 200:
-        raise upstream_error(f"translation upstream returned HTTP {response.status_code}")
-
-    try:
-        payload: object = response.json()
-    except ValueError as exc:
-        raise upstream_error("translation upstream returned invalid JSON") from exc
-
-    translated = extract_translation(payload)
-    if not translated:
-        raise upstream_error("translation upstream returned an unexpected payload")
-    return translated
+    Dictionary loading takes ~1s, so it runs in a worker thread. When the
+    dictionaries are missing, the endpoint answers 503 instead of falling
+    back to any network translator.
+    """
+    global _translator
+    if _translator is None:
+        async with _translator_lock:
+            if _translator is None:
+                try:
+                    _translator = await asyncio.to_thread(_load_vietphrase_translator)
+                except RuntimeError as exc:
+                    raise translator_unavailable(str(exc)) from exc
+    return _translator
 
 
 def validate_rate(rate: str) -> None:
@@ -183,7 +179,7 @@ async def health() -> dict[str, str]:
     return {
         "status": "ok",
         "version": APP_VERSION,
-        "translator": "google-free",
+        "translator": "vietphrase",
         "tts": "edge-tts",
     }
 
@@ -191,12 +187,13 @@ async def health() -> dict[str, str]:
 @app.post("/translate", response_model=TranslateResponse)
 async def translate(
     req: TranslateRequest,
-    client: httpx.AsyncClient = Depends(get_http_client),
+    translator: Translator = Depends(get_translator),
 ) -> TranslateResponse:
     text = req.text.strip()
     if not text:
         raise invalid_input("text must not be empty")
-    return TranslateResponse(text=await fetch_google_translation(client, text))
+    translated = await asyncio.to_thread(translator.translate, text)
+    return TranslateResponse(text=translated)
 
 
 @app.post("/tts", response_class=Response)

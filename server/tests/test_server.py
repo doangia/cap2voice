@@ -1,8 +1,10 @@
 """Contract tests for the temporary cap2voice FastAPI server (AC-SRV-1..3).
 
-Upstream boundaries are simulated with ``httpx.MockTransport`` and a stub
-Edge-TTS ``Communicate`` factory, so the real request construction, payload
-parsing, validation, chunk filtering and error mapping still execute.
+The translator boundary is the offline Vietphrase dictionary translator,
+injected through ``get_translator`` so tests can stub it; one test exercises
+the real translator against the bundled dictionaries. The Edge-TTS boundary
+is a stub ``Communicate`` factory. The real request construction, validation,
+chunk filtering and error mapping still execute.
 """
 
 from __future__ import annotations
@@ -11,32 +13,40 @@ from collections.abc import AsyncIterator, Callable, Iterator
 
 import aiohttp
 import edge_tts
-import httpx
 import pytest
 from edge_tts.typing import TTSChunk
 from fastapi.testclient import TestClient
 
-from server.server import app, get_communicate_factory, get_http_client
+import server.server as server_module
+from server.server import app, get_communicate_factory, get_translator
 
 ZH_LINE = "夜深了，雨还在下。"
 VI_LINE = "Đêm đã khuya, mưa vẫn còn rơi."
-GOOGLE_PAYLOAD: object = [[[VI_LINE, ZH_LINE, None, None, 10]], None, "zh-CN"]
 
 
 @pytest.fixture
 def client() -> Iterator[TestClient]:
+    server_module._translator = None
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()
+    server_module._translator = None
 
 
-def override_http(handler: Callable[[httpx.Request], httpx.Response]) -> None:
-    async def fake_http_client() -> AsyncIterator[httpx.AsyncClient]:
-        transport = httpx.MockTransport(handler)
-        async with httpx.AsyncClient(transport=transport) as http_client:
-            yield http_client
+class StubTranslator:
+    """Returns a fixed Vietnamese line, like a stubbed translator."""
 
-    app.dependency_overrides[get_http_client] = fake_http_client
+    def __init__(self, text: str = VI_LINE) -> None:
+        self.text = text
+        self.seen: list[str] = []
+
+    def translate(self, text: str) -> str:
+        self.seen.append(text)
+        return self.text
+
+
+def override_translator(translator: object) -> None:
+    app.dependency_overrides[get_translator] = lambda: translator
 
 
 def override_tts(factory: Callable[..., object]) -> None:
@@ -90,10 +100,6 @@ def stub_factory() -> tuple[Callable[..., StubCommunicate], list[StubCommunicate
     return factory, created
 
 
-def google_ok(request: httpx.Request) -> httpx.Response:
-    return httpx.Response(200, json=GOOGLE_PAYLOAD)
-
-
 # --- AC-SRV-1: GET /health -------------------------------------------------
 
 
@@ -104,7 +110,7 @@ def test_health_returns_exact_schema(client: TestClient) -> None:
     assert response.json() == {
         "status": "ok",
         "version": "0.1.0",
-        "translator": "google-free",
+        "translator": "vietphrase",
         "tts": "edge-tts",
     }
 
@@ -112,31 +118,35 @@ def test_health_returns_exact_schema(client: TestClient) -> None:
 # --- AC-SRV-2: POST /translate ---------------------------------------------
 
 
-def test_translate_returns_vietnamese_and_requests_zh_to_vi(
+def test_translate_returns_vietnamese_from_translator(
     client: TestClient,
 ) -> None:
-    seen: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen.append(request)
-        return google_ok(request)
-
-    override_http(handler)
+    translator = StubTranslator()
+    override_translator(translator)
 
     response = client.post("/translate", json={"text": ZH_LINE})
 
     assert response.status_code == 200
     assert response.json() == {"text": VI_LINE}
-    assert len(seen) == 1
-    assert seen[0].url.params["sl"] == "zh-CN"
-    assert seen[0].url.params["tl"] == "vi"
-    assert seen[0].url.params["q"] == ZH_LINE
+    assert translator.seen == [ZH_LINE]
+
+
+def test_translate_uses_real_vietphrase_translator_offline(
+    client: TestClient,
+) -> None:
+    # No dependency override: loads the real dictionaries from
+    # server/vietphrase/data (fetched by CI before pytest) and translates
+    # fully offline, with no network access at all.
+    response = client.post("/translate", json={"text": ZH_LINE})
+
+    assert response.status_code == 200
+    assert response.json() == {"text": VI_LINE}
 
 
 def test_translate_rejects_whitespace_with_structured_400(
     client: TestClient,
 ) -> None:
-    override_http(google_ok)
+    override_translator(StubTranslator())
 
     response = client.post("/translate", json={"text": "   \t  "})
 
@@ -147,60 +157,27 @@ def test_translate_rejects_whitespace_with_structured_400(
     }
 
 
-def test_translate_maps_google_429_to_structured_rate_limit(
-    client: TestClient,
+def test_translate_maps_missing_dictionaries_to_503_with_fetch_command(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    override_http(lambda request: httpx.Response(429, json={"error": "quota"}))
+    def missing_dictionaries() -> object:
+        raise RuntimeError(
+            "Vietphrase dictionaries are missing from server/vietphrase/data. "
+            "They are not bundled with the repo; download them with "
+            "'python -m server.vietphrase --fetch --text \"...\"'."
+        )
+
+    monkeypatch.setattr(
+        server_module, "_load_vietphrase_translator", missing_dictionaries
+    )
 
     response = client.post("/translate", json={"text": ZH_LINE})
 
-    assert response.status_code == 429
-    assert response.json() == {
-        "error": "rate_limited",
-        "detail": "Google Translate rate limit reached",
-    }
-
-
-def test_translate_maps_network_failure_to_502(client: TestClient) -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("network down", request=request)
-
-    override_http(handler)
-
-    response = client.post("/translate", json={"text": ZH_LINE})
-
-    assert response.status_code == 502
-    assert response.json() == {
-        "error": "upstream_error",
-        "detail": "translation upstream unreachable",
-    }
-
-
-def test_translate_maps_timeout_to_502(client: TestClient) -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        raise httpx.ReadTimeout("too slow", request=request)
-
-    override_http(handler)
-
-    response = client.post("/translate", json={"text": ZH_LINE})
-
-    assert response.status_code == 502
-    assert response.json() == {
-        "error": "upstream_error",
-        "detail": "translation upstream timed out",
-    }
-
-
-def test_translate_maps_unexpected_payload_to_502(client: TestClient) -> None:
-    override_http(lambda request: httpx.Response(200, json=[[]]))
-
-    response = client.post("/translate", json={"text": ZH_LINE})
-
-    assert response.status_code == 502
-    assert response.json() == {
-        "error": "upstream_error",
-        "detail": "translation upstream returned an unexpected payload",
-    }
+    assert response.status_code == 503
+    body = response.json()
+    assert body["error"] == "translator_unavailable"
+    assert "Vietphrase dictionaries are missing" in body["detail"]
+    assert "python -m server.vietphrase --fetch" in body["detail"]
 
 
 # --- AC-SRV-3: POST /tts ----------------------------------------------------
