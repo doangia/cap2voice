@@ -35,4 +35,7 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install -r server/requirements.txt
+      # Dictionaries are GPL-3.0 upstream data, not committed: fetch them
+      # once so test_bundled_dictionaries_load_offline runs for real.
+      - run: python -m server.vietphrase --fetch --text "夜深了，雨还在下。"
       - run: python -m pytest server/ -q
