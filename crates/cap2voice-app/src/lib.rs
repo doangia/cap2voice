@@ -5,3 +5,4 @@ pub mod audio;
 pub mod capture;
 pub mod config;
 pub mod ocr;
+pub mod pipeline;

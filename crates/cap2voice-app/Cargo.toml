@@ -6,6 +6,7 @@ license.workspace = true
 description = "Windows desktop subtitle OCR, translation, and Vietnamese TTS overlay"
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
 rodio = { version = "0.23", default-features = false, features = ["playback", "symphonia-mp3"] }

@@ -216,14 +216,14 @@
 **Description:** Implement pure-logic `BoundedAudioQueue` (max 3 pending items; drops oldest unplayed item when full without cutting off active speech) and `AudioPlayer` on a dedicated `rodio` `0.23` worker thread with real-time gain (`0.0..=1.0`, default `0.75`), instant `stop_and_clear()`, and explicit audio-device error reporting.
 
 **Done means (Acceptance criteria):**
-- [x] Unit tests prove FIFO ordering and bounded capacity (pushing 5 items while 1 plays keeps only the newest 3 pending items, dropping oldest unplayed — `AC-TTS-3`).
-- [x] `set_volume` scales sink loudness linearly (`0%`–`100%`, default `75%` — `AC-TTS-5`), and `stop_and_clear` halts active audio within `200 ms` and empties queue (`AC-TTS-4`).
-- [x] Audio device or MP3 decode failures return typed `AudioError` surfaced to UI status rather than panicking (`AC-TTS-7`).
+- [ ] Unit tests prove FIFO ordering and bounded capacity (pushing 5 items while 1 plays keeps only the newest 3 pending items, dropping oldest unplayed — `AC-TTS-3`).
+- [ ] `set_volume` scales sink loudness linearly (`0%`–`100%`, default `75%` — `AC-TTS-5`), and `stop_and_clear` halts active audio within `200 ms` and empties queue (`AC-TTS-4`).
+- [ ] Audio device or MP3 decode failures return typed `AudioError` surfaced to UI status rather than panicking (`AC-TTS-7`).
 
 **Verification:**
-- [x] Automated tests pass: `cargo test -p cap2voice-app audio`
-- [x] Build & lint pass: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings`
-- [x] Real PC check: Run `cargo test -p cap2voice-app --test audio_queue_tests -- --ignored --nocapture` playing two real Vietnamese MP3 clips sequentially through PC speakers verifying zero overlap, audible volume change, and immediate halt on `stop_and_clear()` (`AC-TTS-1`, `AC-TTS-4`).
+- [ ] Automated tests pass: `cargo test -p cap2voice-app audio`
+- [ ] Build & lint pass: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings`
+- [ ] Real PC check: Run `cargo test -p cap2voice-app --test audio_queue_tests -- --ignored --nocapture` playing two real Vietnamese MP3 clips sequentially through PC speakers verifying zero overlap, audible volume change, and immediate halt on `stop_and_clear()` (`AC-TTS-1`, `AC-TTS-4`).
 
 **Dependencies:** Task 4 (can run in parallel with Task 7)
 
@@ -240,15 +240,16 @@
 **Description:** Implement `SubtitleLogger` writing flushed UTF-8 `[YYYY-MM-DD HH:MM:SS] <Chinese> : <Vietnamese>` lines to daily log files, and `PipelineRunner` connecting `FrameCapturer` → `PixelDiffGate` → `OcrEngine` → `TextDeduplicator` → `Translator` (monotonic sequence guard + explicit `429`/network error banners) → `TtsEngine` (respecting `auto_read` toggle) → `AudioPlayer` + UI state channel.
 
 **Done means (Acceptance criteria):**
-- [ ] `SubtitleLogger` appends and flushes exact UTF-8 `[YYYY-MM-DD HH:MM:SS] <Chinese> : <Vietnamese>` lines immediately (`AC-OCR-7`).
-- [ ] Out-of-order translation response (`seq N` arriving after `seq N+1`) is discarded and never overwrites `N+1` (`AC-TR-4`).
-- [ ] With `auto_read == false`, zero `TtsEngine::synthesize` calls are made while translation and logging continue (`AC-TTS-6`).
-- [ ] Translation/TTS/network errors clear stale Vietnamese text and emit explicit Vietnamese UI status errors (`AC-TR-3`, `AC-TTS-7`).
+- [x] `SubtitleLogger` appends and flushes exact UTF-8 `[YYYY-MM-DD HH:MM:SS] <Chinese> : <Vietnamese>` lines immediately (`AC-OCR-7`).
+- [x] Out-of-order translation response (`seq N` arriving after `seq N+1`) is discarded and never overwrites `N+1` (`AC-TR-4`).
+- [x] With `auto_read == false`, zero `TtsEngine::synthesize` calls are made while translation and logging continue (`AC-TTS-6`).
+- [x] Translation/TTS/network errors clear stale Vietnamese text and emit explicit Vietnamese UI status errors (`AC-TR-3`, `AC-TTS-7`).
 
 **Verification:**
-- [ ] Automated tests pass: `cargo test -p cap2voice-app pipeline` (mocked capturer, OCR, slow/out-of-order translator, mock TTS)
-- [ ] Build & lint pass: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings`
+- [x] Automated tests pass: `cargo test -p cap2voice-app pipeline` (mocked capturer, OCR, slow/out-of-order translator, mock TTS)
+- [x] Build & lint pass: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings`
 - [ ] Real PC check: Run `#[ignore]` headless 60-second smoke test over a real Chinese hardcoded-subtitle video playing on Danh's PC; inspect generated `%APPDATA%\cap2voice\logs\subtitles-YYYY-MM-DD.log` for accurate `Chinese : Vietnamese` pairs, confirm sequential Vietnamese speech, and confirm paused frames produce zero OCR calls.
+  - PARTIAL 2026-11-20 18:30 (Muse verified): smoke test ran 60s over a generated 90s test video (15 Chinese lines) — OCR 17/17 subtitles emitted live, 429 banner shown correctly, 6 stale translations discarded live. BUT translations 0 / logged pairs 0 / TTS 0 because Google Translate still returns 429 from this IP (since 19/11 23:38). Log file not created yet (correct — nothing to log). Re-run this check when the rate limit lifts; do NOT keep probing (each probe may extend the block).
 
 **Dependencies:** Task 5, Task 6, Task 7, Task 8
 
