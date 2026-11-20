@@ -1132,6 +1132,83 @@ async fn pipeline_stop_clears_audio_aborts_inflight_translation_and_returns_idle
     );
 }
 
+#[test]
+fn start_on_from_non_tokio_thread_drives_pipeline_and_stops_via_block_on() {
+    assert!(
+        tokio::runtime::Handle::try_current().is_err(),
+        "test must run on a plain synchronous thread outside Tokio runtime"
+    );
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .thread_name("cap2voice-sync-test")
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(err) => panic!("failed building Tokio runtime: {err}"),
+    };
+
+    let temp = TempDirGuard::new("sync_start_on");
+    let capturer = Arc::new(MockCapturer::new(
+        vec![Ok(solid_frame(18))],
+        Ok(solid_frame(18)),
+    ));
+    let ocr = Arc::new(MockOcrEngine::new(
+        vec![Ok(ocr_block("夜深了，雨还在下。"))],
+        Ok(ocr_block("夜深了，雨还在下。")),
+    ));
+    let translator = Arc::new(ControllableTranslator::scripted(vec![Ok(
+        "Đêm đã khuya, mưa vẫn còn rơi.".to_string(),
+    )]));
+    let tts = Arc::new(MockTtsEngine::new(Vec::new()));
+    let audio = Arc::new(MockAudioPlayback::new());
+    let logger = Arc::new(SubtitleLogger::new(temp.path().to_path_buf()));
+
+    let handle = match PipelineRunner::start_on(
+        runtime.handle(),
+        test_settings(30),
+        PipelineDeps {
+            capturer: capturer.clone(),
+            ocr: ocr.clone(),
+            translator: translator.clone(),
+            tts: tts.clone(),
+            audio: audio.clone(),
+            logger: Some(logger),
+        },
+    ) {
+        Ok(h) => h,
+        Err(err) => panic!("PipelineRunner::start_on failed: {err}"),
+    };
+
+    let mut rx = handle.subscribe();
+    let deadline = std::time::Instant::now() + TEST_WAIT_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        if rx.has_changed().unwrap_or(false) {
+            let snap = rx.borrow_and_update().clone();
+            if snap.metrics.translations_succeeded >= 1 && snap.metrics.logged_pairs >= 1 {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let snap = rx.borrow().clone();
+    assert!(snap.metrics.translations_succeeded >= 1);
+    assert_eq!(snap.chinese_line, "夜深了，雨还在下。");
+    assert_eq!(snap.vietnamese_line, "Đêm đã khuya, mưa vẫn còn rơi.");
+    assert!(capturer.call_count() >= 1);
+    assert!(ocr.call_count() >= 1);
+
+    let stop_result = runtime
+        .block_on(async move { tokio::time::timeout(Duration::from_secs(2), handle.stop()).await });
+    assert!(
+        stop_result.is_ok(),
+        "handle.stop() timed out inside block_on"
+    );
+    assert_eq!(rx.borrow().status, PipelineStatus::Idle);
+}
+
 fn unused_loopback_port() -> u16 {
     let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:0") else {
         panic!("failed binding ephemeral TCP port");

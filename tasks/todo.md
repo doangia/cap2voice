@@ -281,9 +281,16 @@
 - [ ] Overlay is draggable, persists `(x, y)` across restarts (`AC-UI-3`), applies `WDA_EXCLUDEFROMCAPTURE` to prevent capture feedback loops (`AC-UI-6`), keeps UI responsive during slow network calls (`AC-TR-5`), reflects all control states + voice switching (`AC-UI-4`, `AC-TTS-2`, `AC-TTS-4`), and shows/clears Vietnamese error banners honestly (`AC-UI-5`, `AC-TR-3`).
 
 **Verification:**
-- [ ] Automated tests pass: `cargo test --workspace` (including font-loader & UI state-reducer unit tests)
-- [ ] Build & lint pass: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo build --release`
+- [x] Automated tests pass: `cargo test --workspace` (including font-loader & UI state-reducer unit tests)
+- [x] Build & lint pass: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo build --release`
 - [ ] Real PC check: Run `cap2voice-app.exe` over VLC/MPV AND Chrome video with hardcoded Chinese subtitles; capture screenshot proving white Chinese + green Vietnamese rendering; drag overlay directly over subtitle region to confirm no OCR feedback loop; switch voice dropdown to `vi-VN-HoaiMyNeural` and confirm audible voice change; disconnect network to verify error banner.
+
+**Ghi chú kiểm chứng 2026-11-20 20:57 (Muse, theo ủy quyền):**
+- Lệch spec: dùng **eframe 0.35** thay vì 0.37 (0.37 yêu cầu rustc ≥1.95, PC có 1.93.1; quyết 19:22 20/11, không đổi toolchain). Ghi chú này để cập nhật spec/plan.
+- Bug P0 phát hiện khi kiểm chứng live lần 1: app crash khi thoát lúc pipeline đang chạy (panic `ui/mod.rs:555` "there is no reactor running" — `tokio::time::timeout` tính ngoài `block_on`). Đã sửa bằng helper `stop_pipeline_with_timeout` (timeout nằm trong async block) + 3 test UI mới + 1 test pipeline mới (start/stop từ thread đồng bộ ngoài runtime). Tests sau sửa: **108 passed, 0 failed** (fmt/clippy exit 0, release exe 11.036.672 byte).
+- Live lần 2 (video test 90s, vùng `(384, 849, 1152, 151)`, monitor `\\.\DISPLAY1`): bấm "Bắt đầu" qua GUI → pipeline chạy thật (frame.png mới 48.142 byte 20:54:50, CPU 0,42s/5s); kéo overlay đè lên vùng phụ đề → frame.png OCR vẫn chỉ thấy phụ đề video "没问题，明天见。" (WDA không feedback loop, đã xem ảnh); vị trí kéo lưu vào config (`x = 434.0, y = 857.0`); bấm X thoát → exit code 0, không panic (fix on_exit đã nghiệm thu).
+- Chưa nghiệm thu live (để mở, chuyển sang cổng Task 14): overlay trên video Chrome; dòng Việt xanh hiện thật (Google vẫn 429 nên chưa có bản dịch); chọn giọng HoaiMy qua dropdown (bấm mù 2 lần không đổi được giọng — cần Danh bấm tay hoặc test có nhìn thấy popup); nghe đổi giọng; ngắt mạng xem banner. Glyph coverage CJK + Việt đã chứng minh bằng unit test `has_glyph` trên font hệ thống thật (không tofu).
+- Bài học: thao tác chuột/kiểm tra cửa sổ phải chạy qua phiên desktop (`hc exec`), KHÔNG qua SSH (MainWindowHandle = 0, SetCursorPos lỗi); vị trí overlay lưu trong config nên mỗi lần chạy có thể mở ở chỗ khác — đọc rect mới trước khi bấm; `monitor_id` trong config phải đúng dạng xcap (`\\.\DISPLAY1`, không phải `DISPLAY1`) nếu không capture fail `MonitorUnavailable`.
 
 **Dependencies:** Task 9
 
