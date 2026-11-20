@@ -2,6 +2,7 @@
 
 pub mod fonts;
 pub mod overlay;
+pub mod region;
 
 use crate::api::{
     discover_server_dir, HttpTranslator, HttpTtsEngine, ServerProcess, ServerProcessConfig,
@@ -23,10 +24,22 @@ use overlay::{
     DisplayAffinityError, OverlayCommand, OverlayState, PositionTracker, ServerUiStatus,
     DEFAULT_OVERLAY_SIZE, POSITION_SAVE_DEBOUNCE,
 };
+use region::{
+    build_region_viewport_builder, region_viewport_id, render_region_selector_ui,
+    select_active_monitor_index, RegionSelectorOutcome, RegionSelectorState,
+};
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
+
+fn configured_window_level(config: &AppConfig) -> egui::WindowLevel {
+    if config.display.always_on_top {
+        egui::WindowLevel::AlwaysOnTop
+    } else {
+        egui::WindowLevel::Normal
+    }
+}
 
 /// Build `eframe::NativeOptions` for the borderless, transparent, always-on-top overlay.
 pub fn build_native_options(config: &AppConfig) -> eframe::NativeOptions {
@@ -36,13 +49,8 @@ pub fn build_native_options(config: &AppConfig) -> eframe::NativeOptions {
         .with_min_inner_size([460.0, 140.0])
         .with_decorations(false)
         .with_transparent(true)
-        .with_resizable(true);
-
-    viewport = if config.display.always_on_top {
-        viewport.with_window_level(egui::WindowLevel::AlwaysOnTop)
-    } else {
-        viewport.with_window_level(egui::WindowLevel::Normal)
-    };
+        .with_resizable(true)
+        .with_window_level(configured_window_level(config));
 
     if let Some(pos) = &config.display.overlay_position {
         viewport = viewport.with_position(egui::Pos2::new(pos.x, pos.y));
@@ -159,6 +167,9 @@ pub struct Cap2VoiceApp {
     wda_attempted_frame: bool,
     wda_error_detail: Option<String>,
     position_tracker: PositionTracker,
+    last_overlay_outer_pos: Option<WindowPosition>,
+    region_selector: Option<RegionSelectorState>,
+    region_selector_focused: bool,
     server_rx: Option<mpsc::Receiver<Result<ServerProcess, ServerProcessError>>>,
     server: Option<ServerProcess>,
     capturer: Arc<dyn FrameCapturer>,
@@ -167,6 +178,32 @@ pub struct Cap2VoiceApp {
     pipeline_handle: Option<PipelineHandle>,
     pipeline_rx: Option<watch::Receiver<PipelineSnapshot>>,
     repaint_forwarder: Option<tokio::task::JoinHandle<()>>,
+}
+
+fn build_live_pipeline_settings(
+    config: &AppConfig,
+    state: &OverlayState,
+) -> Result<PipelineSettings, crate::pipeline::PipelineError> {
+    let mut settings = PipelineSettings::from_app_config(config)?;
+    settings.muted = state.muted;
+    settings.voice = state.selected_voice.clone();
+    Ok(settings)
+}
+
+pub(crate) fn apply_region_selection_outcome(
+    config: &mut AppConfig,
+    state: &mut OverlayState,
+    outcome: &RegionSelectorOutcome,
+) -> bool {
+    match outcome {
+        RegionSelectorOutcome::Confirmed(region) => {
+            config.general.region = Some(region.clone());
+            state.region_panel_open = false;
+            state.ui_notice = None;
+            true
+        }
+        RegionSelectorOutcome::Cancelled | RegionSelectorOutcome::Pending => false,
+    }
 }
 
 impl Cap2VoiceApp {
@@ -207,6 +244,7 @@ impl Cap2VoiceApp {
             bootstrap.config.display.overlay_position.clone(),
             POSITION_SAVE_DEBOUNCE,
         );
+        let initial_outer_pos = bootstrap.config.display.overlay_position.clone();
 
         Self {
             runtime,
@@ -217,6 +255,9 @@ impl Cap2VoiceApp {
             wda_attempted_frame: false,
             wda_error_detail,
             position_tracker,
+            last_overlay_outer_pos: initial_outer_pos,
+            region_selector: None,
+            region_selector_focused: false,
             server_rx: Some(server_rx),
             server: None,
             capturer: Arc::new(XcapCapturer::new()),
@@ -297,15 +338,13 @@ impl Cap2VoiceApp {
             return;
         };
 
-        let mut settings = match PipelineSettings::from_app_config(&self.config) {
+        let settings = match build_live_pipeline_settings(&self.config, &self.state) {
             Ok(s) => s,
             Err(err) => {
                 self.state.ui_notice = Some(err.to_string());
                 return;
             }
         };
-        settings.muted = self.state.muted;
-        settings.voice = self.state.selected_voice.clone();
 
         if self.ocr.is_none() {
             match resolve_wechat_paths_from_config(&self.config.general) {
@@ -452,6 +491,65 @@ impl Cap2VoiceApp {
         }
     }
 
+    fn open_region_selector(&mut self, ctx: &egui::Context) {
+        let monitors = match self.capturer.list_monitors() {
+            Ok(list) => list,
+            Err(err) => {
+                self.state.ui_notice =
+                    Some(format!("Không thể liệt kê màn hình để chọn vùng: {err}"));
+                return;
+            }
+        };
+        let active_idx = select_active_monitor_index(
+            &monitors,
+            self.last_overlay_outer_pos.as_ref(),
+            ctx.pixels_per_point(),
+        );
+        let selector = match RegionSelectorState::new(monitors, active_idx) {
+            Ok(s) => s,
+            Err(err) => {
+                self.state.ui_notice = Some(err.to_string());
+                return;
+            }
+        };
+
+        self.state.region_panel_open = false;
+        self.region_selector = Some(selector);
+        self.region_selector_focused = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+            egui::WindowLevel::Normal,
+        ));
+        ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
+        ctx.request_repaint();
+    }
+
+    fn finish_region_selection(&mut self, ctx: &egui::Context, outcome: RegionSelectorOutcome) {
+        self.region_selector = None;
+        self.region_selector_focused = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(configured_window_level(
+            &self.config,
+        )));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        ctx.request_repaint();
+
+        if apply_region_selection_outcome(&mut self.config, &mut self.state, &outcome) {
+            self.persist_config();
+            if let Some(handle) = &self.pipeline_handle {
+                match build_live_pipeline_settings(&self.config, &self.state) {
+                    Ok(settings) => {
+                        if let Err(err) = handle.update_settings(settings) {
+                            self.state.ui_notice = Some(err.to_string());
+                        }
+                    }
+                    Err(err) => {
+                        self.state.ui_notice = Some(err.to_string());
+                    }
+                }
+            }
+        }
+    }
+
     fn dispatch_commands(&mut self, ctx: &egui::Context, commands: Vec<OverlayCommand>) {
         for cmd in commands {
             match cmd {
@@ -459,9 +557,7 @@ impl Cap2VoiceApp {
                 OverlayCommand::StopPipeline => self.handle_stop_pipeline(ctx),
                 OverlayCommand::ToggleMute => self.handle_toggle_mute(),
                 OverlayCommand::SelectVoice(voice) => self.handle_select_voice(voice),
-                OverlayCommand::ToggleRegionPanel => {
-                    self.state.region_panel_open = !self.state.region_panel_open;
-                }
+                OverlayCommand::ToggleRegionPanel => self.open_region_selector(ctx),
                 OverlayCommand::ToggleSettingsPanel => {
                     self.state.settings_panel_open = !self.state.settings_panel_open;
                 }
@@ -526,24 +622,68 @@ impl eframe::App for Cap2VoiceApp {
         self.poll_background_channels();
         self.check_wda_fallback(frame, ui);
 
-        if let Some(outer_rect) = ui.input(|i| i.viewport().outer_rect) {
-            let now = Instant::now();
-            self.position_tracker
-                .observe(outer_rect.min.x, outer_rect.min.y, now);
-            if let Some(ready_pos) = self.position_tracker.take_ready_to_save(now) {
-                self.save_overlay_position(ready_pos);
+        if self.region_selector.is_none() {
+            if let Some(outer_rect) = ui.input(|i| i.viewport().outer_rect) {
+                let outer_pos = WindowPosition {
+                    x: outer_rect.min.x,
+                    y: outer_rect.min.y,
+                };
+                self.last_overlay_outer_pos = Some(outer_pos);
+                let now = Instant::now();
+                self.position_tracker
+                    .observe(outer_rect.min.x, outer_rect.min.y, now);
+                if let Some(ready_pos) = self.position_tracker.take_ready_to_save(now) {
+                    self.save_overlay_position(ready_pos);
+                }
             }
         }
 
-        let commands = egui::CentralPanel::default()
-            .frame(egui::Frame::NONE)
-            .show(ui, |ui| {
-                render_overlay_ui(ui, &mut self.state, &self.config, &self.font_warnings)
-            })
-            .inner;
-
         let ctx = ui.ctx().clone();
-        self.dispatch_commands(&ctx, commands);
+        if let Some(monitor) = self
+            .region_selector
+            .as_ref()
+            .and_then(RegionSelectorState::active_monitor)
+            .cloned()
+        {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ui, |_| {});
+
+            let builder = build_region_viewport_builder(&monitor);
+            let outcome = ctx.show_viewport_immediate(
+                region_viewport_id(),
+                builder,
+                |viewport_ui, _class| {
+                    if !self.region_selector_focused {
+                        self.region_selector_focused = true;
+                        viewport_ui
+                            .ctx()
+                            .send_viewport_cmd(egui::ViewportCommand::Focus);
+                    }
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(viewport_ui, |inner_ui| {
+                            if let Some(selector) = &mut self.region_selector {
+                                render_region_selector_ui(inner_ui, selector)
+                            } else {
+                                RegionSelectorOutcome::Pending
+                            }
+                        })
+                        .inner
+                },
+            );
+            if !matches!(outcome, RegionSelectorOutcome::Pending) {
+                self.finish_region_selection(&ctx, outcome);
+            }
+        } else {
+            let commands = egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| {
+                    render_overlay_ui(ui, &mut self.state, &self.config, &self.font_warnings)
+                })
+                .inner;
+            self.dispatch_commands(&ctx, commands);
+        }
 
         if matches!(self.state.server_status, ServerUiStatus::Starting) || self.state.is_running() {
             ctx.request_repaint_after(Duration::from_millis(100));
@@ -586,7 +726,11 @@ pub fn run_app() -> Result<(), eframe::Error> {
 #[cfg(test)]
 mod tests {
     use super::overlay::{OverlayState, ServerUiStatus};
-    use super::{build_native_options, format_server_startup_error, stop_pipeline_with_timeout};
+    use super::region::RegionSelectorOutcome;
+    use super::{
+        apply_region_selection_outcome, build_native_options, format_server_startup_error,
+        stop_pipeline_with_timeout,
+    };
     use crate::api::{
         BoxFuture, HttpTranslator, HttpTtsEngine, ServerProcessError, TranslateError, Translator,
         TtsEngine, TtsError, DEFAULT_CONNECT_TIMEOUT, DEFAULT_TRANSLATE_TIMEOUT,
@@ -1111,5 +1255,51 @@ mod tests {
             "stop_pipeline_with_timeout should stop pipeline cleanly"
         );
         assert_eq!(rx.borrow().status, PipelineStatus::Idle);
+    }
+
+    #[test]
+    fn region_selection_confirmed_updates_config_and_clears_missing_region_notice() {
+        let mut cfg = AppConfig::default();
+        let mut state = OverlayState::from_config(&cfg, Vec::new());
+        state.server_status = ServerUiStatus::Ready;
+        assert!(!state.request_start(false));
+        assert!(state.region_panel_open);
+        assert!(state.ui_notice.is_some());
+
+        let selected = CaptureRegion {
+            monitor_id: r"\\.\DISPLAY1".to_string(),
+            x: 320,
+            y: 900,
+            width: 1280,
+            height: 80,
+        };
+        let changed = apply_region_selection_outcome(
+            &mut cfg,
+            &mut state,
+            &RegionSelectorOutcome::Confirmed(selected.clone()),
+        );
+        assert!(changed);
+        assert_eq!(cfg.general.region, Some(selected));
+        assert!(!state.region_panel_open);
+        assert_eq!(state.active_error_banner(), None);
+    }
+
+    #[test]
+    fn region_selection_cancelled_preserves_existing_saved_region() {
+        let existing = CaptureRegion {
+            monitor_id: r"\\.\DISPLAY1".to_string(),
+            x: 420,
+            y: 1020,
+            width: 1280,
+            height: 60,
+        };
+        let mut cfg = AppConfig::default();
+        cfg.general.region = Some(existing.clone());
+        let mut state = OverlayState::from_config(&cfg, Vec::new());
+
+        let changed =
+            apply_region_selection_outcome(&mut cfg, &mut state, &RegionSelectorOutcome::Cancelled);
+        assert!(!changed);
+        assert_eq!(cfg.general.region, Some(existing));
     }
 }

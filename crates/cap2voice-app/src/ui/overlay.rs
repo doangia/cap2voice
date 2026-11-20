@@ -302,7 +302,7 @@ fn render_inline_info_panels(ui: &mut egui::Ui, state: &mut OverlayState, config
                             r.monitor_id, r.x, r.y, r.width, r.height
                         ),
                         None => {
-                            "Vùng phụ đề: Chưa chọn vùng (Task 11 sẽ bổ sung kéo chọn màn hình)"
+                            "Vùng phụ đề: Chưa chọn vùng — bấm 'Chọn vùng' để kéo chọn trên màn hình"
                                 .to_string()
                         }
                     };

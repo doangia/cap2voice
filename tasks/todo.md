@@ -309,14 +309,26 @@
 **Description:** Implement the fullscreen dimmed region-selection viewport matching Mockup 2 (`region-select`) with top-center pill `"Kéo chuột để chọn vùng phụ đề"`, red dashed drag rectangle (`#EF4444`) with clear inner cut-out, live `<W> × <H> px · <X>, <Y>` physical-pixel badge, minimum `20 × 16 px` guard, `Esc`/right-click cancel, and logical-to-physical DPI coordinate mapping.
 
 **Done means (Acceptance criteria):**
-- [ ] Clicking `Chọn vùng` dims the screen, shows prompt pill, draws red dashed box with clear interior, and updates live `<W> × <H> px · <X>, <Y>` badge (`AC-CAP-1`).
-- [ ] Releasing drag `>= 20 × 16 px` saves physical monitor coordinates to `AppConfig`; smaller clicks are rejected; `Esc` or right-click cancels without overwriting previous region (`AC-CAP-2`).
-- [ ] Unit tests verify logical-to-physical DPI coordinate math at `100%`, `125%`, `150%`, `175%` scaling (`AC-CAP-3`).
+- [x] Clicking `Chọn vùng` dims the screen, shows prompt pill, draws red dashed box with clear interior, and updates live `<W> × <H> px · <X>, <Y>` badge (`AC-CAP-1`).
+- [x] Releasing drag `>= 20 × 16 px` saves physical monitor coordinates to `AppConfig`; smaller clicks are rejected; `Esc` or right-click cancels without overwriting previous region (`AC-CAP-2`).
+- [x] Unit tests verify logical-to-physical DPI coordinate math at `100%`, `125%`, `150%`, `175%` scaling (`AC-CAP-3`).
 
 **Verification:**
-- [ ] Automated tests pass: `cargo test -p cap2voice-app region`
-- [ ] Build & lint pass: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings`
+- [x] Automated tests pass: `cargo test -p cap2voice-app region`
+- [x] Build & lint pass: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings`
 - [ ] Real PC check: Test `Chọn vùng` on Danh's monitor at Windows DPI scaling (`125%` or `150%`), capture screenshot of active red-dashed selection, verify captured PNG matches the subtitle box within ±2 px, and verify `Esc` preserves prior saved coordinates.
+
+**Ghi chú kiểm chứng 2026-11-20 21:29 (Muse tự kiểm chứng độc lập):**
+- fmt/clippy/test exit 0 hết; tổng 118 test pass (108 sau Task 10 + 10 mới), khớp agent báo.
+- Live GUI (màn hình thật 1920x1080, DPI hệ thống 100% — KHÔNG phải 125%/150% như ô check yêu cầu; map DPI 125/150/175% chỉ có unit test, xem dưới):
+  - Bấm "Chọn vùng" → viewport chọn vùng mở: toàn màn tối mờ, pill giữa trên "Kéo chuột để chọn vùng phụ đề / Nhấn Esc hoặc chuột phải để huỷ", con trỏ crosshair (ảnh selector-shot2.png).
+  - Kéo (500,850)→(1400,1000), giữ chuột: hộp nét đứt đỏ + badge live "900 × 150 px · 500, 849" (ảnh selector-shot3.png).
+  - Thả chuột → config.toml lưu `[general.region] x=500, y=849, width=900, height=150` (sai số y 1px so với kéo 850 — trong ±2px, chấp nhận).
+  - Mở lại → bấm Esc → selector đóng, config giữ nguyên (500, 849, 900, 150). Esc nghiệm thu live.
+  - KHÔNG test live: click nhỏ <20×16 bị từ chối (chỉ có unit test `region_selector_accepts_20x16_minimum_and_rejects_smaller_clicks_with_hint`); chuột phải huỷ (chỉ có unit test); DPI 125%/150% live (PC đang 100%, đổi scaling sẽ làm phiền màn hình Danh).
+  - Nút "Chọn vùng" nằm ở top+142 (không phải top+122 như tính từ layout Task 10) vì có banner/cảnh báo đẩy action bar xuống — click GUI sau này phải sweep y (đã thử 979 trượt, 999 trúng). Bài học: vị trí action bar thay đổi theo banner, luôn đọc lại và sweep.
+  - Sự cố giữa chừng: đường Herdr rớt ~21:24 làm chết cả ffplay lẫn app (background hc exec bị SIGTERM); đã kiểm tra process thật, Herdr tự hồi (HC_OK 21:24:55), chạy lại từ đầu. Một script retry-selector cũ bị kill để tránh click lạc.
+  - Đóng app bằng X → exit 0, không panic; ffplay đã kill, Chrome đưa lên foreground, màn hình Danh bình thường.
 
 **Dependencies:** Task 5, Task 10
 
