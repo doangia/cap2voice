@@ -619,8 +619,10 @@ mod win_autostart {
 
         let valid_len = (byte_len as usize).min(buf.len());
         let units: Vec<u16> = buf[..valid_len]
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
             .take_while(|&u| u != 0)
             .collect();
         Ok(Some(String::from_utf16_lossy(&units)))
