@@ -345,14 +345,26 @@
 **Description:** Implement the decorated dark `Cài đặt` window matching Mockup 3 (`settings-tray`) with all 5 functional sidebar tabs (`Chung`, `Dịch`, `Giọng đọc`, `Hiển thị`, `Phím tắt` — zero stubs), draft editing (`Huỷ` discards; `Lưu thay đổi` validates, persists atomically, applies live, and updates Windows autostart registry), `Chọn lại vùng`, `Kiểm tra kết nối` (`/health`), and `Nghe thử` (`/tts`).
 
 **Done means (Acceptance criteria):**
-- [ ] All 5 sidebar tabs render complete functional controls matching `docs/spec.md` §3.6 (`AC-SET-1`).
-- [ ] `Huỷ` reverts draft edits without touching `config.toml` or live state (`AC-SET-2`); `Lưu thay đổi` saves atomically, applies live (font size, opacity, voice, volume, FPS, auto-read), and persists across restarts (`AC-SET-3`, `AC-TTS-2`, `AC-TTS-5`, `AC-TTS-6`).
-- [ ] `Chọn lại vùng` opens the region selector and updates the draft coordinates (`AC-SET-4`); `Khởi động cùng Windows` toggles the `HKCU\...\Run\cap2voice` entry on save (`AC-SET-5`).
+- [x] All 5 sidebar tabs render complete functional controls matching `docs/spec.md` §3.6 (`AC-SET-1`).
+- [x] `Huỷ` reverts draft edits without touching `config.toml` or live state (`AC-SET-2`); `Lưu thay đổi` saves atomically, applies live (font size, opacity, voice, volume, FPS, auto-read), and persists across restarts (`AC-SET-3`, `AC-TTS-2`, `AC-TTS-5`, `AC-TTS-6`).
+- [x] `Chọn lại vùng` opens the region selector and updates the draft coordinates (`AC-SET-4`); `Khởi động cùng Windows` toggles the `HKCU\...\Run\cap2voice` entry on save (`AC-SET-5`).
 
 **Verification:**
-- [ ] Automated tests pass: `cargo test -p cap2voice-app settings` (draft commit/discard & validation unit tests)
-- [ ] Build & lint pass: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] Real PC check: Open `Cài đặt`, capture screenshots of all 5 tabs; test `Huỷ` vs `Lưu thay đổi` + restart persistence; test `Chọn lại vùng`, `Kiểm tra kết nối`, `Nghe thử`, and `Khởi động cùng Windows` registry toggle.
+- [x] Automated tests pass: `cargo test -p cap2voice-app settings` (draft commit/discard & validation unit tests)
+- [x] Build & lint pass: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings`
+- [x] Real PC check: Open `Cài đặt`, capture screenshots of all 5 tabs; test `Huỷ` vs `Lưu thay đổi` + restart persistence; test `Chọn lại vùng`, `Kiểm tra kết nối`, `Nghe thử`, and `Khởi động cùng Windows` registry toggle.
+**Ghi chú kiểm chứng 2026-11-20 21:43–22:02 (Muse tự kiểm chứng độc lập):**
+- fmt/clippy/test exit 0 hết; tổng 130 test pass (118 sau Task 11 + 12 mới), khớp agent báo.
+- Live GUI (màn hình thật 1920x1080, DPI 100%): cửa sổ Cài đặt 680x480 trang trí tối, đủ 5 tab, ảnh chụp cả 5 tab tại `~/workspace/cap2voice-task12-review/settings-tab-{chung2,dich,giongdoc,hienthi,phimtat}.png`. Tab Hiển thị có khung xem trước 2 dòng dùng đúng bản dịch Vietphrase ("夜深了，雨还在下。" / "Đêm đã khuya, mưa vẫn còn rơi.").
+- Kiểm tra kết nối: hiện "Kết nối OK (v0.1.0 · vietphrase · edge-tts)".
+- Nghe thử: hiện "Đang phát mẫu giọng đọc" (âm thanh thật không nghe được từ xa — Task 8 đã chứng minh AudioPlayer phát được MP3 Edge-TTS thật trên PC).
+- Huỷ: bật autostart rồi Huỷ → config.toml không đổi (start_with_windows=false), registry sạch.
+- Lưu + autostart: bật rồi Lưu → registry HKCU Run\cap2voice = đường dẫn exe release, config start_with_windows=true; đóng app, mở lại → checkbox autostart vẫn tích (giữ qua khởi động lại); tắt rồi Lưu → registry mất, config false (trả về trạng thái gốc).
+- Chọn lại vùng: bấm nút → selector mở, kéo (600,850)→(1300,1000) → nháp hiện "600, 849 · 700 × 150 px" + dòng "Có thay đổi chưa lưu", config đĩa CHƯA đổi; bấm Lưu → config ghi (600,849,700,150).
+- Lưu ý kỹ thuật khi test GUI: cửa sổ Cài đặt KHÔNG luôn trên cùng (ffplay fullscreen che mất — phải SetWindowPos topmost + foreground trước khi chụp/bấm); vị trí cửa sổ thay đổi mỗi lần mở (cascade +52px, có lần về (26,26)) nên phải đọc rect mới trước mỗi lần bấm; nút "Cài đặt" trên overlay nằm ở left+536 (x=970), bấm 960 trượt; checkbox lệch 23px so với ước lượng mắt — bấm theo ảnh chụp, không theo ước lượng.
+- **Câu hỏi mở (chưa có lời giải): 21:46:04 config.toml tự ghi lại region (500,849,900,150) → (505,893,923,162) mà không có click nào của Muse giải thích được** (mtime trùng lúc mở Cài đặt; chỉ có 3 đường persist: save_overlay_position / handle_select_voice / finish_region_selection-Confirmed — cả 3 đều không khớp hành động đã làm). Vùng đó đã bị ghi đè bằng (600,849,700,150) đã nghiệm thu ở trên, nhưng nguyên nhân vẫn cần agent xem lại (nghi selector nhận sự kiện chuột cũ hoặc tracker lưu nhầm). Không chặn Task 12.
+- App thoát bằng X → exit 0, không panic; ffplay đã kill, Chrome đưa lên foreground, màn hình Danh bình thường.
+
 
 **Dependencies:** Task 4, Task 10, Task 11
 

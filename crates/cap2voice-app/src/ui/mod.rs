@@ -3,15 +3,19 @@
 pub mod fonts;
 pub mod overlay;
 pub mod region;
+pub mod settings;
 
 use crate::api::{
-    discover_server_dir, HttpTranslator, HttpTtsEngine, ServerProcess, ServerProcessConfig,
-    ServerProcessError, DEFAULT_CONNECT_TIMEOUT, DEFAULT_TRANSLATE_TIMEOUT, DEFAULT_TTS_TIMEOUT,
+    check_health, discover_server_dir, HealthError, HealthStatus, HttpTranslator, HttpTtsEngine,
+    ServerProcess, ServerProcessConfig, ServerProcessError, TtsEngine, TtsError,
+    DEFAULT_CONNECT_TIMEOUT, DEFAULT_HEALTH_TIMEOUT, DEFAULT_TRANSLATE_TIMEOUT,
+    DEFAULT_TTS_TIMEOUT,
 };
 use crate::audio::{AudioPlayback, AudioPlayer};
 use crate::capture::{FrameCapturer, XcapCapturer};
 use crate::config::{
-    default_config_path, load_config_from, save_config_to, AppConfig, WindowPosition,
+    default_config_path, load_config_from, save_config_to, set_windows_autostart, AppConfig,
+    ConfigError, WindowPosition,
 };
 use crate::ocr::{resolve_wechat_paths_from_config, OcrEngine, WeChatOcrAdapter};
 use crate::pipeline::{
@@ -28,7 +32,11 @@ use region::{
     build_region_viewport_builder, region_viewport_id, render_region_selector_ui,
     select_active_monitor_index, RegionSelectorOutcome, RegionSelectorState,
 };
-use std::path::PathBuf;
+use settings::{
+    build_settings_viewport_builder, render_settings_ui, settings_viewport_id, AsyncFeedbackState,
+    SettingsCommand, SettingsDraftState, SETTINGS_PREVIEW_SAMPLE_TEXT,
+};
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
@@ -157,6 +165,24 @@ fn load_bootstrap() -> AppBootstrap {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegionSelectionTarget {
+    LiveConfig,
+    SettingsDraft,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SettingsCommitEffects {
+    pub port_changed: bool,
+    pub wechat_paths_changed: bool,
+    pub always_on_top_changed: bool,
+}
+
+struct TtsPreviewAudio {
+    mp3_bytes: Vec<u8>,
+    volume: f32,
+}
+
 /// Root `eframe` application shell coordinating server lifecycle, pipeline, and overlay UI.
 pub struct Cap2VoiceApp {
     runtime: tokio::runtime::Runtime,
@@ -170,6 +196,11 @@ pub struct Cap2VoiceApp {
     last_overlay_outer_pos: Option<WindowPosition>,
     region_selector: Option<RegionSelectorState>,
     region_selector_focused: bool,
+    region_selection_target: RegionSelectionTarget,
+    settings_draft: Option<SettingsDraftState>,
+    settings_focused: bool,
+    health_check_rx: Option<mpsc::Receiver<Result<HealthStatus, HealthError>>>,
+    tts_preview_rx: Option<mpsc::Receiver<Result<TtsPreviewAudio, TtsError>>>,
     server_rx: Option<mpsc::Receiver<Result<ServerProcess, ServerProcessError>>>,
     server: Option<ServerProcess>,
     capturer: Arc<dyn FrameCapturer>,
@@ -178,6 +209,70 @@ pub struct Cap2VoiceApp {
     pipeline_handle: Option<PipelineHandle>,
     pipeline_rx: Option<watch::Receiver<PipelineSnapshot>>,
     repaint_forwarder: Option<tokio::task::JoinHandle<()>>,
+}
+
+fn spawn_server_startup(
+    runtime: &tokio::runtime::Runtime,
+    port: u16,
+    ctx: egui::Context,
+) -> mpsc::Receiver<Result<ServerProcess, ServerProcessError>> {
+    let (server_tx, server_rx) = mpsc::sync_channel(1);
+    runtime.spawn(async move {
+        let res = match resolve_server_directory() {
+            Ok(server_dir) => {
+                ServerProcess::start(ServerProcessConfig::for_port(port, server_dir)).await
+            }
+            Err(err) => Err(err),
+        };
+        let _ = server_tx.send(res);
+        ctx.request_repaint();
+    });
+    server_rx
+}
+
+pub(crate) fn commit_settings_to_state<F>(
+    current_config: &mut AppConfig,
+    config_path: Option<&Path>,
+    ui_state: &mut OverlayState,
+    new_config: AppConfig,
+    apply_autostart: F,
+) -> Result<SettingsCommitEffects, String>
+where
+    F: Fn(bool) -> Result<(), ConfigError>,
+{
+    new_config.validate().map_err(|err| err.to_string())?;
+
+    let prev_autostart = current_config.general.start_with_windows;
+    let next_autostart = new_config.general.start_with_windows;
+    let autostart_changed = prev_autostart != next_autostart;
+
+    if autostart_changed {
+        apply_autostart(next_autostart)
+            .map_err(|err| format!("Không thể cập nhật khởi động cùng Windows: {err}"))?;
+    }
+
+    if let Some(path) = config_path {
+        if let Err(err) = save_config_to(path, &new_config) {
+            if autostart_changed {
+                let _ = apply_autostart(prev_autostart);
+            }
+            return Err(format!("Không lưu được cấu hình {}: {err}", path.display()));
+        }
+    }
+
+    let effects = SettingsCommitEffects {
+        port_changed: current_config.translation.server_port != new_config.translation.server_port,
+        wechat_paths_changed: current_config.general.wxocr_dll_path
+            != new_config.general.wxocr_dll_path
+            || current_config.general.weixin_dir_path != new_config.general.weixin_dir_path,
+        always_on_top_changed: current_config.display.always_on_top
+            != new_config.display.always_on_top,
+    };
+
+    *current_config = new_config;
+    ui_state.selected_voice = current_config.voice.voice.clone();
+    ui_state.ui_notice = None;
+    Ok(effects)
 }
 
 fn build_live_pipeline_settings(
@@ -226,19 +321,11 @@ impl Cap2VoiceApp {
             }
         }
 
-        let (server_tx, server_rx) = mpsc::sync_channel(1);
-        let port = bootstrap.config.translation.server_port;
-        let ctx_for_server = cc.egui_ctx.clone();
-        runtime.spawn(async move {
-            let res = match resolve_server_directory() {
-                Ok(server_dir) => {
-                    ServerProcess::start(ServerProcessConfig::for_port(port, server_dir)).await
-                }
-                Err(err) => Err(err),
-            };
-            let _ = server_tx.send(res);
-            ctx_for_server.request_repaint();
-        });
+        let server_rx = spawn_server_startup(
+            &runtime,
+            bootstrap.config.translation.server_port,
+            cc.egui_ctx.clone(),
+        );
 
         let position_tracker = PositionTracker::new(
             bootstrap.config.display.overlay_position.clone(),
@@ -258,6 +345,11 @@ impl Cap2VoiceApp {
             last_overlay_outer_pos: initial_outer_pos,
             region_selector: None,
             region_selector_focused: false,
+            region_selection_target: RegionSelectionTarget::LiveConfig,
+            settings_draft: None,
+            settings_focused: false,
+            health_check_rx: None,
+            tts_preview_rx: None,
             server_rx: Some(server_rx),
             server: None,
             capturer: Arc::new(XcapCapturer::new()),
@@ -306,6 +398,98 @@ impl Cap2VoiceApp {
             self.state.apply_pipeline_snapshot(snap);
             if stopped_now {
                 self.pipeline_rx = None;
+            }
+        }
+
+        if let Some(rx) = &self.health_check_rx {
+            match rx.try_recv() {
+                Ok(Ok(health)) => {
+                    if let Some(draft) = &mut self.settings_draft {
+                        draft.connection_status = AsyncFeedbackState::Success(format!(
+                            "Kết nối OK (v{} · {} · {})",
+                            health.version, health.translator, health.tts
+                        ));
+                    }
+                    self.health_check_rx = None;
+                }
+                Ok(Err(err)) => {
+                    if let Some(draft) = &mut self.settings_draft {
+                        draft.connection_status =
+                            AsyncFeedbackState::Error(format!("Lỗi kết nối: {err}"));
+                    }
+                    self.health_check_rx = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if let Some(draft) = &mut self.settings_draft {
+                        draft.connection_status = AsyncFeedbackState::Error(
+                            "Luồng kiểm tra kết nối đã dừng bất ngờ".to_string(),
+                        );
+                    }
+                    self.health_check_rx = None;
+                }
+            }
+        }
+
+        let preview_result = if let Some(rx) = &self.tts_preview_rx {
+            match rx.try_recv() {
+                Ok(res) => {
+                    self.tts_preview_rx = None;
+                    Some(Ok(res))
+                }
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.tts_preview_rx = None;
+                    Some(Err("Luồng nghe thử TTS đã dừng bất ngờ".to_string()))
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Some(outcome) = preview_result {
+            match outcome {
+                Ok(Ok(TtsPreviewAudio { mp3_bytes, volume })) => {
+                    if self.audio.is_none() {
+                        match AudioPlayer::new(volume) {
+                            Ok(player) => {
+                                self.audio = Some(Arc::new(player));
+                            }
+                            Err(err) => {
+                                if let Some(draft) = &mut self.settings_draft {
+                                    draft.tts_preview_status =
+                                        AsyncFeedbackState::Error(format!("Lỗi âm thanh: {err}"));
+                                }
+                            }
+                        }
+                    }
+                    if let Some(audio) = &self.audio {
+                        let play_res = audio
+                            .set_volume(volume)
+                            .and_then(|()| audio.enqueue_mp3(mp3_bytes));
+                        if let Some(draft) = &mut self.settings_draft {
+                            draft.tts_preview_status = match play_res {
+                                Ok(_) => AsyncFeedbackState::Success(
+                                    "Đang phát mẫu giọng đọc".to_string(),
+                                ),
+                                Err(err) => {
+                                    AsyncFeedbackState::Error(format!("Lỗi phát âm thanh: {err}"))
+                                }
+                            };
+                        }
+                    }
+                }
+                Ok(Err(err)) => {
+                    if let Some(draft) = &mut self.settings_draft {
+                        draft.tts_preview_status =
+                            AsyncFeedbackState::Error(format!("Lỗi TTS: {err}"));
+                    }
+                }
+                Err(msg) => {
+                    if let Some(draft) = &mut self.settings_draft {
+                        draft.tts_preview_status = AsyncFeedbackState::Error(msg);
+                    }
+                }
             }
         }
     }
@@ -491,12 +675,18 @@ impl Cap2VoiceApp {
         }
     }
 
-    fn open_region_selector(&mut self, ctx: &egui::Context) {
+    fn open_region_selector(&mut self, ctx: &egui::Context, target: RegionSelectionTarget) {
         let monitors = match self.capturer.list_monitors() {
             Ok(list) => list,
             Err(err) => {
-                self.state.ui_notice =
-                    Some(format!("Không thể liệt kê màn hình để chọn vùng: {err}"));
+                let msg = format!("Không thể liệt kê màn hình để chọn vùng: {err}");
+                if target == RegionSelectionTarget::SettingsDraft {
+                    if let Some(draft) = &mut self.settings_draft {
+                        draft.validation_error = Some(msg);
+                    }
+                } else {
+                    self.state.ui_notice = Some(msg);
+                }
                 return;
             }
         };
@@ -508,12 +698,19 @@ impl Cap2VoiceApp {
         let selector = match RegionSelectorState::new(monitors, active_idx) {
             Ok(s) => s,
             Err(err) => {
-                self.state.ui_notice = Some(err.to_string());
+                if target == RegionSelectionTarget::SettingsDraft {
+                    if let Some(draft) = &mut self.settings_draft {
+                        draft.validation_error = Some(err.to_string());
+                    }
+                } else {
+                    self.state.ui_notice = Some(err.to_string());
+                }
                 return;
             }
         };
 
         self.state.region_panel_open = false;
+        self.region_selection_target = target;
         self.region_selector = Some(selector);
         self.region_selector_focused = false;
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
@@ -530,6 +727,19 @@ impl Cap2VoiceApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(configured_window_level(
             &self.config,
         )));
+
+        if self.region_selection_target == RegionSelectionTarget::SettingsDraft {
+            self.region_selection_target = RegionSelectionTarget::LiveConfig;
+            if let RegionSelectorOutcome::Confirmed(region) = outcome {
+                if let Some(draft) = &mut self.settings_draft {
+                    draft.set_draft_region(region);
+                }
+            }
+            self.settings_focused = false;
+            ctx.request_repaint();
+            return;
+        }
+
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         ctx.request_repaint();
 
@@ -550,6 +760,166 @@ impl Cap2VoiceApp {
         }
     }
 
+    fn open_settings_window(&mut self, ctx: &egui::Context) {
+        self.state.settings_panel_open = false;
+        if self.settings_draft.is_none() {
+            self.settings_draft = Some(SettingsDraftState::from_config(&self.config));
+        }
+        self.settings_focused = false;
+        ctx.request_repaint();
+    }
+
+    fn handle_settings_command(&mut self, ctx: &egui::Context, cmd: SettingsCommand) {
+        match cmd {
+            SettingsCommand::Cancel => {
+                if let Some(draft) = self.settings_draft.take() {
+                    let _ = draft.discard();
+                }
+                if let Some(handle) = &self.pipeline_handle {
+                    if let Err(err) = handle.set_volume(self.config.voice.volume) {
+                        self.state.ui_notice = Some(err.to_string());
+                    }
+                } else if let Some(audio) = &self.audio {
+                    if let Err(err) = audio.set_volume(self.config.voice.volume) {
+                        self.state.ui_notice = Some(format!("Lỗi âm thanh: {err}"));
+                    }
+                }
+                self.health_check_rx = None;
+                self.tts_preview_rx = None;
+                self.settings_focused = false;
+                ctx.request_repaint();
+            }
+            SettingsCommand::SelectRegion => {
+                self.open_region_selector(ctx, RegionSelectionTarget::SettingsDraft);
+            }
+            SettingsCommand::TestConnection { port } => {
+                if let Some(draft) = &mut self.settings_draft {
+                    draft.connection_status = AsyncFeedbackState::InProgress(format!(
+                        "Đang kiểm tra 127.0.0.1:{port}..."
+                    ));
+                }
+                let (tx, rx) = mpsc::sync_channel(1);
+                self.health_check_rx = Some(rx);
+                let ctx_wake = ctx.clone();
+                self.runtime.spawn(async move {
+                    let base_url = format!("http://127.0.0.1:{port}");
+                    let res = check_health(&base_url, DEFAULT_HEALTH_TIMEOUT).await;
+                    let _ = tx.send(res);
+                    ctx_wake.request_repaint();
+                });
+                ctx.request_repaint();
+            }
+            SettingsCommand::PreviewVoice {
+                port,
+                voice,
+                rate,
+                volume,
+            } => {
+                if self.audio.is_none() {
+                    match AudioPlayer::new(volume) {
+                        Ok(player) => {
+                            self.audio = Some(Arc::new(player));
+                        }
+                        Err(err) => {
+                            if let Some(draft) = &mut self.settings_draft {
+                                draft.tts_preview_status =
+                                    AsyncFeedbackState::Error(format!("Lỗi âm thanh: {err}"));
+                            }
+                            return;
+                        }
+                    }
+                }
+                if let Some(draft) = &mut self.settings_draft {
+                    draft.tts_preview_status =
+                        AsyncFeedbackState::InProgress(format!("Đang tạo mẫu giọng {voice}..."));
+                }
+                let (tx, rx) = mpsc::sync_channel(1);
+                self.tts_preview_rx = Some(rx);
+                let ctx_wake = ctx.clone();
+                self.runtime.spawn(async move {
+                    let base_url = format!("http://127.0.0.1:{port}");
+                    let res = match HttpTtsEngine::with_base_url(
+                        base_url,
+                        DEFAULT_CONNECT_TIMEOUT,
+                        DEFAULT_TTS_TIMEOUT,
+                    ) {
+                        Ok(client) => client
+                            .synthesize(SETTINGS_PREVIEW_SAMPLE_TEXT, &voice, &rate)
+                            .await
+                            .map(|mp3_bytes| TtsPreviewAudio { mp3_bytes, volume }),
+                        Err(err) => Err(err),
+                    };
+                    let _ = tx.send(res);
+                    ctx_wake.request_repaint();
+                });
+                ctx.request_repaint();
+            }
+            SettingsCommand::Save(new_config) => {
+                let exe_res = std::env::current_exe().map_err(|err| ConfigError::Io {
+                    path: PathBuf::from("cap2voice-app.exe"),
+                    detail: err.to_string(),
+                });
+                let commit_res = commit_settings_to_state(
+                    &mut self.config,
+                    self.config_path.as_deref(),
+                    &mut self.state,
+                    *new_config,
+                    |enabled| {
+                        let exe = exe_res.as_ref().map_err(Clone::clone)?;
+                        set_windows_autostart(enabled, exe)
+                    },
+                );
+
+                match commit_res {
+                    Ok(effects) => {
+                        self.settings_draft = None;
+                        self.settings_focused = false;
+                        self.health_check_rx = None;
+                        self.tts_preview_rx = None;
+
+                        if effects.wechat_paths_changed {
+                            self.ocr = None;
+                        }
+                        if effects.always_on_top_changed {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                                configured_window_level(&self.config),
+                            ));
+                        }
+                        if let Some(handle) = &self.pipeline_handle {
+                            match build_live_pipeline_settings(&self.config, &self.state) {
+                                Ok(settings) => {
+                                    if let Err(err) = handle.update_settings(settings) {
+                                        self.state.ui_notice = Some(err.to_string());
+                                    }
+                                }
+                                Err(err) => {
+                                    self.state.ui_notice = Some(err.to_string());
+                                }
+                            }
+                        } else if let Some(audio) = &self.audio {
+                            if let Err(err) = audio.set_volume(self.config.voice.volume) {
+                                self.state.ui_notice = Some(format!("Lỗi âm thanh: {err}"));
+                            }
+                        }
+                        if effects.port_changed {
+                            self.server = None;
+                            self.state.server_status = ServerUiStatus::Starting;
+                            let port = self.config.translation.server_port;
+                            self.server_rx =
+                                Some(spawn_server_startup(&self.runtime, port, ctx.clone()));
+                        }
+                        ctx.request_repaint();
+                    }
+                    Err(err_msg) => {
+                        if let Some(draft) = &mut self.settings_draft {
+                            draft.validation_error = Some(err_msg);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn dispatch_commands(&mut self, ctx: &egui::Context, commands: Vec<OverlayCommand>) {
         for cmd in commands {
             match cmd {
@@ -557,10 +927,10 @@ impl Cap2VoiceApp {
                 OverlayCommand::StopPipeline => self.handle_stop_pipeline(ctx),
                 OverlayCommand::ToggleMute => self.handle_toggle_mute(),
                 OverlayCommand::SelectVoice(voice) => self.handle_select_voice(voice),
-                OverlayCommand::ToggleRegionPanel => self.open_region_selector(ctx),
-                OverlayCommand::ToggleSettingsPanel => {
-                    self.state.settings_panel_open = !self.state.settings_panel_open;
+                OverlayCommand::ToggleRegionPanel => {
+                    self.open_region_selector(ctx, RegionSelectionTarget::LiveConfig);
                 }
+                OverlayCommand::ToggleSettingsPanel => self.open_settings_window(ctx),
                 OverlayCommand::CloseWindow => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
@@ -676,6 +1046,29 @@ impl eframe::App for Cap2VoiceApp {
                 self.finish_region_selection(&ctx, outcome);
             }
         } else {
+            if self.settings_draft.is_some() {
+                let settings_cmd = ctx.show_viewport_immediate(
+                    settings_viewport_id(),
+                    build_settings_viewport_builder(),
+                    |viewport_ui, _class| {
+                        if !self.settings_focused {
+                            self.settings_focused = true;
+                            viewport_ui
+                                .ctx()
+                                .send_viewport_cmd(egui::ViewportCommand::Focus);
+                        }
+                        if let Some(draft) = &mut self.settings_draft {
+                            render_settings_ui(viewport_ui, draft)
+                        } else {
+                            None
+                        }
+                    },
+                );
+                if let Some(cmd) = settings_cmd {
+                    self.handle_settings_command(&ctx, cmd);
+                }
+            }
+
             let commands = egui::CentralPanel::default()
                 .frame(egui::Frame::NONE)
                 .show(ui, |ui| {
@@ -685,7 +1078,11 @@ impl eframe::App for Cap2VoiceApp {
             self.dispatch_commands(&ctx, commands);
         }
 
-        if matches!(self.state.server_status, ServerUiStatus::Starting) || self.state.is_running() {
+        if matches!(self.state.server_status, ServerUiStatus::Starting)
+            || self.state.is_running()
+            || self.health_check_rx.is_some()
+            || self.tts_preview_rx.is_some()
+        {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
@@ -727,9 +1124,10 @@ pub fn run_app() -> Result<(), eframe::Error> {
 mod tests {
     use super::overlay::{OverlayState, ServerUiStatus};
     use super::region::RegionSelectorOutcome;
+    use super::settings::SettingsDraftState;
     use super::{
-        apply_region_selection_outcome, build_native_options, format_server_startup_error,
-        stop_pipeline_with_timeout,
+        apply_region_selection_outcome, build_native_options, commit_settings_to_state,
+        format_server_startup_error, stop_pipeline_with_timeout, SettingsCommitEffects,
     };
     use crate::api::{
         BoxFuture, HttpTranslator, HttpTtsEngine, ServerProcessError, TranslateError, Translator,
@@ -738,7 +1136,7 @@ mod tests {
     };
     use crate::audio::{AudioError, AudioPlayback, EnqueueOutcome};
     use crate::capture::{CaptureError, CapturedFrame, FrameCapturer, MonitorInfo};
-    use crate::config::{AppConfig, CaptureRegion, WindowPosition};
+    use crate::config::{load_config_from, AppConfig, CaptureRegion, ConfigError, WindowPosition};
     use crate::ocr::{OcrAdapterError, OcrEngine, OcrResult, TextBlock};
     use crate::pipeline::{
         PipelineDeps, PipelineRunner, PipelineSettings, PipelineStatus, SubtitleLogger,
@@ -1301,5 +1699,159 @@ mod tests {
             apply_region_selection_outcome(&mut cfg, &mut state, &RegionSelectorOutcome::Cancelled);
         assert!(!changed);
         assert_eq!(cfg.general.region, Some(existing));
+    }
+
+    #[test]
+    fn settings_commit_saves_atomically_updates_live_state_and_invokes_autostart_on_toggle() {
+        let temp_dir = TestTempDir::new("settings_commit_ok");
+        let cfg_path = temp_dir.path().join("config.toml");
+
+        let mut live_cfg = AppConfig::default();
+        let mut ui_state = OverlayState::from_config(&live_cfg, Vec::new());
+
+        let mut draft_state = SettingsDraftState::from_config(&live_cfg);
+        draft_state.draft.general.capture_fps = 15;
+        draft_state.draft.general.start_with_windows = true;
+        draft_state.draft.voice.voice = "vi-VN-HoaiMyNeural".to_string();
+        draft_state.draft.voice.volume = 0.55;
+        draft_state.draft.display.font_size_px = 24.0;
+        draft_state.draft.display.always_on_top = false;
+        draft_state.server_port_input = "18888".to_string();
+
+        let committed = match draft_state.try_commit() {
+            Ok(c) => c,
+            Err(err) => panic!("expected draft commit to pass: {err}"),
+        };
+
+        let autostart_calls = Mutex::new(Vec::new());
+        let effects = match commit_settings_to_state(
+            &mut live_cfg,
+            Some(&cfg_path),
+            &mut ui_state,
+            committed.clone(),
+            |enabled| {
+                autostart_calls
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(enabled);
+                Ok(())
+            },
+        ) {
+            Ok(eff) => eff,
+            Err(err) => panic!("expected commit_settings_to_state to succeed: {err}"),
+        };
+
+        assert_eq!(
+            effects,
+            SettingsCommitEffects {
+                port_changed: true,
+                wechat_paths_changed: false,
+                always_on_top_changed: true,
+            }
+        );
+        assert_eq!(
+            *autostart_calls.lock().unwrap_or_else(|e| e.into_inner()),
+            vec![true]
+        );
+        assert_eq!(live_cfg, committed);
+        assert_eq!(ui_state.selected_voice, "vi-VN-HoaiMyNeural");
+
+        let reloaded = match load_config_from(&cfg_path) {
+            Ok(out) => out.config,
+            Err(err) => panic!("expected saved config.toml to reload cleanly: {err}"),
+        };
+        assert_eq!(reloaded, committed);
+    }
+
+    #[test]
+    fn settings_commit_aborts_without_modifying_config_when_autostart_fails() {
+        let temp_dir = TestTempDir::new("settings_commit_autostart_fail");
+        let cfg_path = temp_dir.path().join("config.toml");
+
+        let mut live_cfg = AppConfig::default();
+        let initial_cfg = live_cfg.clone();
+        let mut ui_state = OverlayState::from_config(&live_cfg, Vec::new());
+
+        let mut next_cfg = AppConfig::default();
+        next_cfg.general.start_with_windows = true;
+        next_cfg.voice.voice = "vi-VN-HoaiMyNeural".to_string();
+
+        let res = commit_settings_to_state(
+            &mut live_cfg,
+            Some(&cfg_path),
+            &mut ui_state,
+            next_cfg,
+            |_enabled| {
+                Err(ConfigError::Registry {
+                    action: "RegSetValueExW",
+                    code: 5,
+                })
+            },
+        );
+        assert!(res.is_err());
+        assert_eq!(live_cfg, initial_cfg);
+        assert!(!cfg_path.exists());
+        assert_eq!(ui_state.selected_voice, initial_cfg.voice.voice);
+    }
+
+    #[test]
+    fn settings_cancel_leaves_config_file_and_live_overlay_state_unchanged() {
+        let mut live_cfg = AppConfig::default();
+        live_cfg.voice.volume = 0.75;
+        let ui_state = OverlayState::from_config(&live_cfg, Vec::new());
+
+        let mut draft_state = SettingsDraftState::from_config(&live_cfg);
+        draft_state.draft.voice.volume = 0.15;
+        draft_state.draft.voice.voice = "vi-VN-HoaiMyNeural".to_string();
+        draft_state.draft.display.font_size_px = 30.0;
+
+        let discarded = draft_state.discard();
+        assert_eq!(discarded, live_cfg);
+        assert_eq!(ui_state.selected_voice, "vi-VN-NamMinhNeural");
+        assert!((live_cfg.voice.volume - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn settings_select_region_updates_draft_until_saved_or_discarded() {
+        let temp_dir = TestTempDir::new("settings_region_draft");
+        let cfg_path = temp_dir.path().join("config.toml");
+
+        let saved_region = CaptureRegion {
+            monitor_id: r"\\.\DISPLAY1".to_string(),
+            x: 100,
+            y: 800,
+            width: 800,
+            height: 80,
+        };
+        let mut live_cfg = AppConfig::default();
+        live_cfg.general.region = Some(saved_region.clone());
+        let mut ui_state = OverlayState::from_config(&live_cfg, Vec::new());
+
+        let mut draft_state = SettingsDraftState::from_config(&live_cfg);
+        let new_region = CaptureRegion {
+            monitor_id: r"\\.\DISPLAY1".to_string(),
+            x: 420,
+            y: 1020,
+            width: 1280,
+            height: 60,
+        };
+        draft_state.set_draft_region(new_region.clone());
+        assert_eq!(live_cfg.general.region, Some(saved_region.clone()));
+        assert!(!cfg_path.exists());
+
+        let committed = match draft_state.try_commit() {
+            Ok(c) => c,
+            Err(err) => panic!("expected draft commit to pass: {err}"),
+        };
+        let res = commit_settings_to_state(
+            &mut live_cfg,
+            Some(&cfg_path),
+            &mut ui_state,
+            committed,
+            |_enabled| Ok(()),
+        );
+        assert!(res.is_ok());
+        assert_eq!(live_cfg.general.region, Some(new_region.clone()));
+        assert!(cfg_path.exists());
     }
 }

@@ -331,7 +331,7 @@ fn render_inline_info_panels(ui: &mut egui::Ui, state: &mut OverlayState, config
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let summary = format!(
-                        "Cài đặt nhanh (cửa sổ 5 tab ở Task 12): {} fps · {} · âm lượng {}% · chữ {} px · độ mờ {}%",
+                        "Cài đặt hiện tại: {} fps · {} · âm lượng {}% · chữ {} px · độ mờ {}%",
                         config.general.capture_fps,
                         state.selected_voice,
                         (config.voice.volume * 100.0).round() as u32,
