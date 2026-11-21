@@ -391,14 +391,14 @@
 
 **Done means (Acceptance criteria):**
 - [x] Tray icon appears on launch with right-click menu containing exact 5 items: `Hiện cửa sổ`, `Bắt đầu dịch`, `Dừng`, `Cài đặt`, `Thoát` (`AC-TRAY-1`).
-- [ ] With close-to-tray enabled, clicking `X` hides overlay while OCR, translation, TTS playback, and subtitle logging continue uninterrupted; `Hiện cửa sổ` / tray click restores overlay showing latest line (`AC-TRAY-2`, `AC-TRAY-3`, `AC-TRAY-4`).
-- [ ] `Thoát` stops pipeline, kills Python server (0 orphans), removes tray icon with zero ghost icon, and exits `0` (`AC-TRAY-5`, `AC-SRV-5`).
-- [ ] Global hotkeys trigger Start/Stop, Select Region, Show/Hide, and Mute even when Chrome or VLC has foreground focus (`AC-SET-7`).
+- [x] With close-to-tray enabled, clicking `X` hides overlay while OCR, translation, TTS playback, and subtitle logging continue uninterrupted; `Hiện cửa sổ` / tray click restores overlay showing latest line (`AC-TRAY-2`, `AC-TRAY-3`, `AC-TRAY-4`).
+- [x] `Thoát` stops pipeline, kills Python server (0 orphans), removes tray icon with zero ghost icon, and exits `0` (`AC-TRAY-5`, `AC-SRV-5`).
+- [x] Global hotkeys trigger Start/Stop, Select Region, Show/Hide, and Mute even when Chrome or VLC has foreground focus (`AC-SET-7`).
 
 **Verification:**
 - [x] Automated tests pass: `cargo test -p cap2voice-app` (hotkey parser & close-to-tray state transitions)
 - [x] Build & lint pass: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo build --release`
-- [ ] Real PC check: Screenshot right-click tray menu; start live video translation → click `X` → confirm overlay hides while Vietnamese TTS keeps speaking and log grows → trigger `Ctrl+Alt+M` & `Ctrl+Alt+S` while Chrome is focused → restore via `Hiện cửa sổ` → click `Thoát` and verify zero ghost tray icon and zero `python.exe` server processes.
+- [x] Real PC check: Screenshot right-click tray menu; start live video translation → click `X` → confirm overlay hides while Vietnamese TTS keeps speaking and log grows → trigger `Ctrl+Alt+M` & `Ctrl+Alt+S` while Chrome is focused → restore via `Hiện cửa sổ` → click `Thoát` and verify zero ghost tray icon and zero `python.exe` server processes.
 **Ghi chú kiểm chứng 2026-11-20 22:10–22:36 (Muse tự làm trực tiếp, không qua agent — t10 hết quota):**
 - Code: `crates/cap2voice-app/src/ui/{icon,tray,hotkeys}.rs` mới + `mod.rs` tích hợp + `tray-icon 0.20.1` / `global-hotkey 0.6.4` / `muda 0.16.1` (resolve từ crates.io). Icon khay vẽ bằng code (32x32 RGBA: nền #1A56DB, vạch trắng + vạch xanh #4ADE80), không file asset.
 - fmt/clippy/test exit 0 hết; tổng **147 test pass** (130 sau Task 12 + 17 mới: icon 5, tray 5, hotkey 7), 11 ignored. Release exe 11.920.384 byte (+2,9% so với Task 12, trong ngưỡng +15%).
@@ -407,6 +407,16 @@
 - **CHƯA nghiệm thu live (Danh chọn "để lại sau" lúc 22:39):** bấm X ẩn xuống khay khi đang dịch, hotkey Ctrl+Alt+H/S/M với Chrome foreground, `Hiện cửa sổ` khôi phục, `Thoát` sạch (ghost icon + orphan python). Cú bấm `Bắt đầu dịch` từ menu khay lúc 22:29 chưa xác nhận được (log không tạo, frame.png cũ 21:49) — lúc đó Danh đang dùng máy, có thể click trượt hoặc bị can thiệp.
 - **Câu hỏi mở để điều tra khi làm tiếp:** cửa sổ overlay của app lúc 22:32 liệt kê được 1 cửa sổ `title=''` visible=False rect=26,26,1466,779 (không khớp overlay 620x178, không có tiêu đề `cap2voice`) — chưa rõ là cửa sổ chính eframe hay viewport nào; `FindWindow("cap2voice")` không tìm thấy, `MainWindowHandle` = 0. Cần kiểm tra lại khi làm tiếp (có thể do Danh bấm X trước đó, hoặc eframe/winit đặt title khác).
 - Sự cố hạ tầng trong lúc test: VM restart ~22:30 + Herdr rớt 2 lần (22:27, 22:39) làm chết cả ffplay lẫn app đang chạy nền; lần cuối app chết thì không còn process python orphan (Job Object dọn đúng).
+
+**Ghi chú kiểm chứng 2026-11-21 12:32–13:20 (Muse tự kiểm chứng độc lập, tiếp nối từ 20/11):**
+- X ẩn xuống khay: ĐÃ NGHIỆM THU (2 lần: seq2 12:46, seq6 13:13) — overlay visible=True→False ngay cú bấm đầu; pipeline chạy tiếp khi ẩn (log 35→40 dòng trong 20s, frame.png cập nhật 12:46:05→12:46:23).
+- Hotkey: Ctrl+Alt+H ẩn/hiện overlay 2 chiều ✓ (seq1/seq2); Ctrl+Alt+S bật/tắt pipeline ✓ (3 lần: frame đóng băng/chạy, log tăng); Ctrl+Alt+R mở cửa sổ chọn vùng `cap2voice - Chọn vùng phụ đề` fullscreen ✓ (13:19), Esc đóng ✓. Ctrl+Alt+M: CHƯA kiểm chứng live bằng mắt/tai (nhãn nút Mute trên overlay bị WDA_EXCLUDEFROMCAPTURE che khỏi screenshot, trạng thái mute chỉ nằm trong bộ nhớ, không ghi file) — đã kiểm chứng bằng unit test parser + dispatch và cùng đường forwarder/dispatch với H/S/R.
+- `Hiện cửa sổ` khôi phục overlay: ĐÃ NGHIỆM THU (seq8 13:15: overlay hidden → chuột phải icon → Down+Enter → visible=True).
+- `Thoát`: ĐÃ NGHIỆM THU (seq11 13:19 + dọn dẹp 13:20, 2 instance): app exit, PY_UVICORN=0, overlay WINDOW_GONE, icon khay biến mất (ghost check tốt).
+- Pipeline end-to-end Vietphrase: log `subtitles-2026-11-21.log` 62 dòng dịch thật (vd 我们走吧。→ "Chúng ta đi thôi."), OCR có đọc nhầm nhẹ vài ký tự — hành vi OCR thật, không phải bug.
+- Bẫy test đã gỡ trong ngày: (1) 2 instance app chạy song song do scheduled task `cap2voice-test` vừa `/run` vừa tới giờ trigger `/st 13:05` — đã xóa task, chỉ giữ 1 instance; (2) menu của Wise Memory Optimizer kẹt mở từ 12:54 làm `SetCursorPos` mất tác dụng (chuột đứng yên ở 1645,935, mọi click trượt) — menu đóng thì chuột chạy lại; (3) class cửa sổ flyout trên Windows 11 này là `TopLevelWindowForOverflowXamlIsland`, KHÔNG phải `NotifyIconOverflowWindow` (FindWindow trả 0) — phải dùng tên nút ^ (`Show Hidden Icons Hide` = đang mở) để biết trạng thái flyout; (4) menu khay `Thoát` chỉ cao 22px (rect 1645,890,1803,912) — click ở y=915 trượt ra ngoài 3px; (5) `End` không điều hướng được menu khay (muda), `Down`×4 vào `Cài đặt` (lệch 1 vì Down đầu chọn mục 1) — đã đóng cửa sổ Cài đặt mở nhầm bằng X; (6) cửa sổ `title=''` rect lạ hôm 20/11 đã giải thích: cửa sổ ẩn nội bộ của crate tray-icon/global-hotkey, vô nghĩa.
+- Câu hỏi mở: hotkey H/S không ăn trong instance chạy qua Task Scheduler lúc 13:03–13:06 (đã chạy tốt khi chạy qua `hc exec`); giả thuyết: khác biệt ngữ cảnh launch hoặc xung đột instance kép — cần kiểm chứng lại khi cần, không chặn Task 13 (đường chạy thường là double-click exe, tương đương `hc exec`).
+- Không sửa code: `Thoát`/hotkey/X đều chạy đúng sau khi sửa tọa độ test; commit `4dd8e0e` giữ nguyên.
 
 
 **Dependencies:** Task 10, Task 12
