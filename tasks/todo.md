@@ -467,15 +467,19 @@
 
 **Checkpoint 5 ĐÃ DUYỆT (Danh, chat chính, 2026-11-21 14:38):** Task 14 xong, commit `ff7a4d8`, V1 được coi là qua cổng. Danh duyệt với test-log ghi 30 PASS / 7 PARTIAL / 4 UNIT / 7 NOT VERIFIED / 2 SKIPPED — các mục chưa kiểm chứng để sau V1, không chặn cổng.
 
-### Task 15 (sau V1): Sửa lỗi câu rác lúc chuyển phụ đề — HOÃN, chưa làm
+### Task 15 (Giai đoạn 2): Sửa lỗi câu rác lúc chuyển phụ đề — ĐANG LÀM (Danh duyệt 14:50 21/11)
 
 **Mô tả:** Lúc phụ đề chuyển câu, OCR đọc nhầm khung hình đang chuyển (pha trộn câu cũ + câu mới) rồi ghi thành dòng rác vào log. Tỉ lệ đo được: **61/190 dòng log (32%)** là dòng rác kiểu này (dòng sạch luôn theo sau trong cùng giây). Cặp sai–câu sạch tương đồng Levenshtein tối đa **0,82–0,86**, dưới ngưỡng dedupe 0,93 nên chỉnh ngưỡng không chặn được.
 
-**Hướng sửa đã đề xuất (chưa làm, chưa sửa code):** giữ-chờ rồi thay (hold-and-replace) — giữ câu OCR mới 300–500 ms, nếu có câu khác tới thì thay bằng câu mới, chỉ phát (dịch/TTS/log) câu cuối cùng. **Không sửa ngưỡng dedupe 0,93.**
+**Đã làm (code, 21/11):** hold-and-replace — `SubtitleHold` trong `crates/cap2voice-app/src/pipeline/mod.rs`: giữ câu OCR mới 400 ms (`DEFAULT_HOLD_DELAY`, `PipelineSettings.hold_delay`, validate ≤ 1 s), có câu khác tới thì thay, chỉ phát (dịch/TTS/log) câu cuối. **Không đổi ngưỡng dedupe 0,93.** Metric mới `held_lines_replaced` đếm số dòng rác bị thay. Unit test `SubtitleHold` (3 test) + integration test `pipeline_hold_and_replace_suppresses_transitional_garbage_line` (garbage → clean, chỉ clean được dịch/log/TTS). `test_settings`/`test_pipeline_settings` đặt `hold_delay = 0` (mock đẩy dòng nhanh như tick, hold 400 ms sẽ gộp nhầm dòng thật khác nhau; hold được kiểm chứng bằng test riêng + live).
+
+**Gate (21/11, chạy bằng `hc exec`):** fmt 0, clippy 0, `cargo test --workspace --lib --tests` 0 (102 lib + 10 pipeline + 22 wcocr-rs + …), mypy --strict 0, pytest 37 passed. Lưu ý: `cargo test` dưới SSH lỗi os error 448 (untrusted mount point) — chạy bằng `hc exec` thì hết; `cargo fmt` trước đó sửa 3 chỗ format.
 
 **Giới hạn của hướng sửa:** giữ-chờ không sửa độ chính xác OCR — ví dụ "明天草上见。" sai 3 lần, mãi 13:35 mới đúng "明天早上见。". Những lỗi OCR kiểu này vẫn cần xử lý riêng (V2).
 
 **Done means:** tỉ lệ dòng rác trong log < 5% trên cùng video khói 90 s; latency vẫn ≤ 2,0 s median; không đổi ngưỡng dedupe.
 
+**Kết quả kiểm chứng live (21/11 15:06, video khói 90 s, bản release mới):** 18 dòng mới (15 slot vòng 1 + 3 slot vòng 2 do ffplay `-loop 0` lặp lại). **Tỉ lệ dòng rác 0/18 = 0%** (baseline 61/190 = 32%), **latency median 1 s** (max 3 s ở dòng đầu do khởi động, còn lại đều +1 s so với lưới slot 6 s). Ngưỡng dedupe không đổi (0,93). **Done means ĐẠT.** Lưu ý: 4/18 dòng vẫn là lỗi đọc OCR (vd "雨我们走吧了。", "对不起时谢我来晚了。") — mỗi dòng là dòng duy nhất trong slot, không có dòng sạch thay thế nên giữ-chờ không chặn được; đó là giới hạn đã ghi, xử lý riêng ở V2. Lần chạy live đầu (15:03) được 0 dòng vì quên bấm Ctrl+Alt+S để chạy pipeline — đã chạy lại có bấm hotkey.
+
 **Verification:**
-- [ ] Real PC check: chạy video khói 90 s, đếm dòng rác trong log < 5%; latency median ≤ 2,0 s.
+- [x] Real PC check: chạy video khói 90 s, đếm dòng rác trong log < 5%; latency median ≤ 2,0 s. (21/11 15:06: 0/18 rác, median 1 s)

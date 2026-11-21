@@ -134,6 +134,11 @@ fn test_settings(fps: u32) -> PipelineSettings {
         pixel_diff_threshold: 0.02,
         dedupe_threshold: 0.93,
         blank_reset_frames: 5,
+        // Hold disabled here: the scripted mocks feed lines as fast as the
+        // ticks, so a 400 ms hold would merge genuinely different lines.
+        // The hold is covered by its own test below (50 ms) and by the
+        // real-PC live verification (400 ms default).
+        hold_delay: Duration::ZERO,
         voice: "vi-VN-NamMinhNeural".to_string(),
         speech_rate: "+0%".to_string(),
         auto_read: true,
@@ -630,6 +635,80 @@ async fn pipeline_happy_path_captures_skips_static_frames_translates_speaks_and_
     assert_eq!(lines.len(), 2);
     assert!(lines[0].ends_with("] 夜深了，雨还在下。 : Đêm đã khuya, mưa vẫn còn rơi."));
     assert!(lines[1].ends_with("] 明日再议。 : Ngày mai bàn tiếp."));
+
+    handle.stop().await;
+    assert_eq!(rx.borrow().status, PipelineStatus::Idle);
+}
+
+#[tokio::test]
+async fn pipeline_hold_and_replace_suppresses_transitional_garbage_line() {
+    let temp = TempDirGuard::new("hold");
+    // Two frames that differ enough to trigger OCR on consecutive ticks:
+    // the first reads a transitional garbage line, the second the clean line.
+    let capturer = Arc::new(MockCapturer::new(
+        vec![Ok(frame_with_band(20, 230)), Ok(frame_with_band(20, 100))],
+        Ok(frame_with_band(20, 100)),
+    ));
+    let ocr = Arc::new(MockOcrEngine::new(
+        vec![
+            Ok(ocr_block("对不起时说找来晚了。")),
+            Ok(ocr_block("对不起，我来晚了。")),
+        ],
+        Ok(ocr_block("对不起，我来晚了。")),
+    ));
+    let translator = Arc::new(ControllableTranslator::scripted(vec![Ok(
+        "Xin lỗi, ta đã tới chậm.".to_string(),
+    )]));
+    let tts = Arc::new(MockTtsEngine::new(Vec::new()));
+    let audio = Arc::new(MockAudioPlayback::new());
+    let logger = Arc::new(SubtitleLogger::new(temp.path().to_path_buf()));
+
+    let mut settings = test_settings(60);
+    settings.hold_delay = Duration::from_millis(50);
+
+    let handle = match PipelineRunner::start(
+        settings,
+        PipelineDeps {
+            capturer: capturer.clone(),
+            ocr: ocr.clone(),
+            translator: translator.clone(),
+            tts: tts.clone(),
+            audio: audio.clone(),
+            logger: Some(logger),
+        },
+    ) {
+        Ok(h) => h,
+        Err(err) => panic!("PipelineRunner::start failed: {err}"),
+    };
+
+    let mut rx = handle.subscribe();
+    let snap = wait_for_snapshot(
+        &mut rx,
+        "garbage line replaced, only clean line translated, logged, and spoken",
+        |s| {
+            s.metrics.logged_pairs == 1
+                && s.metrics.held_lines_replaced == 1
+                && s.metrics.tts_calls == 1
+        },
+    )
+    .await;
+
+    assert_eq!(snap.status, PipelineStatus::Running);
+    assert_eq!(snap.chinese_line, "对不起，我来晚了。");
+    assert_eq!(snap.vietnamese_line, "Xin lỗi, ta đã tới chậm.");
+    assert_eq!(snap.metrics.subtitles_emitted, 1);
+    assert_eq!(snap.metrics.translations_succeeded, 1);
+    assert_eq!(snap.metrics.tts_calls, 1);
+    assert_eq!(translator.calls(), vec!["对不起，我来晚了。".to_string()]);
+
+    let today_log = daily_log_path(temp.path(), Local::now().date_naive());
+    let content = match std::fs::read_to_string(&today_log) {
+        Ok(s) => s,
+        Err(err) => panic!("failed reading daily log {}: {err}", today_log.display()),
+    };
+    let lines: Vec<&str> = content.lines().collect();
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].ends_with("] 对不起，我来晚了。 : Xin lỗi, ta đã tới chậm."));
 
     handle.stop().await;
     assert_eq!(rx.borrow().status, PipelineStatus::Idle);

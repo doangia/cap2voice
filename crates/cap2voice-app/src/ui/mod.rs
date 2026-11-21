@@ -1598,6 +1598,7 @@ mod tests {
             pixel_diff_threshold: 0.02,
             dedupe_threshold: 0.93,
             blank_reset_frames: 5,
+            hold_delay: Duration::ZERO,
             voice: "vi-VN-NamMinhNeural".to_string(),
             speech_rate: "+0%".to_string(),
             auto_read: true,
