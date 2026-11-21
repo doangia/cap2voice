@@ -82,7 +82,10 @@ pub enum CaptureError {
     Io { path: String, detail: String },
 }
 
-/// Trait abstracting screen region capture (allows swapping `xcap` for `windows-capture`).
+/// Trait abstracting screen region capture.
+///
+/// The only production implementation is `xcap`; there is no `windows-capture`
+/// fallback. The trait exists so tests can substitute a fake capturer.
 pub trait FrameCapturer: Send + Sync {
     fn list_monitors(&self) -> Result<Vec<MonitorInfo>, CaptureError>;
     fn capture_region(&self, region: &CaptureRegion) -> Result<CapturedFrame, CaptureError>;

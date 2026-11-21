@@ -15,7 +15,7 @@
 
 - The app **only observes a user-selected screen region** — it is **not** a video player and never reads video files or inspects browser tabs/DOM.
 - In real time, it captures the subtitle region, skips visually unchanged frames, runs local WeChat OCR (`wcocr-rs`), filters to Chinese text, deduplicates repeated subtitle lines, translates Chinese → Vietnamese, displays both lines (Chinese above in white, Vietnamese below in green) on a borderless always-on-top floating overlay, reads the Vietnamese translation aloud via TTS, and logs each `Chinese : Vietnamese` pair to disk.
-- To reach a working V1 quickly without blocking on native Rust Edge-TTS WebSocket work, translation (Google Translate free endpoint) and TTS (Edge-TTS) run behind a **temporary local Python FastAPI server** automatically started and stopped by the Rust application. The Rust app communicates with it through clean trait boundaries so V2 can replace both endpoints with native Rust without changing the UI, capture, OCR, or tray layers.
+- To reach a working V1 quickly without blocking on native Rust Edge-TTS WebSocket work, translation (offline Vietphrase dictionary engine) and TTS (Edge-TTS) run behind a **temporary local Python FastAPI server** automatically started and stopped by the Rust application. The Rust app communicates with it through clean trait boundaries so V2 can replace both endpoints with native Rust without changing the UI, capture, OCR, or tray layers.
 
 ### End-to-End Pipeline
 
@@ -33,7 +33,7 @@ Fuzzy Deduplicator (threshold 0.93 + blank-frame reset)
    │  4. Emit only when new Chinese line differs from previous line
    ▼
 Local Python API Server (127.0.0.1:<port>, managed by Rust app)
-   ├─ POST /translate  (zh → vi, Google Translate free endpoint)
+   ├─ POST /translate  (zh → vi, offline Vietphrase)
    └─ POST /tts        (vi → MP3, Edge-TTS, default vi-VN-NamMinhNeural)
    ▼
 Floating egui Overlay (Chinese white + Vietnamese green)
@@ -49,7 +49,7 @@ Each capability maps to a single responsibility with one-way dependencies (no cy
 |---|---|---|
 | `config` | Typed settings model, TOML load/save, validation, Windows autostart registry helper | — |
 | `ocr` | `wcocr-rs` pure Rust crate (WeChat 4.x mmmojo), path auto-detection, CJK filtering, line assembly | — |
-| `capture` | Region coordinates (DPI/monitor-aware), screen capture (`xcap` / fallback `windows-capture`), pixel-diff gate | `config` |
+| `capture` | Region coordinates (DPI/monitor-aware), screen capture (`xcap` only — no fallback backend), pixel-diff gate | `config` |
 | `api-server` | Temporary Python FastAPI server (`GET /health`, `POST /translate`, `POST /tts`) + Rust child-process lifecycle & Windows Job Object cleanup | `config` |
 | `pipeline` | Capture loop orchestration, fuzzy deduplicator, `Translator` HTTP client, `TtsClient` HTTP client, `rodio` FIFO audio player, UTF-8 subtitle logger | `config`, `capture`, `ocr`, `api-server` |
 | `overlay-ui` | `eframe`/`egui` borderless always-on-top 2-line overlay, region-selector fullscreen overlay, CJK+Vietnamese font chain, visible error/status banner | `config`, `pipeline` |
@@ -65,8 +65,8 @@ Each capability maps to a single responsibility with one-way dependencies (no cy
 | Layer | Technology | Version / Notes |
 |---|---|---|
 | OS & Toolchain | Windows 10/11 x64 (`x86_64-pc-windows-msvc`), Rust 2021 edition | Verified locally: `rustc 1.93.1`, `cargo 1.93.1` |
-| GUI & Overlay | `eframe` / `egui` | `eframe` `0.37` (pure Rust, no Tauri, no WebView) |
-| Screen Capture | `xcap` (primary) / `windows-capture` (contingency fallback) | `xcap` `0.9.10`; fallback `windows-capture` `2.0.1` if real-PC capture latency exceeds budget |
+| GUI & Overlay | `eframe` / `egui` | `eframe` `0.35` (pure Rust, no Tauri, no WebView) |
+| Screen Capture | `xcap` | `xcap` `0.9.10` (only backend; measured on the real PC: p50 15.45 ms / p95 17.38 ms, well under the 30/50 ms budget — no fallback exists) |
 | Local OCR | `wcocr-rs` (internal workspace crate, refactored from `C:\Users\doanv\wechat-ocr-rs`) | `libloading` `0.8`, `prost` `0.13`, `serde` `1`; WeChat 4.x `mmmojo_64.dll` + `wxocr.dll` (plugin 8022, Weixin `4.0.2.28` — user's PC, personal-use only) |
 | HTTP Client | `reqwest` (with `tokio` runtime) | `reqwest` `0.13` (Rust app → local Python server) |
 | Audio Playback | `rodio` (MP3 decoder enabled) | `rodio` `0.23` |
@@ -104,7 +104,7 @@ Reference mockup: `docs/mockups/media-generation-region-select-*.webp`.
 - `AC-CAP-3`: On a Windows display at `125%` or `150%` DPI scaling, a captured PNG of the selected region matches the visual pixels inside the drawn red box within ±2 px.
 - `AC-CAP-4`: On a paused video frame (static pixels), pixel-diff skips ≥ 99% of frames after the initial frame (zero redundant OCR calls while static).
 - `AC-CAP-5`: When the subtitle text changes on screen, pixel-diff triggers OCR on the next capture tick (≤ 150 ms at 10 fps).
-- `AC-CAP-6`: Median cropped-frame capture latency on the target PC is ≤ 30 ms (p95 ≤ 50 ms). If `xcap` exceeds 50 ms p95 on the real PC, swap the `FrameCapturer` implementation to `windows-capture` `2.0.1` without changing callers.
+- `AC-CAP-6`: Median cropped-frame capture latency on the target PC is ≤ 30 ms (p95 ≤ 50 ms). Measured on the real PC: p50 15.45 ms / p95 17.38 ms (Task 5). There is no fallback backend; if `xcap` ever exceeds budget, evaluating another capture library is a new engineering decision, not a swap to existing code.
 - `AC-CAP-7`: If the saved monitor is disconnected or coordinates fall out of bounds, capture fails explicitly with a Vietnamese UI warning prompting the user to re-select the region (never panics or captures garbage).
 
 ---
@@ -158,7 +158,7 @@ Reference mockup: `docs/mockups/media-generation-region-select-*.webp`.
 - Runs asynchronously off the UI thread. If a newer Chinese subtitle arrives while a previous translation is in flight, sequence numbers ensure stale responses never overwrite newer subtitles on screen.
 - **Explicit Error Handling (non-negotiable):**
   - Network unreachable / DNS error / upstream `502`/`503`: show visible error banner `"Mất kết nối mạng — không thể dịch"`, keep displaying the latest Chinese OCR line, do **not** display fake text or reuse the previous Vietnamese translation under a new Chinese line (clear or mark Vietnamese line as `[Lỗi dịch — kiểm tra kết nối mạng]`).
-  - Upstream HTTP `429` (Google Translate rate limit): show visible warning `"Google Translate bị giới hạn tốc độ — tạm chờ..."` and apply bounded backoff (e.g. 2 s) before retrying subsequent lines.
+  - Translation is offline (Vietphrase dictionaries, no network call), so there is no upstream rate limit for `/translate`: no `429` is produced by the server. The Rust client's `429` → `TranslateError::RateLimited` mapping is retained only as defensive code for a future network-backed translator, and must not be presented as a live V1 path.
   - Local server down/refused: show `"Server dịch/TTS chưa sẵn sàng"` and attempt controlled health-check recovery or surface restart error.
 
 **Acceptance Criteria:**
@@ -241,7 +241,7 @@ Reference mockup: `docs/mockups/media-generation-settings-tray-*.webp`.
        - Checkbox: `Khởi động cùng Windows` (default unchecked)
        - Checkbox: `Khởi động ở chế độ ẩn xuống khay` (default unchecked)
     2. `Dịch` (Translation):
-       - Translation provider display (`Google Translate (miễn phí — qua server local)`)
+       - Translation provider display (`Vietphrase (offline — qua server local)`)
        - Local API server port (default `18765`) + `Kiểm tra kết nối` button calling `GET /health`
        - Fuzzy deduplication threshold slider (`0.80`–`0.99`, default `0.93`)
        - Pixel-diff sensitivity threshold slider (`0.5%`–`10.0%`, default `2.0%`)
@@ -311,13 +311,12 @@ Located in `server/server.py` and `server/requirements.txt`. Strictly temporary;
 - **HTTP Contract:**
   1. `GET /health`
      - `200 OK`
-     - Body: `{"status": "ok", "version": "0.1.0", "translator": "google-free", "tts": "edge-tts"}`
+     - Body: `{"status": "ok", "version": "0.1.0", "translator": "vietphrase", "tts": "edge-tts"}`
   2. `POST /translate`
      - Request (`application/json`): `{"text": "夜深了，雨还在下。"}`
      - `200 OK`: `{"text": "Đêm đã khuya, mưa vẫn còn rơi."}`
      - `400 Bad Request`: empty/whitespace-only `text` → `{"error": "invalid_input", "detail": "text must not be empty"}`
-     - `429 Too Many Requests`: upstream Google Translate rate-limit → `{"error": "rate_limited", "detail": "..."}`
-     - `502 Bad Gateway` / `503 Service Unavailable`: upstream network error/timeout/unexpected payload → `{"error": "upstream_error", "detail": "..."}`
+     - `503 Service Unavailable`: translator dictionaries missing/unloadable → `{"error": "translator_unavailable", "detail": "..."}` (no `429` and no upstream `502` are produced: translation is offline, there is no upstream network call)
   3. `POST /tts`
      - Request (`application/json`): `{"text": "Đêm đã khuya, mưa vẫn còn rơi.", "voice": "vi-VN-NamMinhNeural", "rate": "+0%"}` (`voice` defaults to `"vi-VN-NamMinhNeural"`, `rate` defaults to `"+0%"`).
      - `200 OK`: `Content-Type: audio/mpeg`, raw non-empty MP3 bytes.
@@ -508,14 +507,19 @@ class TranslateResponse(BaseModel):
 
 
 @app.post("/translate", response_model=TranslateResponse)
-async def translate(req: TranslateRequest) -> TranslateResponse:
+async def translate(
+    req: TranslateRequest,
+    translator: Translator = Depends(get_translator),
+) -> TranslateResponse:
     cleaned = req.text.strip()
     if not cleaned:
         raise HTTPException(
             status_code=400,
             detail={"error": "invalid_input", "detail": "text must not be empty"},
         )
-    translated = await fetch_google_translation(cleaned)
+    # Offline Vietphrase dictionary lookup (server.vietphrase); synchronous,
+    # so it runs in a worker thread. No network call, no upstream rate limit.
+    translated = await asyncio.to_thread(translator.translate, cleaned)
     return TranslateResponse(text=translated)
 ```
 
@@ -536,10 +540,10 @@ Testing follows `AGENTS.md` and TDD (RED → GREEN → REFACTOR): every function
 
 | Risk | Verification Check | Mitigation / Contingency |
 |---|---|---|
-| `xcap` capture latency on real PC | Benchmark 100 cropped captures on target display | If p95 > 50 ms, switch `FrameCapturer` impl to `windows-capture` `2.0.1` |
-| Google Translate quality on short spoken subtitles & free-endpoint rate limits | 15+ min real drama test + inspect log pairs | Deduplication (`0.93`) + pixel-diff minimize request volume; surface HTTP `429` explicitly; evaluate DeepL in V2 |
+| `xcap` capture latency on real PC | Benchmark 100 cropped captures on target display | Measured p50 15.45 ms / p95 17.38 ms (Task 5), well under budget; no fallback backend exists |
+| Vietphrase offline translation quality on short spoken subtitles | 15+ min real drama test + inspect log pairs | Deduplication (`0.93`) + pixel-diff minimize request volume; evaluate DeepL in V2 |
 | `wcocr-rs` temp-file I/O vs in-memory `pic_data` | Measure OCR latency over 50 consecutive subtitle changes | Start with single reused `%TEMP%\cap2voice\frame.png`; test `pic_data` if disk I/O is measurable |
-| `tray-icon` + `eframe` 0.37 close-to-tray event loop on Windows | Live test clicking `X` during active playback + restoring via tray | Intercept `CloseRequested` via `ViewportCommand::CancelClose` + `Visible(false)`; wake event loop on tray messages |
+| `tray-icon` + `eframe` 0.35 close-to-tray event loop on Windows | Live test clicking `X` during active playback + restoring via tray | Intercept `CloseRequested` via `ViewportCommand::CancelClose` + `Visible(false)`; wake event loop on tray messages |
 | Windows DPI scaling (`125%` / `150%`) & multi-monitor region offset | Draw box on scaled display, save captured frame, compare visually | Normalize logical egui points ↔ physical monitor pixels via monitor scale factor |
 | CJK + Vietnamese font rendering in `egui` | Live screenshot with Traditional/Simplified Chinese + full Vietnamese diacritics | Load Windows system fonts (`Segoe UI` + `Microsoft YaHei`) into `egui::FontDefinitions` |
 
@@ -558,7 +562,7 @@ Testing follows `AGENTS.md` and TDD (RED → GREEN → REFACTOR): every function
 ### Ask First
 - Any Git state-modifying operation (`commit`, `push`, `pull`, `merge`, `rebase`, `reset`, branch creation/deletion, tagging) or publish/deploy/delete action — requires an explicit "go" for that exact action.
 - Modifying existing original files outside newly created project artifacts.
-- Adding new major crates/dependencies or triggering the `xcap` → `windows-capture` contingency swap.
+- Adding new major crates/dependencies (including any new capture backend — there is no `windows-capture` fallback to swap to).
 - Changing the HTTP contract (`/health`, `/translate`, `/tts`), `config.toml` schema, or `CONSTRAINTS.md` quality thresholds.
 
 ### Never
@@ -592,7 +596,7 @@ V1 is ready for user acceptance and packaging when **all** conditions below pass
 The following items from `brief.md` §8 and `AGENTS.md` are explicitly excluded from V1 and must not be implemented in this cycle:
 
 - **Local offline translation model (`Helsinki-NLP/opus-mt-zh-vi`, ~300 MB):** Deferred to V2 to avoid shipping heavy ML inference runtimes in V1.
-- **DeepL API translation backend:** Deferred to V2 pending real-subtitle quality evaluation of Google Translate in V1.
+- **DeepL API translation backend:** Deferred to V2 pending real-subtitle quality evaluation of Vietphrase in V1.
 - **Native Rust Edge-TTS (direct WebSocket protocol) & Python server removal:** Deferred to V2; V1 isolates the Python server behind `Translator`/`TtsEngine` traits for a clean drop-in swap later.
 - **Pinyin display above the Chinese line & click-to-replay Chinese audio:** Deferred to V2 language-learning enhancements.
 - **Searchable translation history table UI:** Deferred to V2 (V1 provides UTF-8 log files on disk).
@@ -614,6 +618,6 @@ Per instructions, reasonable defaults were chosen for all underspecified details
 7. **Python Environment & Local Server Port:** **Assumption:** `cap2voice-app` looks for `server/.venv/Scripts/python.exe` first, then `python` on `PATH`, and binds to configurable `127.0.0.1:18765` (explicit error if port is occupied — no silent port hopping).
 8. **WeChat OCR Image Input (`pic_path` vs `pic_data`):** Inspected `wcocr-rs/src/ocr.rs` passes `pic_path` (proven on WeChat 4.x) while `pic_data` in `wx4::ParseOcrReqMessage` is untested. **Assumption:** V1 uses a single reused temp file (`%TEMP%\cap2voice\frame.png`) as the proven path and optionally benchmarks `pic_data` in-memory during OCR implementation.
 9. **Subtitle Log Path & Format:** **Assumption:** Daily UTF-8 append logs at `%APPDATA%\cap2voice\logs\subtitles-YYYY-MM-DD.log` with format `[YYYY-MM-DD HH:MM:SS] <Chinese> : <Vietnamese>`, flushed per line, configurable directory in Settings → `Chung`.
-10. **Google Translate Free Endpoint:** **Assumption:** `server/server.py` queries Google's public web translate endpoint (`https://translate.googleapis.com/translate_a/single?client=gtx&sl=zh-CN&tl=vi&dt=t`) via async `httpx` with strict timeouts and explicit HTTP `429`/`502` error mapping.
+10. **Offline Vietphrase Translation:** **Assumption (updated 2026-11-21, supersedes the original Google Translate assumption):** `server/server.py` translates fully offline through `server.vietphrase` (a port of the GPL-3.0 `duongden/script-vietphrase-translator` userscript; dictionaries live in `server/vietphrase/data`, outside git). It replaced the Google Translate free endpoint on 2026-11-20 because Google returned HTTP `429` for ~2 days. There is no upstream network call and no rate limit for `/translate`; the server returns `503 translator_unavailable` only when the dictionaries are missing/unloadable.
 11. **Overlay Self-Capture Exclusion:** Dragging the floating overlay over the selected subtitle box would create an OCR feedback loop if captured. **Assumption:** V1 applies Windows `SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)` (Windows 10 2004+) to exclude the overlay from screen capture automatically, plus warns if the call is unsupported and regions overlap.
 12. **Start With Windows Registry Scope:** **Assumption:** `Khởi động cùng Windows` defaults to **unchecked** and, when enabled by the user, writes only to per-user `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\cap2voice` (requires no UAC admin elevation).

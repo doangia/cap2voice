@@ -42,13 +42,13 @@ cap2voice/
 └── AGENTS.md             # this file
 ```
 
-- UI: `eframe` 0.37 (egui), borderless always-on-top overlay window.
-- Capture: `xcap` 0.9.10; fallback `windows-capture` 2.0.1 if xcap is too slow on the real PC.
+- UI: `eframe` 0.35 (egui), borderless always-on-top overlay window.
+- Capture: `xcap` 0.9.10. There is no `windows-capture` fallback: `xcap` is the only capture backend, and the `FrameCapturer` trait exists so tests can substitute a fake, not to swap in another real backend.
 - OCR: `wcocr-rs` (internal crate). Current code exports a C ABI
   (`wechat_ocr` / `stop_ocr`); the first refactor is to use it as a direct Rust crate.
 - HTTP: `reqwest` 0.13 (Rust app → Python server). Audio: `rodio` 0.23.
 - Python server (temporary, later replaced by native Rust): FastAPI,
-  `POST /translate` (Google Translate, zh→vi), `POST /tts` (Edge-TTS → mp3,
+  `POST /translate` (Vietphrase offline, zh→vi), `POST /tts` (Edge-TTS → mp3,
   default voice `vi-VN-NamMinhNeural`). The Rust app starts/stops the server
   itself; the user never runs it by hand.
 - No crate `edge-tts` exists: native Rust TTS later means calling the Edge-TTS
@@ -97,8 +97,7 @@ Every task runs the lifecycle. Never write code before the spec and plan gates p
 - **WeChat OCR engine is personal-use only.** It runs through the Weixin
   install on the PC (`C:\Program Files\Tencent\Weixin\4.0.2.28`, OCR plugin
   8022). Never distribute the engine or its binaries.
-- **Network failures are reported, never silent.** Google Translate (free
-  endpoint) and Edge-TTS need network. If the network is down, the app must
+- **Network failures are reported, never silent.** Edge-TTS needs network; Vietphrase translation is offline and does not. If the network is down, the app must
   say so clearly instead of silently not translating.
 - **Do not build out-of-MVP scope in the first round:** local translation
   model (`Helsinki-NLP/opus-mt-zh-vi`), native Rust TTS, pinyin on the Chinese
@@ -121,9 +120,8 @@ python -m pytest server/
 - UI checks need a screenshot or a live run on the PC — a successful compile
   is not a UI verification.
 - Known risks to verify during build (from `brief.md` §9): xcap capture speed
-  on the real PC; Google Translate quality on short spoken subtitle lines;
-  Edge-TTS websocket protocol (native Rust step only); free Translate endpoint
-  rate limits; tray-icon crate behavior and close-to-tray on Windows.
+  on the real PC; Vietphrase offline translation quality on short spoken subtitle lines;
+  Edge-TTS websocket protocol (native Rust step only); tray-icon crate behavior and close-to-tray on Windows.
 
 ## Conventions
 
