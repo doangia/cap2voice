@@ -151,6 +151,18 @@ pub fn extract_chinese_subtitle(blocks: &[TextBlock]) -> Option<String> {
     filter_cjk_text(&joined)
 }
 
+/// Sort `blocks` in reading order and filter each block's text separately,
+/// returning one non-empty Chinese line per visual line (top-to-bottom).
+/// Two visual lines in one OCR frame stay separate here so the pipeline can
+/// treat them as two utterances (A2 / gh #1) instead of one merged line.
+/// Returns an empty `Vec` when no block contains CJK text.
+pub fn extract_chinese_subtitle_lines(blocks: &[TextBlock]) -> Vec<String> {
+    sort_text_blocks(blocks)
+        .into_iter()
+        .filter_map(|block| filter_cjk_text(block.text.trim()))
+        .collect()
+}
+
 /// Strip whitespace and punctuation, leaving only CJK ideographs and normalized digits
 /// for deduplication comparison.
 pub fn normalize_for_comparison(text: &str) -> String {
@@ -284,9 +296,9 @@ impl TextDeduplicator for FuzzyDeduplicator {
 #[cfg(test)]
 mod tests {
     use super::{
-        filter_cjk_text, is_cjk_ideograph, join_sorted_blocks, normalized_similarity,
-        sort_text_blocks, FuzzyDeduplicator, TextDeduplicator, DEFAULT_BLANK_RESET_FRAMES,
-        DEFAULT_DEDUPE_THRESHOLD,
+        extract_chinese_subtitle_lines, filter_cjk_text, is_cjk_ideograph, join_sorted_blocks,
+        normalized_similarity, sort_text_blocks, FuzzyDeduplicator, TextDeduplicator,
+        DEFAULT_BLANK_RESET_FRAMES, DEFAULT_DEDUPE_THRESHOLD,
     };
     use wcocr_rs::TextBlock;
 
@@ -320,6 +332,33 @@ mod tests {
             .collect();
         assert_eq!(sorted_texts, vec!["你", "好", "世界", "明天", "见"]);
         assert_eq!(join_sorted_blocks(&blocks), "你 好 世界 明天 见");
+    }
+
+    #[test]
+    fn extract_chinese_subtitle_lines_keeps_two_visual_lines_separate() {
+        // Two speakers stacked in one frame stay two utterances.
+        let blocks = vec![
+            block(100.0, 100.0, 300.0, 120.0, "你好吗？"),
+            block(100.0, 130.0, 300.0, 150.0, "我很好。"),
+        ];
+        assert_eq!(
+            extract_chinese_subtitle_lines(&blocks),
+            vec!["你好吗？".to_string(), "我很好。".to_string()]
+        );
+    }
+
+    #[test]
+    fn extract_chinese_subtitle_lines_drops_non_cjk_blocks() {
+        let blocks = vec![
+            block(100.0, 100.0, 300.0, 120.0, "你好"),
+            block(100.0, 130.0, 300.0, 150.0, "ABC 123"),
+            block(100.0, 160.0, 300.0, 180.0, "再见"),
+        ];
+        assert_eq!(
+            extract_chinese_subtitle_lines(&blocks),
+            vec!["你好".to_string(), "再见".to_string()]
+        );
+        assert!(extract_chinese_subtitle_lines(&[]).is_empty());
     }
 
     #[test]

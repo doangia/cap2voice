@@ -23,7 +23,7 @@ use crate::config::{
 use crate::ocr::{resolve_wechat_paths_from_config, OcrEngine, WeChatOcrAdapter};
 use crate::pipeline::{
     PipelineDeps, PipelineHandle, PipelineRunner, PipelineSettings, PipelineSnapshot,
-    PipelineStatus, SubtitleLogger,
+    PipelineStatus, SubtitleLogger, TranslationCache, TtsCache,
 };
 use eframe::egui;
 use global_hotkey::GlobalHotKeyEvent;
@@ -214,6 +214,11 @@ pub struct Cap2VoiceApp {
     capturer: Arc<dyn FrameCapturer>,
     ocr: Option<Arc<dyn OcrEngine>>,
     audio: Option<Arc<dyn AudioPlayback>>,
+    /// Translation + TTS caches (A3 / gh #2), shared with the pipeline.
+    /// Created lazily from `config.effective_cache_dir()` so the Settings
+    /// "clear cache" action works even before the pipeline ever started.
+    translation_cache: Option<Arc<TranslationCache>>,
+    tts_cache: Option<Arc<TtsCache>>,
     pipeline_handle: Option<PipelineHandle>,
     pipeline_rx: Option<watch::Receiver<PipelineSnapshot>>,
     repaint_forwarder: Option<tokio::task::JoinHandle<()>>,
@@ -470,6 +475,8 @@ impl Cap2VoiceApp {
             capturer: Arc::new(XcapCapturer::new()),
             ocr: None,
             audio: None,
+            translation_cache: None,
+            tts_cache: None,
             pipeline_handle: None,
             pipeline_rx: None,
             repaint_forwarder: None,
@@ -663,6 +670,25 @@ impl Cap2VoiceApp {
         self.position_tracker.mark_saved(pos);
     }
 
+    /// Load (or reuse) the translation + TTS caches from
+    /// `config.effective_cache_dir()` (A3 / gh #2). Kept on the app so the
+    /// Settings "clear cache" action can reach the same `Arc`s the
+    /// pipeline uses, even before the pipeline ever started.
+    fn ensure_caches(&mut self) -> Result<(Arc<TranslationCache>, Arc<TtsCache>), String> {
+        if let (Some(t), Some(a)) = (&self.translation_cache, &self.tts_cache) {
+            return Ok((Arc::clone(t), Arc::clone(a)));
+        }
+        let dir = self
+            .config
+            .effective_cache_dir()
+            .map_err(|err| err.to_string())?;
+        let translation = Arc::new(TranslationCache::load(&dir).map_err(|err| err.to_string())?);
+        let tts = Arc::new(TtsCache::load(&dir).map_err(|err| err.to_string())?);
+        self.translation_cache = Some(Arc::clone(&translation));
+        self.tts_cache = Some(Arc::clone(&tts));
+        Ok((translation, tts))
+    }
+
     fn handle_start_pipeline(&mut self, ctx: &egui::Context) {
         if !self
             .state
@@ -749,6 +775,18 @@ impl Cap2VoiceApp {
             None
         };
 
+        // Translation + TTS caches (A3 / gh #2). A load failure is not
+        // fatal: the pipeline runs uncached and retries the load next start.
+        let (translation_cache, tts_cache) = match self.ensure_caches() {
+            Ok(caches) => (Some(caches.0), Some(caches.1)),
+            Err(err) => {
+                self.state.ui_notice = Some(format!(
+                    "Không tải được bộ nhớ đệm, chạy không cache: {err}"
+                ));
+                (None, None)
+            }
+        };
+
         let deps = PipelineDeps {
             capturer: Arc::clone(&self.capturer),
             ocr,
@@ -756,6 +794,8 @@ impl Cap2VoiceApp {
             tts,
             audio,
             logger,
+            translation_cache,
+            tts_cache,
         };
 
         match PipelineRunner::start_on(self.runtime.handle(), settings, deps) {
@@ -940,6 +980,22 @@ impl Cap2VoiceApp {
                 self.health_check_rx = None;
                 self.tts_preview_rx = None;
                 self.settings_focused = false;
+                ctx.request_repaint();
+            }
+            SettingsCommand::ClearCache => {
+                // Clear the translation + TTS caches (A3 / gh #2). Loads
+                // them first if the pipeline never started, so the button
+                // also clears disk entries from earlier runs.
+                match self.ensure_caches() {
+                    Ok((translation, tts)) => {
+                        let _ = translation.clear();
+                        let _ = tts.clear();
+                        self.state.ui_notice = Some("Đã xóa bộ nhớ đệm".to_string());
+                    }
+                    Err(err) => {
+                        self.state.ui_notice = Some(format!("Không xóa được bộ nhớ đệm: {err}"));
+                    }
+                }
                 ctx.request_repaint();
             }
             SettingsCommand::SelectRegion => {
@@ -1668,6 +1724,8 @@ mod tests {
             }),
             audio: Arc::new(TestAudio::new()),
             logger: None,
+            translation_cache: None,
+            tts_cache: None,
         };
 
         let handle = match PipelineRunner::start_on(
@@ -1754,6 +1812,8 @@ mod tests {
             tts: tts.clone(),
             audio: audio.clone(),
             logger: Some(Arc::new(SubtitleLogger::new(temp_dir.path().to_path_buf()))),
+            translation_cache: None,
+            tts_cache: None,
         };
 
         let handle = match PipelineRunner::start_on(runtime.handle(), settings, deps) {
@@ -1843,6 +1903,8 @@ mod tests {
             }),
             audio,
             logger: None,
+            translation_cache: None,
+            tts_cache: None,
         };
 
         let handle = match PipelineRunner::start_on(

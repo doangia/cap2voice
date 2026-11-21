@@ -304,6 +304,14 @@ impl AppConfig {
             None => default_log_dir(),
         }
     }
+
+    /// Resolve the translation + TTS cache directory, using
+    /// `%APPDATA%\cap2voice\cache` by default (A3 / gh #2). There is no
+    /// separate config option for the cache dir; it always lives next to
+    /// the logs under the same `%APPDATA%\cap2voice` root.
+    pub fn effective_cache_dir(&self) -> Result<PathBuf, ConfigError> {
+        default_cache_dir()
+    }
 }
 
 fn appdata_root() -> Result<PathBuf, ConfigError> {
@@ -324,6 +332,11 @@ pub fn default_config_path() -> Result<PathBuf, ConfigError> {
 /// Return `%APPDATA%\cap2voice\logs`.
 pub fn default_log_dir() -> Result<PathBuf, ConfigError> {
     Ok(appdata_root()?.join("logs"))
+}
+
+/// Return `%APPDATA%\cap2voice\cache` (A3 / gh #2).
+pub fn default_cache_dir() -> Result<PathBuf, ConfigError> {
+    Ok(appdata_root()?.join("cache"))
 }
 
 fn backup_corrupt_file(path: &Path) -> Result<PathBuf, ConfigError> {

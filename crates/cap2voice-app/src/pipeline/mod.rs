@@ -1,14 +1,16 @@
 //! Async subtitle translation pipeline orchestrator and daily UTF-8 logger.
 
+pub mod cache;
 pub mod logger;
 
+pub use cache::{normalize_cache_key, CacheError, TranslationCache, TtsCache};
 pub use logger::{daily_log_path, format_subtitle_log_line, SubtitleLogError, SubtitleLogger};
 
 use crate::api::{TranslateError, Translator, TtsEngine};
 use crate::audio::{validate_volume, AudioError, AudioPlayback};
 use crate::capture::{validate_region_dimensions, FrameCapturer, PixelDiffGate};
 use crate::config::{AppConfig, CaptureRegion};
-use crate::ocr::{extract_chinese_subtitle, FuzzyDeduplicator, OcrEngine, TextDeduplicator};
+use crate::ocr::{extract_chinese_subtitle_lines, FuzzyDeduplicator, OcrEngine, TextDeduplicator};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
@@ -257,6 +259,16 @@ pub fn map_translate_error_banner(err: &TranslateError) -> PipelineErrorBanner {
     }
 }
 
+/// Whether an emitted subtitle is a fast preliminary translation or a
+/// completed sentence (A2 / gh #1). Preliminary translations display only;
+/// completed sentences display (replacing any preliminary), are logged, and
+/// are spoken via TTS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubtitleKind {
+    Preliminary,
+    Completed,
+}
+
 /// Trait-object dependencies injected into `PipelineRunner::start`.
 #[derive(Clone)]
 pub struct PipelineDeps {
@@ -266,6 +278,13 @@ pub struct PipelineDeps {
     pub tts: Arc<dyn TtsEngine>,
     pub audio: Arc<dyn AudioPlayback>,
     pub logger: Option<Arc<SubtitleLogger>>,
+    /// Translation cache (A3 / gh #2). Consulted only for completed
+    /// sentences; the preliminary translation never consults it. `None`
+    /// disables caching (the translator is always called).
+    pub translation_cache: Option<Arc<TranslationCache>>,
+    /// TTS audio cache (A3 / gh #2). Consulted only for completed
+    /// sentences. `None` disables caching.
+    pub tts_cache: Option<Arc<TtsCache>>,
 }
 
 struct SharedPipelineState {
@@ -540,11 +559,201 @@ impl SubtitleHold {
     }
 }
 
+/// Sentence-final punctuation that completes a subtitle sentence (A2 / gh #1).
+/// Both fullwidth CJK forms and their halfwidth ASCII equivalents.
+const SENTENCE_FINAL_PUNCT: [char; 7] = ['。', '？', '！', '…', '.', '!', '?'];
+
+/// Default timeout for completing a buffered sentence that received no new
+/// fragment (A2 / gh #1): 1.2 s, inside the 1.0–1.5 s range from the issue.
+pub const DEFAULT_SENTENCE_TIMEOUT: Duration = Duration::from_millis(1200);
+
+/// Default blank-frame count that completes a buffered sentence when the
+/// subtitle disappears (A2 / gh #1): 5 frames ≈ 0.5 s at 10 fps, matching
+/// the dedupe `blank_reset_frames` default.
+pub const DEFAULT_SENTENCE_BLANK_FRAMES: u32 = 5;
+
+/// Maximum time a sentence may stay buffered (A2 / gh #1): a safety valve
+/// so an unpunctuated fragment displayed for a very long time is not held
+/// forever when the subtitle never disappears cleanly (the `touch` calls
+/// keep resetting the short timeout while the subtitle is on screen).
+/// 10 s is far above any real split-sentence gap (a display lasts ~2–6 s)
+/// and only fires for pathological long displays.
+pub const MAX_SENTENCE_BUFFER_AGE: Duration = Duration::from_secs(10);
+
+/// What the pipeline should do with a `SentenceBuffer` event (A2 / gh #1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SentenceEvent {
+    /// Translate the buffer-so-far for display only. No logging, no TTS.
+    /// Keeps Vietnamese visible within ~2 s of the subtitle appearing.
+    Preliminary(String),
+    /// Translate the whole completed sentence; display it (replacing any
+    /// preliminary), log the pair, and speak it via TTS.
+    Completed(String),
+}
+
+/// Accumulates OCR fragments into sentences (A2 / gh #1).
+///
+/// The translation unit is a *sentence*, not an OCR frame: a long sentence
+/// split across two subtitle displays is accumulated and translated as one
+/// unit, while two visual lines in one frame are separate utterances (the
+/// caller flushes before pushing a new line from the same frame).
+///
+/// Composes with the Task 15 hold-and-replace debounce: the hold sits
+/// *upstream* and only emits stable lines; the buffer sits *downstream* and
+/// accumulates those stable lines into sentences. The hold suppresses
+/// transitional garbage frames; the buffer assembles real fragments.
+#[derive(Debug)]
+pub struct SentenceBuffer {
+    buffer: String,
+    last_push: Option<Instant>,
+    /// When the current buffered sentence started (first fragment). Used
+    /// for the `MAX_SENTENCE_BUFFER_AGE` safety valve.
+    buffer_started: Option<Instant>,
+    blank_frames: u32,
+    blank_frames_to_flush: u32,
+    timeout: Duration,
+}
+
+impl SentenceBuffer {
+    pub fn new(timeout: Duration, blank_frames_to_flush: u32) -> Self {
+        Self {
+            buffer: String::new(),
+            last_push: None,
+            buffer_started: None,
+            blank_frames: 0,
+            blank_frames_to_flush: blank_frames_to_flush.max(1),
+            timeout,
+        }
+    }
+
+    /// Current buffered (incomplete) text, if any.
+    pub fn buffered_text(&self) -> &str {
+        &self.buffer
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
+    /// Push a fragment that continues the current sentence (the next display
+    /// of the same sentence, or the first line of a frame). Returns the
+    /// events to act on, in order: zero or more completed sentences, then
+    /// at most one preliminary for the incomplete remainder.
+    pub fn push(&mut self, fragment: String, now: Instant) -> Vec<SentenceEvent> {
+        self.blank_frames = 0;
+        if self.buffer.is_empty() {
+            self.buffer_started = Some(now);
+        }
+        self.last_push = Some(now);
+        self.buffer.push_str(&fragment);
+        self.drain_completed()
+    }
+
+    /// Push a new visual line from the *same* frame as the previous line.
+    /// The previous line's sentence is a separate utterance, so it is
+    /// completed first; then the new line starts a fresh sentence. Returns
+    /// the events to act on, in order.
+    pub fn push_new_line(&mut self, fragment: String, now: Instant) -> Vec<SentenceEvent> {
+        let mut events = Vec::new();
+        if let Some(done) = self.flush() {
+            events.push(SentenceEvent::Completed(done));
+        }
+        events.extend(self.push(fragment, now));
+        events
+    }
+
+    /// Note a blank / non-CJK frame (the subtitle may have disappeared).
+    /// Returns the completed sentence once the blank run reaches the
+    /// threshold, or `None`.
+    pub fn note_blank(&mut self, _now: Instant) -> Option<String> {
+        self.blank_frames = self.blank_frames.saturating_add(1);
+        if self.blank_frames >= self.blank_frames_to_flush {
+            self.blank_frames = 0;
+            self.flush()
+        } else {
+            None
+        }
+    }
+
+    /// Flush the buffered sentence as completed when it has content and no
+    /// new fragment arrived for `timeout`, or when the buffer has held a
+    /// sentence for longer than `MAX_SENTENCE_BUFFER_AGE` (safety valve
+    /// for unpunctuated long displays). Returns the sentence, or `None`.
+    pub fn flush_if_timed_out(&mut self, now: Instant) -> Option<String> {
+        if self.buffer.is_empty() {
+            return None;
+        }
+        // Safety valve: never hold a sentence longer than the max age,
+        // even if `touch` keeps resetting the short timeout.
+        if let Some(started) = self.buffer_started {
+            if now.saturating_duration_since(started) >= MAX_SENTENCE_BUFFER_AGE {
+                return self.flush();
+            }
+        }
+        let last = self.last_push?;
+        if now.saturating_duration_since(last) >= self.timeout {
+            self.flush()
+        } else {
+            None
+        }
+    }
+
+    /// Note that the current subtitle is still on screen (the frame is
+    /// unchanged, or the OCR text duplicates the buffered fragment).
+    /// Resets the completion timeout so a long-displayed fragment is not
+    /// completed while it is still visible (A2 / gh #1). The dedupe and
+    /// pixel-diff gates hide repeated reads of the same subtitle from
+    /// `push`, so without this the timeout would fire mid-display and
+    /// split a sentence across two log lines.
+    pub fn touch(&mut self, now: Instant) {
+        if !self.buffer.is_empty() {
+            self.last_push = Some(now);
+        }
+    }
+
+    /// Take the buffered text as a completed sentence (if non-empty) and
+    /// clear the buffer.
+    pub fn flush(&mut self) -> Option<String> {
+        if self.buffer.is_empty() {
+            return None;
+        }
+        self.last_push = None;
+        self.buffer_started = None;
+        self.blank_frames = 0;
+        Some(std::mem::take(&mut self.buffer))
+    }
+
+    /// Split off every complete sentence at the end of the buffer (a
+    /// fragment may contain more than one sentence), returning a
+    /// `Completed` event per sentence plus a `Preliminary` for the
+    /// incomplete remainder, if any.
+    fn drain_completed(&mut self) -> Vec<SentenceEvent> {
+        let mut events = Vec::new();
+        loop {
+            let Some(end) = self.buffer.char_indices().find_map(|(i, ch)| {
+                SENTENCE_FINAL_PUNCT
+                    .contains(&ch)
+                    .then_some(i + ch.len_utf8())
+            }) else {
+                break;
+            };
+            let sentence: String = self.buffer.drain(..end).collect();
+            events.push(SentenceEvent::Completed(sentence));
+        }
+        if !self.buffer.is_empty() {
+            events.push(SentenceEvent::Preliminary(self.buffer.clone()));
+        }
+        events
+    }
+}
 /// Assign a sequence number, publish the Chinese line, and spawn the
-/// translate/log/TTS task for an emitted subtitle line. Returns `false`
-/// when the pipeline is already stopped (caller must break the loop).
+/// translate/log/TTS task for an emitted subtitle. `kind` selects the
+/// preliminary (display only) or completed (display + log + TTS) path
+/// (A2 / gh #1). Returns `false` when the pipeline is already stopped
+/// (caller must break the loop).
 fn emit_subtitle(
     chinese: String,
+    kind: SubtitleKind,
     shared: &Arc<Mutex<SharedPipelineState>>,
     deps: &PipelineDeps,
     semaphore: &Arc<Semaphore>,
@@ -568,8 +777,60 @@ fn emit_subtitle(
     let task_deps = deps.clone();
     let task_sem = Arc::clone(semaphore);
     inflight.spawn(async move {
-        process_emitted_subtitle(seq, chinese, task_shared, task_deps, task_sem).await;
+        process_emitted_subtitle(seq, chinese, kind, task_shared, task_deps, task_sem).await;
     });
+    true
+}
+
+/// Emit every event from a `SentenceBuffer` push, in order. Returns `false`
+/// when the pipeline is already stopped.
+fn emit_sentence_events(
+    events: Vec<SentenceEvent>,
+    shared: &Arc<Mutex<SharedPipelineState>>,
+    deps: &PipelineDeps,
+    semaphore: &Arc<Semaphore>,
+    inflight: &mut JoinSet<()>,
+) -> bool {
+    for event in events {
+        let (text, kind) = match event {
+            SentenceEvent::Preliminary(text) => (text, SubtitleKind::Preliminary),
+            SentenceEvent::Completed(text) => (text, SubtitleKind::Completed),
+        };
+        if !emit_subtitle(text, kind, shared, deps, semaphore, inflight) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Split a held frame text (lines joined with "\n") into visual lines,
+/// feed each to the `SentenceBuffer`, and emit the resulting events. A new
+/// line in the same frame is a separate utterance, so the buffer completes
+/// the previous sentence before starting it. Returns `false` when the
+/// pipeline is already stopped.
+fn emit_held_lines(
+    joined: String,
+    sentence_buffer: &mut SentenceBuffer,
+    shared: &Arc<Mutex<SharedPipelineState>>,
+    deps: &PipelineDeps,
+    semaphore: &Arc<Semaphore>,
+    inflight: &mut JoinSet<()>,
+) -> bool {
+    let mut first_line = true;
+    for line in joined.split('\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let events = if first_line {
+            sentence_buffer.push(line.to_string(), Instant::now())
+        } else {
+            sentence_buffer.push_new_line(line.to_string(), Instant::now())
+        };
+        first_line = false;
+        if !emit_sentence_events(events, shared, deps, semaphore, inflight) {
+            return false;
+        }
+    }
     true
 }
 
@@ -591,6 +852,10 @@ async fn run_orchestrator_loop(
     let mut pixel_diff = PixelDiffGate::with_threshold(active_pixel_threshold);
     let mut deduper = FuzzyDeduplicator::new(initial.dedupe_threshold, initial.blank_reset_frames);
     let mut hold = SubtitleHold::new(initial.hold_delay);
+    // SentenceBuffer (A2 / gh #1) sits downstream of the hold: the hold
+    // emits stable lines, the buffer accumulates them into sentences.
+    let mut sentence_buffer =
+        SentenceBuffer::new(DEFAULT_SENTENCE_TIMEOUT, DEFAULT_SENTENCE_BLANK_FRAMES);
 
     let mut ticker = tokio::time::interval(fps_to_interval(active_fps));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -607,7 +872,29 @@ async fn run_orchestrator_loop(
 
         // Emit a held subtitle whose hold window has expired (Task 15).
         if let Some(chinese) = hold.take_ready(Instant::now()) {
-            if !emit_subtitle(chinese, &shared, &deps, &semaphore, &mut inflight) {
+            if !emit_held_lines(
+                chinese,
+                &mut sentence_buffer,
+                &shared,
+                &deps,
+                &semaphore,
+                &mut inflight,
+            ) {
+                break;
+            }
+        }
+
+        // Complete a buffered sentence that received no new fragment for
+        // the sentence timeout (A2 / gh #1).
+        if let Some(completed) = sentence_buffer.flush_if_timed_out(Instant::now()) {
+            if !emit_subtitle(
+                completed,
+                SubtitleKind::Completed,
+                &shared,
+                &deps,
+                &semaphore,
+                &mut inflight,
+            ) {
                 break;
             }
         }
@@ -687,6 +974,10 @@ async fn run_orchestrator_loop(
                     let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
                     state.snapshot.metrics.frames_skipped_pixel_diff += 1;
                     state.publish();
+                    // The frame is unchanged, so the current subtitle is
+                    // still on screen: keep the SentenceBuffer timeout from
+                    // firing mid-display (A2 / gh #1).
+                    sentence_buffer.touch(Instant::now());
                     continue;
                 }
 
@@ -722,10 +1013,42 @@ async fn run_orchestrator_loop(
                     }
                 };
 
-                let filtered = extract_chinese_subtitle(&ocr_result.ocr_response);
-                let Some(chinese) = deduper.process(filtered.as_deref()) else {
+                // Extract one filtered line per visual line (top-to-bottom,
+                // A2 / gh #1). An empty list means the frame has no CJK text.
+                let lines = extract_chinese_subtitle_lines(&ocr_result.ocr_response);
+                if lines.is_empty() {
+                    // Blank / non-CJK frame: keep the dedupe blank counting
+                    // and tell the SentenceBuffer the subtitle may have
+                    // disappeared; a long enough blank run completes the
+                    // buffered sentence.
+                    let _ = deduper.process(None);
+                    if let Some(completed) = sentence_buffer.note_blank(Instant::now()) {
+                        if !emit_subtitle(
+                            completed,
+                            SubtitleKind::Completed,
+                            &shared,
+                            &deps,
+                            &semaphore,
+                            &mut inflight,
+                        ) {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+
+                // Dedupe + hold operate on the frame's lines joined with
+                // "\n" (the dedupe normalizes to CJK + digits only, so the
+                // separator does not affect comparison). The hold emits the
+                // joined text; the loop top splits it back into lines.
+                let joined = lines.join("\n");
+                let Some(chinese) = deduper.process(Some(&joined)) else {
                     let state = shared.lock().unwrap_or_else(|e| e.into_inner());
                     state.publish();
+                    // The OCR text duplicates the previous line, so the
+                    // subtitle is still on screen: keep the SentenceBuffer
+                    // timeout from firing mid-display (A2 / gh #1).
+                    sentence_buffer.touch(Instant::now());
                     continue;
                 };
 
@@ -739,7 +1062,14 @@ async fn run_orchestrator_loop(
                     state.publish();
                 }
                 if let Some(ready) = hold.take_ready(Instant::now()) {
-                    if !emit_subtitle(ready, &shared, &deps, &semaphore, &mut inflight) {
+                    if !emit_held_lines(
+                        ready,
+                        &mut sentence_buffer,
+                        &shared,
+                        &deps,
+                        &semaphore,
+                        &mut inflight,
+                    ) {
                         break;
                     }
                 }
@@ -759,6 +1089,7 @@ async fn run_orchestrator_loop(
 async fn process_emitted_subtitle(
     seq: u64,
     chinese: String,
+    kind: SubtitleKind,
     shared: Arc<Mutex<SharedPipelineState>>,
     deps: PipelineDeps,
     semaphore: Arc<Semaphore>,
@@ -767,12 +1098,18 @@ async fn process_emitted_subtitle(
         return;
     };
 
+    let is_completed = kind == SubtitleKind::Completed;
+
+    // Preliminary translations are display-only: a newer emission makes
+    // them stale and they are discarded entirely. A completed sentence is
+    // never discarded as stale — it must be logged and spoken even when a
+    // newer preliminary exists; only its display update is skipped then.
     let backoff_until = {
         let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
         if state.stopped {
             return;
         }
-        if seq < state.snapshot.latest_seq {
+        if !is_completed && seq < state.snapshot.latest_seq {
             state.snapshot.metrics.stale_translations_discarded += 1;
             state.publish();
             return;
@@ -791,20 +1128,45 @@ async fn process_emitted_subtitle(
         if state.stopped {
             return;
         }
-        if seq < state.snapshot.latest_seq {
+        if !is_completed && seq < state.snapshot.latest_seq {
             state.snapshot.metrics.stale_translations_discarded += 1;
             state.publish();
             return;
         }
     }
 
-    let translate_res = deps.translator.translate(&chinese).await;
+    // Completed sentences consult the translation cache (A3 / gh #2); the
+    // preliminary translation never does. `get` normalizes the key
+    // internally, so the raw sentence is passed here.
+    let cached_vietnamese = if is_completed {
+        deps.translation_cache
+            .as_ref()
+            .and_then(|cache| cache.get(&chinese))
+    } else {
+        None
+    };
+
+    let translate_res = match cached_vietnamese {
+        Some(vi) => Ok(vi),
+        None => deps.translator.translate(&chinese).await,
+    };
+
     let (vietnamese, enable_log, should_tts, voice, rate) = {
         let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
         if state.stopped {
             return;
         }
-        if seq < state.snapshot.latest_seq {
+        // For a completed sentence, a stale seq only skips the display
+        // update (a newer emission already owns the screen); the log and
+        // TTS below still run. A completed sentence is NEVER discarded
+        // for resolving out of order: two sentences emitted together
+        // (e.g. two speakers in one frame, A2 / gh #1) resolve
+        // concurrently, and discarding the slower one would lose a line
+        // of dialogue. The display stays on the newest sentence; the
+        // log/TTS stream keeps every completed sentence. For a
+        // preliminary, any staleness discards the whole task (checked above).
+        let display_stale = seq < state.snapshot.latest_seq;
+        if !is_completed && display_stale {
             state.snapshot.metrics.stale_translations_discarded += 1;
             state.publish();
             return;
@@ -813,18 +1175,29 @@ async fn process_emitted_subtitle(
         match translate_res {
             Ok(vi) => {
                 state.rate_limit_until = None;
-                state.snapshot.vietnamese_line = vi.clone();
+                if !display_stale {
+                    state.snapshot.vietnamese_line = vi.clone();
+                }
                 state.snapshot.metrics.translations_succeeded += 1;
                 state.snapshot.error_banner = None;
-                let enable_log = state.settings.enable_subtitle_log;
-                let should_tts = state.settings.auto_read && !state.settings.muted;
+                // Store a completed translation in the cache (A3). The
+                // preliminary translation is never cached.
+                if is_completed {
+                    if let Some(cache) = &deps.translation_cache {
+                        let _ = cache.put(&chinese, vi.clone());
+                    }
+                }
+                let enable_log = is_completed && state.settings.enable_subtitle_log;
+                let should_tts = is_completed && state.settings.auto_read && !state.settings.muted;
                 let voice = state.settings.voice.clone();
                 let rate = state.settings.speech_rate.clone();
                 state.publish();
                 (vi, enable_log, should_tts, voice, rate)
             }
             Err(err) => {
-                state.snapshot.vietnamese_line.clear();
+                if !display_stale {
+                    state.snapshot.vietnamese_line.clear();
+                }
                 if matches!(err, TranslateError::RateLimited { .. }) {
                     let backoff = state.settings.rate_limit_backoff;
                     if !backoff.is_zero() {
@@ -858,16 +1231,40 @@ async fn process_emitted_subtitle(
         return;
     }
 
-    let tts_res = deps.tts.synthesize(&vietnamese, &voice, &rate).await;
+    // Completed sentences consult the TTS cache (A3 / gh #2); a cache hit
+    // skips the `/tts` call entirely. `tts_calls` counts real syntheses.
+    let (cached_mp3, tts_cache_hit) = match &deps.tts_cache {
+        Some(cache) => match cache.get(&vietnamese, &voice, &rate) {
+            Some(mp3) => (Some(mp3), true),
+            None => (None, false),
+        },
+        None => (None, false),
+    };
+
+    let tts_res = match cached_mp3 {
+        Some(mp3) => Ok(mp3),
+        None => deps.tts.synthesize(&vietnamese, &voice, &rate).await,
+    };
+
     let mp3_bytes = {
         let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
-        state.snapshot.metrics.tts_calls += 1;
+        if !tts_cache_hit {
+            state.snapshot.metrics.tts_calls += 1;
+        }
         if state.stopped || !state.settings.auto_read || state.settings.muted {
             state.publish();
             return;
         }
         match tts_res {
-            Ok(bytes) => bytes,
+            Ok(bytes) => {
+                // Store freshly synthesized audio in the TTS cache (A3).
+                if !tts_cache_hit {
+                    if let Some(cache) = &deps.tts_cache {
+                        let _ = cache.put(&vietnamese, &voice, &rate, bytes.clone());
+                    }
+                }
+                bytes
+            }
             Err(err) => {
                 state.set_banner(PipelineErrorKind::Tts, format!("Lỗi giọng đọc TTS: {err}"));
                 return;
@@ -888,9 +1285,9 @@ async fn process_emitted_subtitle(
 mod tests {
     use super::{
         map_translate_error_banner, Duration, Instant, PipelineError, PipelineErrorBanner,
-        PipelineErrorKind, PipelineSettings, SubtitleHold, DEFAULT_HOLD_DELAY,
-        ERR_BANNER_SERVER_UNAVAILABLE, ERR_BANNER_TRANSLATE_NETWORK,
-        ERR_BANNER_TRANSLATE_RATE_LIMIT,
+        PipelineErrorKind, PipelineSettings, SentenceBuffer, SentenceEvent, SubtitleHold,
+        DEFAULT_HOLD_DELAY, DEFAULT_SENTENCE_BLANK_FRAMES, ERR_BANNER_SERVER_UNAVAILABLE,
+        ERR_BANNER_TRANSLATE_NETWORK, ERR_BANNER_TRANSLATE_RATE_LIMIT, MAX_SENTENCE_BUFFER_AGE,
     };
     use crate::api::TranslateError;
     use crate::config::{AppConfig, CaptureRegion};
@@ -975,6 +1372,183 @@ mod tests {
         let mut hold = SubtitleHold::new(Duration::ZERO);
         assert!(!hold.push("夜深了，雨还在下。".to_string(), t0));
         assert_eq!(hold.take_ready(t0), Some("夜深了，雨还在下。".to_string()));
+    }
+
+    #[test]
+    fn sentence_buffer_accumulates_fragments_and_completes_on_punctuation() {
+        let t0 = Instant::now();
+        let mut buf =
+            SentenceBuffer::new(Duration::from_millis(1200), DEFAULT_SENTENCE_BLANK_FRAMES);
+        // First fragment: no final punctuation → preliminary only.
+        assert_eq!(
+            buf.push("明天".to_string(), t0),
+            vec![SentenceEvent::Preliminary("明天".to_string())]
+        );
+        // Second fragment completes the sentence → re-translate the whole.
+        assert_eq!(
+            buf.push("早上见。".to_string(), t0 + Duration::from_millis(200)),
+            vec![SentenceEvent::Completed("明天早上见。".to_string())]
+        );
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn sentence_buffer_completes_immediately_on_final_punctuation() {
+        let t0 = Instant::now();
+        let mut buf =
+            SentenceBuffer::new(Duration::from_millis(1200), DEFAULT_SENTENCE_BLANK_FRAMES);
+        assert_eq!(
+            buf.push("你好吗？".to_string(), t0),
+            vec![SentenceEvent::Completed("你好吗？".to_string())]
+        );
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn sentence_buffer_splits_two_sentences_in_one_fragment() {
+        let t0 = Instant::now();
+        let mut buf =
+            SentenceBuffer::new(Duration::from_millis(1200), DEFAULT_SENTENCE_BLANK_FRAMES);
+        assert_eq!(
+            buf.push("你好。我很好".to_string(), t0),
+            vec![
+                SentenceEvent::Completed("你好。".to_string()),
+                SentenceEvent::Preliminary("我很好".to_string()),
+            ]
+        );
+        assert_eq!(buf.buffered_text(), "我很好");
+    }
+
+    #[test]
+    fn sentence_buffer_new_line_completes_previous_utterance() {
+        let t0 = Instant::now();
+        let mut buf =
+            SentenceBuffer::new(Duration::from_millis(1200), DEFAULT_SENTENCE_BLANK_FRAMES);
+        // First visual line: incomplete, preliminary only.
+        assert_eq!(
+            buf.push("你好吗".to_string(), t0),
+            vec![SentenceEvent::Preliminary("你好吗".to_string())]
+        );
+        // Second visual line in the SAME frame: separate utterance — the
+        // first line completes before the second starts.
+        assert_eq!(
+            buf.push_new_line("我很好。".to_string(), t0),
+            vec![
+                SentenceEvent::Completed("你好吗".to_string()),
+                SentenceEvent::Completed("我很好。".to_string()),
+            ]
+        );
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn sentence_buffer_flushes_on_blank_run_and_on_timeout() {
+        let t0 = Instant::now();
+        let mut buf =
+            SentenceBuffer::new(Duration::from_millis(1200), DEFAULT_SENTENCE_BLANK_FRAMES);
+        assert_eq!(
+            buf.push("等一下".to_string(), t0),
+            vec![SentenceEvent::Preliminary("等一下".to_string())]
+        );
+        // Fewer blanks than the threshold: nothing yet.
+        for _ in 0..(DEFAULT_SENTENCE_BLANK_FRAMES - 1) {
+            assert_eq!(buf.note_blank(t0), None);
+        }
+        // The threshold blank completes the sentence (subtitle disappeared).
+        assert_eq!(buf.note_blank(t0), Some("等一下".to_string()));
+        assert!(buf.is_empty());
+
+        // Timeout: content with no new fragment for the timeout window.
+        assert_eq!(
+            buf.push("再见".to_string(), t0),
+            vec![SentenceEvent::Preliminary("再见".to_string())]
+        );
+        assert_eq!(
+            buf.flush_if_timed_out(t0 + Duration::from_millis(1199)),
+            None
+        );
+        assert_eq!(
+            buf.flush_if_timed_out(t0 + Duration::from_millis(1200)),
+            Some("再见".to_string())
+        );
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn sentence_buffer_touch_keeps_long_displayed_fragment_from_timing_out() {
+        let t0 = Instant::now();
+        let mut buf =
+            SentenceBuffer::new(Duration::from_millis(1200), DEFAULT_SENTENCE_BLANK_FRAMES);
+        // Fragment with no final punctuation: preliminary only.
+        assert_eq!(
+            buf.push("你好，我是".to_string(), t0),
+            vec![SentenceEvent::Preliminary("你好，我是".to_string())]
+        );
+        // The subtitle stays on screen (dedupe / pixel-diff hide the
+        // repeated reads): touching the buffer keeps the timeout from
+        // firing, so the fragment is NOT completed at t0 + 1200 ms.
+        buf.touch(t0 + Duration::from_millis(1100));
+        assert_eq!(
+            buf.flush_if_timed_out(t0 + Duration::from_millis(1200)),
+            None
+        );
+        // A continuation arriving later still joins the same sentence.
+        assert_eq!(
+            buf.push("小明。".to_string(), t0 + Duration::from_millis(2000)),
+            vec![SentenceEvent::Completed("你好，我是小明。".to_string())]
+        );
+        assert!(buf.is_empty());
+
+        // Touching an empty buffer is a no-op (no phantom timeout).
+        buf.touch(t0 + Duration::from_millis(3000));
+        assert_eq!(
+            buf.flush_if_timed_out(t0 + Duration::from_millis(5000)),
+            None
+        );
+    }
+
+    #[test]
+    fn sentence_buffer_max_age_completes_unpunctuated_long_display() {
+        let t0 = Instant::now();
+        let mut buf =
+            SentenceBuffer::new(Duration::from_millis(1200), DEFAULT_SENTENCE_BLANK_FRAMES);
+        assert_eq!(
+            buf.push("是".to_string(), t0),
+            vec![SentenceEvent::Preliminary("是".to_string())]
+        );
+        // Repeated touches (subtitle still on screen) keep the short
+        // timeout from firing, but the 10 s max-age safety valve still
+        // completes the sentence.
+        for millis in (1000..10000).step_by(1000) {
+            buf.touch(t0 + Duration::from_millis(millis));
+            assert_eq!(
+                buf.flush_if_timed_out(t0 + Duration::from_millis(millis)),
+                None
+            );
+        }
+        assert_eq!(
+            buf.flush_if_timed_out(t0 + MAX_SENTENCE_BUFFER_AGE),
+            Some("是".to_string())
+        );
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn sentence_buffer_blank_resets_when_a_fragment_arrives() {
+        let t0 = Instant::now();
+        let mut buf = SentenceBuffer::new(Duration::from_millis(1200), 2);
+        assert_eq!(
+            buf.push("等一下".to_string(), t0),
+            vec![SentenceEvent::Preliminary("等一下".to_string())]
+        );
+        assert_eq!(buf.note_blank(t0), None);
+        // A new fragment resets the blank run, so one more blank is not enough.
+        assert_eq!(
+            buf.push("，好吗".to_string(), t0),
+            vec![SentenceEvent::Preliminary("等一下，好吗".to_string())]
+        );
+        assert_eq!(buf.note_blank(t0), None);
+        assert_eq!(buf.note_blank(t0), Some("等一下，好吗".to_string()));
     }
 
     #[test]

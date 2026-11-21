@@ -19,8 +19,8 @@ use cap2voice_app::ocr::{
 };
 use cap2voice_app::pipeline::{
     daily_log_path, PipelineDeps, PipelineErrorKind, PipelineRunner, PipelineSettings,
-    PipelineSnapshot, PipelineStatus, SubtitleLogger, ERR_BANNER_SERVER_UNAVAILABLE,
-    ERR_BANNER_TRANSLATE_NETWORK, ERR_BANNER_TRANSLATE_RATE_LIMIT,
+    PipelineSnapshot, PipelineStatus, SubtitleLogger, TranslationCache, TtsCache,
+    ERR_BANNER_SERVER_UNAVAILABLE, ERR_BANNER_TRANSLATE_NETWORK, ERR_BANNER_TRANSLATE_RATE_LIMIT,
 };
 use chrono::Local;
 use std::collections::VecDeque;
@@ -114,6 +114,40 @@ fn ocr_block(text: &str) -> OcrResult {
             text: text.to_string(),
             details: Vec::new(),
         }],
+    }
+}
+
+/// OCR result with several visual lines (one `TextBlock` per line, at the
+/// given `top` offsets). Used for the two-lines-in-one-frame test (A2).
+fn ocr_blocks(lines: &[(&str, f32)]) -> OcrResult {
+    OcrResult {
+        errcode: 0,
+        imgpath: "frame.png".to_string(),
+        width: 64,
+        height: 20,
+        ocr_response: lines
+            .iter()
+            .map(|(text, top)| TextBlock {
+                left: 4.0,
+                top: *top,
+                right: 60.0,
+                bottom: top + 14.0,
+                rate: 0.99,
+                text: text.to_string(),
+                details: Vec::new(),
+            })
+            .collect(),
+    }
+}
+
+/// OCR result with no text at all (blank frame, A2 blank-run flush).
+fn ocr_empty() -> OcrResult {
+    OcrResult {
+        errcode: 0,
+        imgpath: "frame.png".to_string(),
+        width: 64,
+        height: 20,
+        ocr_response: Vec::new(),
     }
 }
 
@@ -590,6 +624,8 @@ async fn pipeline_happy_path_captures_skips_static_frames_translates_speaks_and_
             tts: tts.clone(),
             audio: audio.clone(),
             logger: Some(logger),
+            translation_cache: None,
+            tts_cache: None,
         },
     ) {
         Ok(h) => h,
@@ -675,6 +711,8 @@ async fn pipeline_hold_and_replace_suppresses_transitional_garbage_line() {
             tts: tts.clone(),
             audio: audio.clone(),
             logger: Some(logger),
+            translation_cache: None,
+            tts_cache: None,
         },
     ) {
         Ok(h) => h,
@@ -715,7 +753,528 @@ async fn pipeline_hold_and_replace_suppresses_transitional_garbage_line() {
 }
 
 #[tokio::test]
-async fn pipeline_discards_out_of_order_translation_response_without_overwriting_newer_subtitle() {
+async fn pipeline_sentence_buffer_translates_split_sentence_as_one_unit() {
+    // A2 / gh #1: "明天" then "早上见。" arrive as two fragments; the
+    // preliminary translation shows fast, but only the completed sentence
+    // "明天早上见。" is logged and spoken.
+    let temp = TempDirGuard::new("sentence_split");
+    let capturer = Arc::new(MockCapturer::new(
+        vec![Ok(frame_with_band(20, 230)), Ok(frame_with_band(20, 100))],
+        Ok(frame_with_band(20, 100)),
+    ));
+    let ocr = Arc::new(MockOcrEngine::new(
+        vec![Ok(ocr_block("明天")), Ok(ocr_block("早上见。"))],
+        Ok(ocr_block("早上见。")),
+    ));
+    let translator = Arc::new(ControllableTranslator::scripted(Vec::new()));
+    let tts = Arc::new(MockTtsEngine::new(Vec::new()));
+    let audio = Arc::new(MockAudioPlayback::new());
+    let logger = Arc::new(SubtitleLogger::new(temp.path().to_path_buf()));
+
+    let handle = match PipelineRunner::start(
+        test_settings(60),
+        PipelineDeps {
+            capturer: capturer.clone(),
+            ocr: ocr.clone(),
+            translator: translator.clone(),
+            tts: tts.clone(),
+            audio: audio.clone(),
+            logger: Some(logger),
+            translation_cache: None,
+            tts_cache: None,
+        },
+    ) {
+        Ok(h) => h,
+        Err(err) => panic!("PipelineRunner::start failed: {err}"),
+    };
+
+    let mut rx = handle.subscribe();
+    let snap = wait_for_snapshot(
+        &mut rx,
+        "split sentence completed, logged, and spoken once",
+        |s| s.metrics.logged_pairs == 1 && s.metrics.tts_calls == 1,
+    )
+    .await;
+
+    assert_eq!(snap.status, PipelineStatus::Running);
+    assert_eq!(snap.chinese_line, "明天早上见。");
+    assert_eq!(snap.vietnamese_line, "VI(明天早上见。)");
+    // Two emissions: the preliminary fragment plus the completed sentence.
+    assert_eq!(snap.metrics.subtitles_emitted, 2);
+    assert_eq!(snap.metrics.translations_succeeded, 2);
+    // The preliminary fragment was translated for display, the completed
+    // sentence was translated as one unit; TTS only spoke the completed one.
+    assert_eq!(
+        translator.calls(),
+        vec!["明天".to_string(), "明天早上见。".to_string()]
+    );
+    assert_eq!(tts.calls().len(), 1);
+    assert_eq!(tts.calls()[0].text, "VI(明天早上见。)");
+    assert_eq!(audio.enqueued_strings().len(), 1);
+
+    let today_log = daily_log_path(temp.path(), Local::now().date_naive());
+    let content = match std::fs::read_to_string(&today_log) {
+        Ok(s) => s,
+        Err(err) => panic!("failed reading daily log {}: {err}", today_log.display()),
+    };
+    let lines: Vec<&str> = content.lines().collect();
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].ends_with("] 明天早上见。 : VI(明天早上见。)"));
+
+    handle.stop().await;
+    assert_eq!(rx.borrow().status, PipelineStatus::Idle);
+}
+
+#[tokio::test]
+async fn pipeline_completed_sentence_survives_newer_preliminary_but_keeps_its_display() {
+    // A2 / gh #1: a completed sentence whose translation resolves AFTER a
+    // newer preliminary must still be logged and spoken (only its display
+    // update is skipped, so the newer preliminary stays on screen). A
+    // newer preliminary alone never discards a completed sentence.
+    let temp = TempDirGuard::new("completed_survives_prelim");
+    let capturer = Arc::new(MockCapturer::new(
+        vec![Ok(frame_with_band(20, 230)), Ok(frame_with_band(20, 100))],
+        Ok(frame_with_band(20, 100)),
+    ));
+    let ocr = Arc::new(MockOcrEngine::new(
+        vec![Ok(ocr_block("你好吗？")), Ok(ocr_block("我很好"))],
+        Ok(ocr_block("我很好")),
+    ));
+    let translator = Arc::new(ControllableTranslator::manual());
+    let tts = Arc::new(MockTtsEngine::new(Vec::new()));
+    let audio = Arc::new(MockAudioPlayback::new());
+    let logger = Arc::new(SubtitleLogger::new(temp.path().to_path_buf()));
+
+    let handle = match PipelineRunner::start(
+        test_settings(60),
+        PipelineDeps {
+            capturer: capturer.clone(),
+            ocr: ocr.clone(),
+            translator: translator.clone(),
+            tts: tts.clone(),
+            audio: audio.clone(),
+            logger: Some(logger),
+            translation_cache: None,
+            tts_cache: None,
+        },
+    ) {
+        Ok(h) => h,
+        Err(err) => panic!("PipelineRunner::start failed: {err}"),
+    };
+
+    translator.wait_for_pending(2).await;
+    assert_eq!(
+        translator.pending_chinese(),
+        vec!["你好吗？".to_string(), "我很好".to_string()]
+    );
+
+    let mut rx = handle.subscribe();
+    // Resolve the newer preliminary FIRST: it owns the display.
+    translator.resolve_at(1, Ok("Tôi rất khỏe.".to_string()));
+    let after_prelim = wait_for_snapshot(&mut rx, "preliminary displayed", |s| {
+        s.vietnamese_line == "Tôi rất khỏe."
+    })
+    .await;
+    assert_eq!(after_prelim.chinese_line, "我很好");
+    assert_eq!(after_prelim.metrics.logged_pairs, 0);
+    assert_eq!(after_prelim.metrics.tts_calls, 0);
+
+    // Resolve the older completed sentence LATE: it must still be logged
+    // and spoken, but must not overwrite the newer preliminary display.
+    translator.resolve_at(0, Ok("Bạn khỏe không?".to_string()));
+    let snap = wait_for_snapshot(&mut rx, "late completed sentence logged and spoken", |s| {
+        s.metrics.logged_pairs == 1 && s.metrics.tts_calls == 1
+    })
+    .await;
+
+    assert_eq!(snap.status, PipelineStatus::Running);
+    assert_eq!(snap.chinese_line, "我很好");
+    assert_eq!(snap.vietnamese_line, "Tôi rất khỏe.");
+    assert_eq!(snap.metrics.translations_succeeded, 2);
+    assert_eq!(snap.metrics.stale_translations_discarded, 0);
+    assert_eq!(tts.calls().len(), 1);
+    assert_eq!(tts.calls()[0].text, "Bạn khỏe không?");
+
+    let today_log = daily_log_path(temp.path(), Local::now().date_naive());
+    let content = match std::fs::read_to_string(&today_log) {
+        Ok(s) => s,
+        Err(err) => panic!("failed reading daily log {}: {err}", today_log.display()),
+    };
+    let lines: Vec<&str> = content.lines().collect();
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].ends_with("] 你好吗？ : Bạn khỏe không?"));
+
+    handle.stop().await;
+    assert_eq!(rx.borrow().status, PipelineStatus::Idle);
+}
+
+#[tokio::test]
+async fn pipeline_two_lines_in_one_frame_stay_separate_utterances() {
+    // A2 / gh #1: two visual lines in one OCR frame are two utterances —
+    // each completes, translates, logs, and speaks on its own.
+    let temp = TempDirGuard::new("two_lines");
+    let capturer = Arc::new(MockCapturer::new(
+        vec![Ok(frame_with_band(20, 230))],
+        Ok(frame_with_band(20, 230)),
+    ));
+    let ocr = Arc::new(MockOcrEngine::new(
+        vec![Ok(ocr_blocks(&[("你好吗？", 4.0), ("我很好。", 40.0)]))],
+        Ok(ocr_blocks(&[("你好吗？", 4.0), ("我很好。", 40.0)])),
+    ));
+    let translator = Arc::new(ControllableTranslator::scripted(Vec::new()));
+    let tts = Arc::new(MockTtsEngine::new(Vec::new()));
+    let audio = Arc::new(MockAudioPlayback::new());
+    let logger = Arc::new(SubtitleLogger::new(temp.path().to_path_buf()));
+
+    let handle = match PipelineRunner::start(
+        test_settings(60),
+        PipelineDeps {
+            capturer: capturer.clone(),
+            ocr: ocr.clone(),
+            translator: translator.clone(),
+            tts: tts.clone(),
+            audio: audio.clone(),
+            logger: Some(logger),
+            translation_cache: None,
+            tts_cache: None,
+        },
+    ) {
+        Ok(h) => h,
+        Err(err) => panic!("PipelineRunner::start failed: {err}"),
+    };
+
+    let mut rx = handle.subscribe();
+    let snap = wait_for_snapshot(
+        &mut rx,
+        "both lines completed, logged, and spoken separately",
+        |s| s.metrics.logged_pairs == 2 && s.metrics.tts_calls == 2,
+    )
+    .await;
+
+    assert_eq!(snap.status, PipelineStatus::Running);
+    assert_eq!(snap.chinese_line, "我很好。");
+    assert_eq!(snap.vietnamese_line, "VI(我很好。)");
+    assert_eq!(snap.metrics.subtitles_emitted, 2);
+    assert_eq!(
+        translator.calls(),
+        vec!["你好吗？".to_string(), "我很好。".to_string()]
+    );
+    assert_eq!(tts.calls().len(), 2);
+    assert_eq!(tts.calls()[0].text, "VI(你好吗？)");
+    assert_eq!(tts.calls()[1].text, "VI(我很好。)");
+
+    let today_log = daily_log_path(temp.path(), Local::now().date_naive());
+    let content = match std::fs::read_to_string(&today_log) {
+        Ok(s) => s,
+        Err(err) => panic!("failed reading daily log {}: {err}", today_log.display()),
+    };
+    let lines: Vec<&str> = content.lines().collect();
+    assert_eq!(lines.len(), 2);
+    assert!(lines[0].ends_with("] 你好吗？ : VI(你好吗？)"));
+    assert!(lines[1].ends_with("] 我很好。 : VI(我很好。)"));
+
+    handle.stop().await;
+    assert_eq!(rx.borrow().status, PipelineStatus::Idle);
+}
+
+#[tokio::test]
+async fn pipeline_fragment_without_completion_never_triggers_tts_or_log() {
+    // A2 / gh #1: a fragment with no final punctuation is only shown as a
+    // preliminary translation — no log line, no TTS — until it completes.
+    let temp = TempDirGuard::new("fragment_only");
+    let capturer = Arc::new(MockCapturer::new(
+        vec![Ok(frame_with_band(20, 230))],
+        Ok(frame_with_band(20, 230)),
+    ));
+    let ocr = Arc::new(MockOcrEngine::new(
+        vec![Ok(ocr_block("等一下"))],
+        Ok(ocr_block("等一下")),
+    ));
+    let translator = Arc::new(ControllableTranslator::scripted(Vec::new()));
+    let tts = Arc::new(MockTtsEngine::new(Vec::new()));
+    let audio = Arc::new(MockAudioPlayback::new());
+    let logger = Arc::new(SubtitleLogger::new(temp.path().to_path_buf()));
+
+    let handle = match PipelineRunner::start(
+        test_settings(60),
+        PipelineDeps {
+            capturer: capturer.clone(),
+            ocr: ocr.clone(),
+            translator: translator.clone(),
+            tts: tts.clone(),
+            audio: audio.clone(),
+            logger: Some(logger),
+            translation_cache: None,
+            tts_cache: None,
+        },
+    ) {
+        Ok(h) => h,
+        Err(err) => panic!("PipelineRunner::start failed: {err}"),
+    };
+
+    let mut rx = handle.subscribe();
+    let snap = wait_for_snapshot(
+        &mut rx,
+        "preliminary translation shown for the fragment",
+        |s| s.metrics.translations_succeeded == 1 && s.vietnamese_line == "VI(等一下)",
+    )
+    .await;
+
+    assert_eq!(snap.status, PipelineStatus::Running);
+    assert_eq!(snap.chinese_line, "等一下");
+    assert_eq!(snap.vietnamese_line, "VI(等一下)");
+    assert_eq!(snap.metrics.logged_pairs, 0);
+    assert_eq!(snap.metrics.tts_calls, 0);
+    assert_eq!(translator.calls(), vec!["等一下".to_string()]);
+    assert!(tts.calls().is_empty());
+    assert!(audio.enqueued_strings().is_empty());
+
+    handle.stop().await;
+    assert_eq!(rx.borrow().status, PipelineStatus::Idle);
+}
+
+#[tokio::test]
+async fn pipeline_sentence_completes_when_subtitle_disappears() {
+    // A2 / gh #1: a fragment with no final punctuation completes when the
+    // subtitle disappears (blank frames), then it is logged and spoken.
+    let temp = TempDirGuard::new("blank_flush");
+    // Frames must keep changing so the pixel-diff gate lets OCR run on
+    // every tick; the OCR results turn blank after the fragment.
+    let capturer = Arc::new(MockCapturer::new(
+        vec![
+            Ok(frame_with_band(20, 230)),
+            Ok(frame_with_band(20, 100)),
+            Ok(frame_with_band(20, 150)),
+            Ok(frame_with_band(20, 200)),
+            Ok(frame_with_band(20, 110)),
+            Ok(frame_with_band(20, 160)),
+        ],
+        Ok(frame_with_band(20, 160)),
+    ));
+    let ocr = Arc::new(MockOcrEngine::new(
+        vec![
+            Ok(ocr_block("等一下")),
+            Ok(ocr_empty()),
+            Ok(ocr_empty()),
+            Ok(ocr_empty()),
+            Ok(ocr_empty()),
+            Ok(ocr_empty()),
+        ],
+        Ok(ocr_empty()),
+    ));
+    let translator = Arc::new(ControllableTranslator::scripted(Vec::new()));
+    let tts = Arc::new(MockTtsEngine::new(Vec::new()));
+    let audio = Arc::new(MockAudioPlayback::new());
+    let logger = Arc::new(SubtitleLogger::new(temp.path().to_path_buf()));
+
+    let handle = match PipelineRunner::start(
+        test_settings(60),
+        PipelineDeps {
+            capturer: capturer.clone(),
+            ocr: ocr.clone(),
+            translator: translator.clone(),
+            tts: tts.clone(),
+            audio: audio.clone(),
+            logger: Some(logger),
+            translation_cache: None,
+            tts_cache: None,
+        },
+    ) {
+        Ok(h) => h,
+        Err(err) => panic!("PipelineRunner::start failed: {err}"),
+    };
+
+    let mut rx = handle.subscribe();
+    let snap = wait_for_snapshot(
+        &mut rx,
+        "fragment completed by blank frames, logged, and spoken",
+        |s| s.metrics.logged_pairs == 1 && s.metrics.tts_calls == 1,
+    )
+    .await;
+
+    assert_eq!(snap.status, PipelineStatus::Running);
+    assert_eq!(snap.chinese_line, "等一下");
+    assert_eq!(snap.vietnamese_line, "VI(等一下)");
+    // The preliminary "等一下" plus the completed "等一下" (same text,
+    // re-translated as a full sentence).
+    assert_eq!(
+        translator.calls(),
+        vec!["等一下".to_string(), "等一下".to_string()]
+    );
+    assert_eq!(tts.calls().len(), 1);
+    assert_eq!(tts.calls()[0].text, "VI(等一下)");
+
+    handle.stop().await;
+    assert_eq!(rx.borrow().status, PipelineStatus::Idle);
+}
+
+#[tokio::test]
+async fn pipeline_cache_serves_repeated_short_line_with_one_translate_and_one_tts() {
+    // A3 / gh #2: "你好。" appears twice with "再见。" in between. The
+    // repeat must hit both caches: exactly 1 translate + 1 TTS call for
+    // it, while the audio is still enqueued a second time (from cache).
+    let temp = TempDirGuard::new("cache_repeat");
+    let cache_dir = temp.path().join("cache");
+    let translation_cache = Arc::new(match TranslationCache::load(&cache_dir) {
+        Ok(c) => c,
+        Err(err) => panic!("TranslationCache::load failed: {err}"),
+    });
+    let tts_cache = Arc::new(match TtsCache::load(&cache_dir) {
+        Ok(c) => c,
+        Err(err) => panic!("TtsCache::load failed: {err}"),
+    });
+    let capturer = Arc::new(MockCapturer::new(
+        vec![
+            Ok(frame_with_band(20, 230)),
+            Ok(frame_with_band(20, 100)),
+            Ok(frame_with_band(20, 150)),
+        ],
+        Ok(frame_with_band(20, 150)),
+    ));
+    let ocr = Arc::new(MockOcrEngine::new(
+        vec![
+            Ok(ocr_block("你好。")),
+            Ok(ocr_block("再见。")),
+            Ok(ocr_block("你好。")),
+        ],
+        Ok(ocr_block("你好。")),
+    ));
+    let translator = Arc::new(ControllableTranslator::scripted(Vec::new()));
+    let tts = Arc::new(MockTtsEngine::new(Vec::new()));
+    let audio = Arc::new(MockAudioPlayback::new());
+    let logger = Arc::new(SubtitleLogger::new(temp.path().to_path_buf()));
+
+    let handle = match PipelineRunner::start(
+        test_settings(60),
+        PipelineDeps {
+            capturer: capturer.clone(),
+            ocr: ocr.clone(),
+            translator: translator.clone(),
+            tts: tts.clone(),
+            audio: audio.clone(),
+            logger: Some(logger),
+            translation_cache: Some(translation_cache),
+            tts_cache: Some(tts_cache),
+        },
+    ) {
+        Ok(h) => h,
+        Err(err) => panic!("PipelineRunner::start failed: {err}"),
+    };
+
+    let mut rx = handle.subscribe();
+    let snap = wait_for_snapshot(
+        &mut rx,
+        "three lines logged, only two real TTS syntheses",
+        |s| s.metrics.logged_pairs == 3 && s.metrics.tts_calls == 2,
+    )
+    .await;
+
+    assert_eq!(snap.status, PipelineStatus::Running);
+    assert_eq!(snap.metrics.translations_succeeded, 3);
+    // Exactly one translate call per distinct sentence; the repeat came
+    // from the translation cache.
+    assert_eq!(
+        translator.calls(),
+        vec!["你好。".to_string(), "再见。".to_string()]
+    );
+    // Exactly one synthesize call per distinct (text, voice, rate); the
+    // repeat came from the TTS cache.
+    assert_eq!(tts.calls().len(), 2);
+    assert_eq!(tts.calls()[0].text, "VI(你好。)");
+    assert_eq!(tts.calls()[1].text, "VI(再见。)");
+    // The cached audio was still enqueued for playback a second time.
+    let enqueued = audio.enqueued_strings();
+    assert_eq!(enqueued.len(), 3);
+    assert_eq!(enqueued[0], enqueued[2]);
+
+    handle.stop().await;
+    assert_eq!(rx.borrow().status, PipelineStatus::Idle);
+}
+
+#[tokio::test]
+async fn pipeline_cache_survives_restart_via_disk_round_trip() {
+    // A3 / gh #2: caches loaded from the same disk dir after a stop serve
+    // the repeated line with zero new translate / TTS calls.
+    let temp = TempDirGuard::new("cache_restart");
+    let cache_dir = temp.path().join("cache");
+
+    let run_once = |cache_dir: &std::path::Path| {
+        let capturer = Arc::new(MockCapturer::new(
+            vec![Ok(frame_with_band(20, 230))],
+            Ok(frame_with_band(20, 230)),
+        ));
+        let ocr = Arc::new(MockOcrEngine::new(
+            vec![Ok(ocr_block("你好。"))],
+            Ok(ocr_block("你好。")),
+        ));
+        let translator = Arc::new(ControllableTranslator::scripted(Vec::new()));
+        let tts = Arc::new(MockTtsEngine::new(Vec::new()));
+        let audio = Arc::new(MockAudioPlayback::new());
+        let logger = Arc::new(SubtitleLogger::new(temp.path().to_path_buf()));
+        let translation_cache = Arc::new(match TranslationCache::load(cache_dir) {
+            Ok(c) => c,
+            Err(err) => panic!("TranslationCache::load failed: {err}"),
+        });
+        let tts_cache = Arc::new(match TtsCache::load(cache_dir) {
+            Ok(c) => c,
+            Err(err) => panic!("TtsCache::load failed: {err}"),
+        });
+        let handle = match PipelineRunner::start(
+            test_settings(60),
+            PipelineDeps {
+                capturer,
+                ocr,
+                translator: translator.clone(),
+                tts: tts.clone(),
+                audio: audio.clone(),
+                logger: Some(logger),
+                translation_cache: Some(translation_cache),
+                tts_cache: Some(tts_cache),
+            },
+        ) {
+            Ok(h) => h,
+            Err(err) => panic!("PipelineRunner::start failed: {err}"),
+        };
+        (handle, translator, tts, audio)
+    };
+
+    // Run 1: cold caches — one translate + one TTS.
+    let (handle, translator1, tts1, _audio1) = run_once(&cache_dir);
+    let mut rx = handle.subscribe();
+    let snap = wait_for_snapshot(&mut rx, "first run translated, logged, and spoken", |s| {
+        s.metrics.logged_pairs == 1 && s.metrics.tts_calls == 1
+    })
+    .await;
+    assert_eq!(snap.chinese_line, "你好。");
+    assert_eq!(translator1.calls(), vec!["你好。".to_string()]);
+    assert_eq!(tts1.calls().len(), 1);
+    handle.stop().await;
+    assert_eq!(rx.borrow().status, PipelineStatus::Idle);
+
+    // Run 2: fresh cache instances from the same disk dir — the line must
+    // come entirely from disk, with no new translate or TTS call.
+    let (handle, translator2, tts2, audio2) = run_once(&cache_dir);
+    let mut rx = handle.subscribe();
+    let snap = wait_for_snapshot(
+        &mut rx,
+        "second run logged and played back from disk cache",
+        |s| s.metrics.logged_pairs == 1,
+    )
+    .await;
+    assert_eq!(snap.status, PipelineStatus::Running);
+    assert_eq!(snap.chinese_line, "你好。");
+    assert_eq!(snap.vietnamese_line, "VI(你好。)");
+    assert!(translator2.calls().is_empty());
+    assert!(tts2.calls().is_empty());
+    assert_eq!(audio2.enqueued_strings().len(), 1);
+
+    handle.stop().await;
+    assert_eq!(rx.borrow().status, PipelineStatus::Idle);
+}
+
+#[tokio::test]
+async fn pipeline_late_completed_sentence_is_logged_and_spoken_without_overwriting_newer_subtitle()
+{
     let temp = TempDirGuard::new("ooo");
     let capturer = Arc::new(MockCapturer::new(
         vec![Ok(solid_frame(10)), Ok(frame_with_band(10, 220))],
@@ -739,6 +1298,8 @@ async fn pipeline_discards_out_of_order_translation_response_without_overwriting
             tts: tts.clone(),
             audio: audio.clone(),
             logger: Some(logger),
+            translation_cache: None,
+            tts_cache: None,
         },
     ) {
         Ok(h) => h,
@@ -752,7 +1313,9 @@ async fn pipeline_discards_out_of_order_translation_response_without_overwriting
     );
 
     let mut rx = handle.subscribe();
-    // Resolve newer seq 2 FIRST, then resolve stale seq 1 LATE.
+    // Resolve newer seq 2 FIRST, then resolve seq 1 LATE. The late
+    // completed sentence is NOT discarded: it is still logged and spoken
+    // (no dialogue is lost), only the display stays on the newer one.
     translator.resolve_at(1, Ok("Câu thứ hai.".to_string()));
     let after_seq2 = wait_for_snapshot(&mut rx, "seq 2 translated", |s| {
         s.latest_seq == 2 && s.vietnamese_line == "Câu thứ hai." && s.metrics.logged_pairs == 1
@@ -761,25 +1324,32 @@ async fn pipeline_discards_out_of_order_translation_response_without_overwriting
     assert_eq!(after_seq2.chinese_line, "第二句。");
 
     translator.resolve_at(0, Ok("Câu thứ nhất ĐẾN TRỄ.".to_string()));
-    let after_stale = wait_for_snapshot(&mut rx, "stale seq 1 discarded", |s| {
-        s.metrics.stale_translations_discarded == 1
+    let after_late = wait_for_snapshot(&mut rx, "late seq 1 logged", |s| {
+        s.metrics.logged_pairs == 2 && s.metrics.stale_translations_discarded == 0
     })
     .await;
 
-    assert_eq!(after_stale.chinese_line, "第二句。");
-    assert_eq!(after_stale.vietnamese_line, "Câu thứ hai.");
-    assert_eq!(after_stale.metrics.translations_succeeded, 1);
-    assert_eq!(after_stale.metrics.logged_pairs, 1);
-    assert_eq!(tts.calls().len(), 1);
+    // The display still shows the newer sentence (the late one did not
+    // overwrite it), but both sentences were logged and spoken.
+    assert_eq!(after_late.chinese_line, "第二句。");
+    assert_eq!(after_late.vietnamese_line, "Câu thứ hai.");
+    assert_eq!(after_late.metrics.translations_succeeded, 2);
+    assert_eq!(after_late.metrics.logged_pairs, 2);
+    assert_eq!(after_late.metrics.stale_translations_discarded, 0);
+    assert_eq!(tts.calls().len(), 2);
     assert_eq!(tts.calls()[0].text, "Câu thứ hai.");
+    assert_eq!(tts.calls()[1].text, "Câu thứ nhất ĐẾN TRỄ.");
     assert_eq!(
         audio.enqueued_strings(),
-        vec!["MP3(vi-VN-NamMinhNeural:Câu thứ hai.)".to_string()]
+        vec![
+            "MP3(vi-VN-NamMinhNeural:Câu thứ hai.)".to_string(),
+            "MP3(vi-VN-NamMinhNeural:Câu thứ nhất ĐẾN TRỄ.)".to_string(),
+        ]
     );
 
     let today_log = daily_log_path(temp.path(), Local::now().date_naive());
     let content = std::fs::read_to_string(&today_log).unwrap_or_default();
-    assert!(!content.contains("ĐẾN TRỄ"));
+    assert!(content.contains("第一句。 : Câu thứ nhất ĐẾN TRỄ."));
     assert!(content.contains("第二句。 : Câu thứ hai."));
 
     handle.stop().await;
@@ -815,6 +1385,8 @@ async fn pipeline_auto_read_false_makes_zero_tts_calls_while_translating_and_log
             tts: tts.clone(),
             audio: audio.clone(),
             logger: Some(logger),
+            translation_cache: None,
+            tts_cache: None,
         },
     ) {
         Ok(h) => h,
@@ -868,6 +1440,8 @@ async fn pipeline_translation_and_network_errors_clear_stale_vietnamese_and_emit
             tts,
             audio,
             logger: Some(logger),
+            translation_cache: None,
+            tts_cache: None,
         },
     ) {
         Ok(h) => h,
@@ -979,6 +1553,8 @@ async fn pipeline_tts_and_audio_errors_surface_non_blocking_warning_while_keepin
             tts,
             audio,
             logger: Some(logger),
+            translation_cache: None,
+            tts_cache: None,
         },
     ) {
         Ok(h) => h,
@@ -1041,6 +1617,8 @@ async fn pipeline_capture_and_ocr_errors_surface_explicit_vietnamese_banners_wit
             tts,
             audio,
             logger: Some(logger),
+            translation_cache: None,
+            tts_cache: None,
         },
     ) {
         Ok(h) => h,
@@ -1104,6 +1682,8 @@ async fn pipeline_live_settings_update_switches_voice_and_mute_stops_audio_immed
             tts: tts.clone(),
             audio: audio.clone(),
             logger: Some(logger),
+            translation_cache: None,
+            tts_cache: None,
         },
     ) {
         Ok(h) => h,
@@ -1183,6 +1763,8 @@ async fn pipeline_stop_clears_audio_aborts_inflight_translation_and_returns_idle
             tts,
             audio: audio.clone(),
             logger: Some(logger),
+            translation_cache: None,
+            tts_cache: None,
         },
     ) {
         Ok(h) => h,
@@ -1254,6 +1836,8 @@ fn start_on_from_non_tokio_thread_drives_pipeline_and_stops_via_block_on() {
             tts: tts.clone(),
             audio: audio.clone(),
             logger: Some(logger),
+            translation_cache: None,
+            tts_cache: None,
         },
     ) {
         Ok(h) => h,
@@ -1435,6 +2019,8 @@ async fn real_pc_60s_headless_pipeline_smoke_test() {
             tts,
             audio,
             logger: Some(logger),
+            translation_cache: None,
+            tts_cache: None,
         },
     ) {
         Ok(h) => h,

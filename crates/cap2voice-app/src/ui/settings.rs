@@ -113,6 +113,9 @@ pub enum SettingsCommand {
         rate: String,
         volume: f32,
     },
+    /// Clear the translation + TTS caches (A3 / gh #2): removes all cached
+    /// text and audio from memory and disk.
+    ClearCache,
 }
 
 /// Isolated draft model backing the Settings window until saved or discarded.
@@ -558,6 +561,18 @@ fn render_translation_tab(
                 &mut state.draft.translation.blank_reset_frames,
                 1..=30,
             ));
+            ui.end_row();
+
+            ui.label("Bộ nhớ đệm dịch + giọng đọc");
+            ui.horizontal(|ui| {
+                if ui.button("Xóa bộ nhớ đệm").clicked() {
+                    *emitted = Some(SettingsCommand::ClearCache);
+                }
+                ui.label(
+                    egui::RichText::new("Xóa toàn bộ bản dịch và audio đã lưu (RAM + đĩa).")
+                        .color(muted_text_color()),
+                );
+            });
             ui.end_row();
         });
 
