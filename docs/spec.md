@@ -582,6 +582,7 @@ V1 is ready for user acceptance and packaging when **all** conditions below pass
 3. **Visual & UX Fidelity:** Screenshots on the real PC confirm all 3 mockup views (`overlay-main`, `region-select`, `settings-tray`) match approved layout, colors (Chinese white, Vietnamese green), CJK + Vietnamese typography, and exact Vietnamese labels.
 4. **Tray & Lifecycle Integrity:** Closing the overlay hides it to tray while background translation + TTS continue; `Hiện cửa sổ` restores it; `Thoát` and forced kill both leave zero lingering `python.exe` server processes.
 5. **Failure Honesty:** Disconnecting internet mid-playback surfaces the clear Vietnamese network-error banner within 1 subtitle cycle and recovers cleanly once connectivity returns; missing WeChat OCR path surfaces a clear setup error.
+   > **Note (2026-11-21, Danh):** the network-disconnect check in this item is skipped for V1 ("task 14 không cần ngắt mạng"). `AC-TR-3` and the offline part of `AC-TTS-7` are recorded as skipped in `docs/test-log-v1.md`, not as verified.
 6. **Log Integrity:** The generated `%APPDATA%\cap2voice\logs\subtitles-YYYY-MM-DD.log` file contains accurate timestamped `Chinese : Vietnamese` pairs with zero mojibake.
 
 ---
