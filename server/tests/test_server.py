@@ -75,7 +75,10 @@ class StubCommunicate:
 class FailingCommunicate:
     async def stream(self) -> AsyncIterator[TTSChunk]:
         raise edge_tts.exceptions.WebSocketError("edge-tts upstream unreachable")
-        yield {"type": "audio", "data": b""}  # unreachable, keeps this an async generator
+        yield {
+            "type": "audio",
+            "data": b"",
+        }  # unreachable, keeps this an async generator
 
 
 class SilentCommunicate:
@@ -86,7 +89,10 @@ class SilentCommunicate:
 class TransportFailingCommunicate:
     async def stream(self) -> AsyncIterator[TTSChunk]:
         raise aiohttp.ClientError("cannot reach Edge-TTS websocket")
-        yield {"type": "audio", "data": b""}  # unreachable, keeps this an async generator
+        yield {
+            "type": "audio",
+            "data": b"",
+        }  # unreachable, keeps this an async generator
 
 
 def stub_factory() -> tuple[Callable[..., StubCommunicate], list[StubCommunicate]]:

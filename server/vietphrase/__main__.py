@@ -28,10 +28,20 @@ _DEFAULT_CACHE = Path(__file__).resolve().parent / ".cache"
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Vietphrase dictionary translator")
-    parser.add_argument("--text", help="Chinese text to translate (reads stdin if omitted)")
-    parser.add_argument("--dict-dir", help="directory holding the five userscript TXT files")
-    parser.add_argument("--fetch", action="store_true", help="download dictionaries from upstream instead of using the bundled copies")
-    parser.add_argument("--json", action="store_true", help="print the full token map as JSON")
+    parser.add_argument(
+        "--text", help="Chinese text to translate (reads stdin if omitted)"
+    )
+    parser.add_argument(
+        "--dict-dir", help="directory holding the five userscript TXT files"
+    )
+    parser.add_argument(
+        "--fetch",
+        action="store_true",
+        help="download dictionaries from upstream instead of using the bundled copies",
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="print the full token map as JSON"
+    )
     args = parser.parse_args(argv)
 
     dictionaries: DictionarySet

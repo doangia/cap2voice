@@ -21,13 +21,11 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import AsyncIterator
 from typing import Protocol
 
 import aiohttp
 from edge_tts import Communicate
 from edge_tts.exceptions import EdgeTTSException
-from edge_tts.typing import TTSChunk
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field

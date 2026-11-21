@@ -8,11 +8,13 @@ on:
     paths:
       - 'crates/**'
       - 'server/**'
+      - 'scripts/**'
       - '.github/workflows/ci.yml'
   pull_request:
     paths:
       - 'crates/**'
       - 'server/**'
+      - 'scripts/**'
       - '.github/workflows/ci.yml'
 
 jobs:
@@ -35,6 +37,9 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install -r server/requirements.txt
+      - run: python -m mypy --strict server/server.py server/vietphrase/translator.py server/vietphrase/rule_engine.py
+      - run: python -m ruff check server/
+      - run: python -m ruff format --check server/
       # Dictionaries are GPL-3.0 upstream data, not committed: fetch them
       # once so test_bundled_dictionaries_load_offline runs for real.
       # PYTHONIOENCODING avoids a cp1252 UnicodeEncodeError when the
@@ -43,3 +48,15 @@ jobs:
         env:
           PYTHONIOENCODING: utf-8
       - run: python -m pytest server/ -q
+
+  no-unwrap:
+    # Enforces CONSTRAINTS.md §1: no bare `.unwrap()` / `.expect(` in
+    # production Rust code. Test-only uses (#[cfg(test)] modules, tests/
+    # dirs, build.rs) and `unwrap_or*` are allowed.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python scripts/check_no_unwrap.py

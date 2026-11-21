@@ -1,0 +1,16 @@
+# Ruff lint + format configuration for the temporary Python server (`server/`).
+# Enforced in CI: `ruff check server/` and `ruff format --check server/`.
+# Line length follows ruff's default (88); `ruff format` normalizes the tree.
+
+[tool.ruff.lint]
+ignore = [
+    # B008: FastAPI's `Depends(...)` in endpoint signatures is the documented
+    # pattern, not a mutable-default bug. Restructuring would fight the framework.
+    "B008",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# FLY002: test fixtures join multi-line inputs with "\n".join(...); the strings
+# contain literal `{0}` placeholders for the rule engine, which an f-string
+# would force to `{{0}}` and make the fixtures harder to read.
+"server/tests/*.py" = ["FLY002"]

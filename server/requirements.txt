@@ -9,3 +9,4 @@ edge-tts==7.2.3
 # Test / static-type toolchain used by Task 3 verification.
 pytest==8.2.2
 mypy==1.17.1
+ruff==0.17.6

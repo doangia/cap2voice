@@ -10,7 +10,8 @@ so the two implementations produce identical translations.
 from __future__ import annotations
 
 import re
-from typing import Literal, Mapping, TypedDict, Union
+from collections.abc import Mapping
+from typing import Literal, TypedDict
 
 NUM_DIGITS = {
     "零": 0,
@@ -73,7 +74,7 @@ class GroupToken(TypedDict):
     optional: bool
 
 
-Token = Union[CaptureToken, LiteralToken, GroupToken]
+Token = CaptureToken | LiteralToken | GroupToken
 
 
 class Anchor(TypedDict):
@@ -227,7 +228,9 @@ def parse_capture(raw: str) -> CaptureToken:
     if not sources or any(source not in CAPTURE_SOURCES for source in sources):
         raise RuleParseError(f"token lạ: <{raw}>")
     fixed = len(sources) == 1 and sources[0] in ("L", "hv")
-    minimum, maximum = _parse_range(split[1] if len(split) > 1 else "", 1 if fixed else 12)
+    minimum, maximum = _parse_range(
+        split[1] if len(split) > 1 else "", 1 if fixed else 12
+    )
     if fixed and (minimum != 1 or maximum != 1):
         raise RuleParseError(f"token <{sources[0]}> chỉ nhận 1 ký tự")
     return {
@@ -311,7 +314,11 @@ def get_anchor(tokens: list[Token]) -> Anchor | None:
                 candidates.append({"value": value, "tokenIndex": i})
 
     def sort_key(candidate: Anchor) -> tuple[int, int]:
-        common = 1 if len(candidate["value"]) == 1 and candidate["value"] in COMMON_ANCHORS else 0
+        common = (
+            1
+            if len(candidate["value"]) == 1 and candidate["value"] in COMMON_ANCHORS
+            else 0
+        )
         return common, -len(candidate["value"])
 
     candidates.sort(key=sort_key)
@@ -360,7 +367,7 @@ def parse_rules(text: str) -> ParseRulesResult:
     seen: set[str] = set()
     for index, raw in enumerate(re.split(r"\r?\n", text or "")):
         line = raw.strip()
-        if not line or line.startswith("#") or line.startswith("//"):
+        if not line or line.startswith(("#", "//")):
             continue
         eq = line.find("=")
         if eq < 1:
@@ -380,7 +387,9 @@ def parse_rules(text: str) -> ParseRulesResult:
         except RuleParseError as exc:
             errors.append({"line": index + 1, "reason": str(exc), "source": raw})
 
-    rules.sort(key=lambda rule: (-rule["specificity"], rule["wildcardCount"], rule["pattern"]))
+    rules.sort(
+        key=lambda rule: (-rule["specificity"], rule["wildcardCount"], rule["pattern"])
+    )
     return {"rules": rules, "errors": errors}
 
 
@@ -469,8 +478,12 @@ def match_rule(
                 hit = walk(token_index + 1, position + len(value), captures)
                 if hit:
                     return hit
-            return walk(token_index + 1, position, captures) if token["optional"] else None
-        for candidate in capture_matches(token, text, position, dictionaries, separator):
+            return (
+                walk(token_index + 1, position, captures) if token["optional"] else None
+            )
+        for candidate in capture_matches(
+            token, text, position, dictionaries, separator
+        ):
             hit = walk(
                 token_index + 1,
                 position + candidate["len"],
@@ -579,7 +592,9 @@ class RuleEngine:
                     elif token["type"] == "group":
                         max_offset += max(len(alt) for alt in token["alternatives"])
                 if anchors:
-                    self._max_wildcard_prefix = max(self._max_wildcard_prefix, max_offset)
+                    self._max_wildcard_prefix = max(
+                        self._max_wildcard_prefix, max_offset
+                    )
                     for anchor in anchors:
                         item: WildcardItem = {
                             "rule": rule,
@@ -641,9 +656,15 @@ def create_rule_engine(
     """Compile ``rule.txt`` into an engine, mirroring ``VPRuleEngine.create``."""
     parsed = parse_rules(rule_text)
     dictionaries: EngineDicts = {
-        "pa": _normalize_dict(input_dictionaries.get("pa") if input_dictionaries else None),
-        "vp": _normalize_dict(input_dictionaries.get("vp") if input_dictionaries else None),
-        "names": _normalize_dict(input_dictionaries.get("names") if input_dictionaries else None),
+        "pa": _normalize_dict(
+            input_dictionaries.get("pa") if input_dictionaries else None
+        ),
+        "vp": _normalize_dict(
+            input_dictionaries.get("vp") if input_dictionaries else None
+        ),
+        "names": _normalize_dict(
+            input_dictionaries.get("names") if input_dictionaries else None
+        ),
         "pronouns": _normalize_dict(
             input_dictionaries.get("pronouns") if input_dictionaries else None
         ),

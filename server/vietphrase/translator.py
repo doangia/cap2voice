@@ -184,7 +184,7 @@ def parse_dictionary(text: str, mode: str = "") -> dict[str, str]:
     # identical result (NFC is stable under substring slicing).
     for raw in re.split(r"\r?\n", text):
         line = raw.strip()
-        if not line or line.startswith("//") or line.startswith("#") or line.startswith("="):
+        if not line or line.startswith(("//", "#", "=")):
             continue
         eq = line.find("=")
         if eq < 1:
@@ -265,10 +265,15 @@ def fetch_default_dictionaries(
         else:
             url = DEFAULT_DICT_URLS[key]
             try:
-                with urlopen(Request(url, headers={"User-Agent": "cap2voice-vietphrase"}), timeout=timeout) as response:
+                with urlopen(
+                    Request(url, headers={"User-Agent": "cap2voice-vietphrase"}),
+                    timeout=timeout,
+                ) as response:
                     text = response.read().decode("utf-8")
             except Exception as exc:
-                raise RuntimeError(f"Cannot fetch dictionary {key}: {url}: {exc}") from exc
+                raise RuntimeError(
+                    f"Cannot fetch dictionary {key}: {url}: {exc}"
+                ) from exc
             if cached is not None:
                 cached.parent.mkdir(parents=True, exist_ok=True)
                 cached.write_text(text, encoding="utf-8")
@@ -328,15 +333,9 @@ def join_translated_tokens(tokens: list[str]) -> str:
             continue
         last = result[-1]
         first = token[0]
-        if CLOSE_RE.match(first):
+        if CLOSE_RE.match(first) or OPEN_RE.search(last) or last == " ":
             result += token
-        elif OPEN_RE.search(last):
-            result += token
-        elif last == " ":
-            result += token
-        elif VIET_RE.search(last) or VIET_RE.search(first):
-            result += " " + token
-        elif last in ("\x03", "\x05"):
+        elif VIET_RE.search(last) or VIET_RE.search(first) or last in ("\x03", "\x05"):
             result += " " + token
         else:
             result += token
@@ -352,7 +351,11 @@ def normalize_token_case(pairs: list[Pair]) -> None:
             or bool(re.search(r"[.!?]\s*$", context))
             or bool(re.search(r"\x02\s*$", context))
         )
-        if not starts_sentence and pair["type"] != "name" and _ASCII_UPPER_RE.match(value):
+        if (
+            not starts_sentence
+            and pair["type"] != "name"
+            and _ASCII_UPPER_RE.match(value)
+        ):
             value = value[0].lower() + value[1:]
             pair["viet"] = value
         context = join_translated_tokens([context, value])
@@ -370,9 +373,7 @@ def post_process_translated_text(text: str) -> str:
     return text.strip()
 
 
-_LOWER_VI = (
-    "a-zàáâãèéêìíòóôõùúýăđơưạảấầẩẫậắằẳẵặẹẻẽếềểễệỉịọỏốồổỗộớờởỡợụủứừửữựỳỷỹ"
-)
+_LOWER_VI = "a-zàáâãèéêìíòóôõùúýăđơưạảấầẩẫậắằẳẵặẹẻẽếềểễệỉịọỏốồổỗộớờởỡợụủứừửữựỳỷỹ"
 
 
 def auto_capitalize(text: str) -> str:
@@ -381,9 +382,19 @@ def auto_capitalize(text: str) -> str:
     trimmed = text.lstrip()
     if trimmed:
         text = trimmed[0].upper() + trimmed[1:]
-    text = re.sub(rf"([.!?])(\s*)([{_LOWER_VI}])", lambda m: m.group(1) + m.group(2) + m.group(3).upper(), text)
-    text = re.sub(rf"(:\s+\x02)([{_LOWER_VI}])", lambda m: m.group(1) + m.group(2).upper(), text)
-    text = re.sub(rf"((?:^|\s)\x02)([{_LOWER_VI}])", lambda m: m.group(1) + m.group(2).upper(), text)
+    text = re.sub(
+        rf"([.!?])(\s*)([{_LOWER_VI}])",
+        lambda m: m.group(1) + m.group(2) + m.group(3).upper(),
+        text,
+    )
+    text = re.sub(
+        rf"(:\s+\x02)([{_LOWER_VI}])", lambda m: m.group(1) + m.group(2).upper(), text
+    )
+    text = re.sub(
+        rf"((?:^|\s)\x02)([{_LOWER_VI}])",
+        lambda m: m.group(1) + m.group(2).upper(),
+        text,
+    )
     return text
 
 
@@ -396,7 +407,9 @@ class VietPhraseTranslator:
     Vietnamese span it became after post-processing.
     """
 
-    def __init__(self, dictionaries: DictionarySet, settings: Settings | None = None) -> None:
+    def __init__(
+        self, dictionaries: DictionarySet, settings: Settings | None = None
+    ) -> None:
         self.settings = settings or Settings()
         self.dict_pa = normalize_dict_object(dictionaries.pa)
         self.dict_vp = normalize_dict_object(dictionaries.vp)
@@ -407,7 +420,9 @@ class VietPhraseTranslator:
         self.dict_vp_keys = sorted(self.dict_vp, key=lambda key: (-len(key), key))
         self.dict_names_keys = sorted(self.dict_names, key=lambda key: (-len(key), key))
         self.dict_vp_max_len = len(self.dict_vp_keys[0]) if self.dict_vp_keys else 1
-        self.dict_names_max_len = len(self.dict_names_keys[0]) if self.dict_names_keys else 0
+        self.dict_names_max_len = (
+            len(self.dict_names_keys[0]) if self.dict_names_keys else 0
+        )
 
         self.rule_engine: RuleEngine | None = create_rule_engine(
             self.rule_text,
@@ -475,7 +490,9 @@ class VietPhraseTranslator:
         max_len = self.dict_vp_max_len
         for segment in segments:
             if segment["is_rule"]:
-                pairs.append({"han": segment["han"], "viet": segment["text"], "type": ""})
+                pairs.append(
+                    {"han": segment["han"], "viet": segment["text"], "type": ""}
+                )
                 continue
             if segment["is_name"]:
                 pairs.append(
@@ -510,11 +527,15 @@ class VietPhraseTranslator:
                 if dichlieu and char in DICH_LIEU_SET:
                     i += 1
                     continue
-                pairs.append({"han": char, "viet": self.dict_pa.get(char, char), "type": ""})
+                pairs.append(
+                    {"han": char, "viet": self.dict_pa.get(char, char), "type": ""}
+                )
                 i += 1
 
         normalize_token_case(pairs)
-        result = post_process_translated_text(join_translated_tokens([pair["viet"] for pair in pairs]))
+        result = post_process_translated_text(
+            join_translated_tokens([pair["viet"] for pair in pairs])
+        )
 
         token_map: list[TokenMapEntry] = []
         search_from = 0
@@ -527,7 +548,9 @@ class VietPhraseTranslator:
             if start < 0:
                 continue
             end = start + len(pair["viet"])
-            token_map.append(TokenMapEntry(han=pair["han"], viet=pair["viet"], start=start, end=end))
+            token_map.append(
+                TokenMapEntry(han=pair["han"], viet=pair["viet"], start=start, end=end)
+            )
             search_from = end
 
         result = fix_vietnamese(resolve_placeholders(auto_capitalize(result)))
@@ -558,7 +581,9 @@ class VietPhraseTranslator:
                 continue
 
             vp_length = 0
-            for length in range(min(self.dict_vp_max_len, remaining), len(name) - 1, -1):
+            for length in range(
+                min(self.dict_vp_max_len, remaining), len(name) - 1, -1
+            ):
                 if text[i : i + length] in self.dict_vp:
                     vp_length = length
                     break
@@ -588,12 +613,12 @@ class VietPhraseTranslator:
 
 
 __all__ = [
+    "DEFAULT_DICT_DIR",
     "DictionarySet",
     "Settings",
     "TokenMapEntry",
     "TranslationResult",
     "VietPhraseTranslator",
-    "DEFAULT_DICT_DIR",
     "fetch_default_dictionaries",
     "load_default_dictionaries",
     "load_dictionary_set",

@@ -1,0 +1,464 @@
+//! Live pipeline lifecycle and settings commit: starting/stopping the
+//! subtitle pipeline, committing settings drafts, and applying region
+//! selection outcomes.
+
+use super::bootstrap::format_server_startup_error;
+use super::hotkeys::HotkeyAction;
+use super::overlay::{OverlayState, ServerUiStatus};
+use super::region::RegionSelectorOutcome;
+use super::settings::AsyncFeedbackState;
+use super::tray::TrayMenuAction;
+use crate::api::{
+    HttpTranslator, HttpTtsEngine, DEFAULT_CONNECT_TIMEOUT, DEFAULT_TRANSLATE_TIMEOUT,
+    DEFAULT_TTS_TIMEOUT,
+};
+use crate::audio::AudioPlayer;
+use crate::config::{save_config_to, AppConfig, ConfigError, WindowPosition};
+use crate::ocr::{resolve_wechat_paths_from_config, WeChatOcrAdapter};
+use crate::pipeline::{
+    PipelineDeps, PipelineRunner, PipelineSettings, PipelineSnapshot, PipelineStatus,
+    SubtitleLogger, TranslationCache, TtsCache,
+};
+use eframe::egui;
+use std::path::Path;
+use std::sync::{mpsc, Arc};
+use tokio::sync::watch;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SettingsCommitEffects {
+    pub port_changed: bool,
+    pub wechat_paths_changed: bool,
+    pub always_on_top_changed: bool,
+}
+
+pub(crate) struct TtsPreviewAudio {
+    pub(crate) mp3_bytes: Vec<u8>,
+    pub(crate) volume: f32,
+}
+
+pub(crate) fn commit_settings_to_state<F>(
+    current_config: &mut AppConfig,
+    config_path: Option<&Path>,
+    ui_state: &mut OverlayState,
+    new_config: AppConfig,
+    apply_autostart: F,
+) -> Result<SettingsCommitEffects, String>
+where
+    F: Fn(bool) -> Result<(), ConfigError>,
+{
+    new_config.validate().map_err(|err| err.to_string())?;
+
+    let prev_autostart = current_config.general.start_with_windows;
+    let next_autostart = new_config.general.start_with_windows;
+    let autostart_changed = prev_autostart != next_autostart;
+
+    if autostart_changed {
+        apply_autostart(next_autostart)
+            .map_err(|err| format!("Không thể cập nhật khởi động cùng Windows: {err}"))?;
+    }
+
+    if let Some(path) = config_path {
+        if let Err(err) = save_config_to(path, &new_config) {
+            if autostart_changed {
+                let _ = apply_autostart(prev_autostart);
+            }
+            return Err(format!("Không lưu được cấu hình {}: {err}", path.display()));
+        }
+    }
+
+    let effects = SettingsCommitEffects {
+        port_changed: current_config.translation.server_port != new_config.translation.server_port,
+        wechat_paths_changed: current_config.general.wxocr_dll_path
+            != new_config.general.wxocr_dll_path
+            || current_config.general.weixin_dir_path != new_config.general.weixin_dir_path,
+        always_on_top_changed: current_config.display.always_on_top
+            != new_config.display.always_on_top,
+    };
+
+    *current_config = new_config;
+    ui_state.selected_voice = current_config.voice.voice.clone();
+    ui_state.ui_notice = None;
+    Ok(effects)
+}
+
+pub(crate) fn build_live_pipeline_settings(
+    config: &AppConfig,
+    state: &OverlayState,
+) -> Result<PipelineSettings, crate::pipeline::PipelineError> {
+    let mut settings = PipelineSettings::from_app_config(config)?;
+    settings.muted = state.muted;
+    settings.voice = state.selected_voice.clone();
+    Ok(settings)
+}
+
+pub(crate) fn apply_region_selection_outcome(
+    config: &mut AppConfig,
+    state: &mut OverlayState,
+    outcome: &RegionSelectorOutcome,
+) -> bool {
+    match outcome {
+        RegionSelectorOutcome::Confirmed(region) => {
+            config.general.region = Some(region.clone());
+            state.region_panel_open = false;
+            state.ui_notice = None;
+            true
+        }
+        RegionSelectorOutcome::Cancelled | RegionSelectorOutcome::Pending => false,
+    }
+}
+
+impl super::Cap2VoiceApp {
+    pub(crate) fn poll_background_channels(&mut self, ctx: &egui::Context) {
+        let tray_actions: Vec<TrayMenuAction> = match &self.tray_action_rx {
+            Some(rx) => {
+                let mut actions = Vec::new();
+                while let Ok(action) = rx.try_recv() {
+                    actions.push(action);
+                }
+                actions
+            }
+            None => Vec::new(),
+        };
+        for action in tray_actions {
+            self.dispatch_tray_action(ctx, action);
+        }
+        let hotkey_actions: Vec<HotkeyAction> = match &self.hotkey_event_rx {
+            Some(rx) => {
+                let mut actions = Vec::new();
+                while let Ok(event) = rx.try_recv() {
+                    if let Some(manager) = &self.hotkeys {
+                        if let Some(action) = manager.action_for_event(&event) {
+                            actions.push(action);
+                        }
+                    }
+                }
+                actions
+            }
+            None => Vec::new(),
+        };
+        for action in hotkey_actions {
+            self.dispatch_hotkey_action(ctx, action);
+        }
+
+        if let Some(rx) = &self.server_rx {
+            match rx.try_recv() {
+                Ok(Ok(srv)) => {
+                    self.server = Some(srv);
+                    self.state.server_status = ServerUiStatus::Ready;
+                    self.server_rx = None;
+                }
+                Ok(Err(err)) => {
+                    self.state.server_status =
+                        ServerUiStatus::Failed(format_server_startup_error(&err));
+                    self.server_rx = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.state.server_status = ServerUiStatus::Failed(
+                        "Luồng khởi động server dịch/TTS đã dừng bất ngờ".to_string(),
+                    );
+                    self.server_rx = None;
+                }
+            }
+        }
+
+        let latest_snap = if let Some(rx) = &mut self.pipeline_rx {
+            if rx.has_changed().unwrap_or(false) {
+                Some(rx.borrow_and_update().clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(snap) = latest_snap {
+            let stopped_now = snap.status == PipelineStatus::Idle && self.pipeline_handle.is_none();
+            self.state.apply_pipeline_snapshot(snap);
+            if stopped_now {
+                self.pipeline_rx = None;
+            }
+        }
+
+        if let Some(rx) = &self.health_check_rx {
+            match rx.try_recv() {
+                Ok(Ok(health)) => {
+                    if let Some(draft) = &mut self.settings_draft {
+                        draft.connection_status = AsyncFeedbackState::Success(format!(
+                            "Kết nối OK (v{} · {} · {})",
+                            health.version, health.translator, health.tts
+                        ));
+                    }
+                    self.health_check_rx = None;
+                }
+                Ok(Err(err)) => {
+                    if let Some(draft) = &mut self.settings_draft {
+                        draft.connection_status =
+                            AsyncFeedbackState::Error(format!("Lỗi kết nối: {err}"));
+                    }
+                    self.health_check_rx = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if let Some(draft) = &mut self.settings_draft {
+                        draft.connection_status = AsyncFeedbackState::Error(
+                            "Luồng kiểm tra kết nối đã dừng bất ngờ".to_string(),
+                        );
+                    }
+                    self.health_check_rx = None;
+                }
+            }
+        }
+
+        let preview_result = if let Some(rx) = &self.tts_preview_rx {
+            match rx.try_recv() {
+                Ok(res) => {
+                    self.tts_preview_rx = None;
+                    Some(Ok(res))
+                }
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.tts_preview_rx = None;
+                    Some(Err("Luồng nghe thử TTS đã dừng bất ngờ".to_string()))
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Some(outcome) = preview_result {
+            match outcome {
+                Ok(Ok(TtsPreviewAudio { mp3_bytes, volume })) => {
+                    if self.audio.is_none() {
+                        match AudioPlayer::new(volume) {
+                            Ok(player) => {
+                                self.audio = Some(Arc::new(player));
+                            }
+                            Err(err) => {
+                                if let Some(draft) = &mut self.settings_draft {
+                                    draft.tts_preview_status =
+                                        AsyncFeedbackState::Error(format!("Lỗi âm thanh: {err}"));
+                                }
+                            }
+                        }
+                    }
+                    if let Some(audio) = &self.audio {
+                        let play_res = audio
+                            .set_volume(volume)
+                            .and_then(|()| audio.enqueue_mp3(mp3_bytes));
+                        if let Some(draft) = &mut self.settings_draft {
+                            draft.tts_preview_status = match play_res {
+                                Ok(_) => AsyncFeedbackState::Success(
+                                    "Đang phát mẫu giọng đọc".to_string(),
+                                ),
+                                Err(err) => {
+                                    AsyncFeedbackState::Error(format!("Lỗi phát âm thanh: {err}"))
+                                }
+                            };
+                        }
+                    }
+                }
+                Ok(Err(err)) => {
+                    if let Some(draft) = &mut self.settings_draft {
+                        draft.tts_preview_status =
+                            AsyncFeedbackState::Error(format!("Lỗi TTS: {err}"));
+                    }
+                }
+                Err(msg) => {
+                    if let Some(draft) = &mut self.settings_draft {
+                        draft.tts_preview_status = AsyncFeedbackState::Error(msg);
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn persist_config(&mut self) {
+        let Some(path) = &self.config_path else {
+            return;
+        };
+        if let Err(err) = save_config_to(path, &self.config) {
+            self.state.ui_notice =
+                Some(format!("Không lưu được cấu hình {}: {err}", path.display()));
+        }
+    }
+
+    pub(crate) fn save_overlay_position(&mut self, pos: WindowPosition) {
+        self.config.display.overlay_position = Some(pos.clone());
+        self.persist_config();
+        self.position_tracker.mark_saved(pos);
+    }
+
+    /// Load (or reuse) the translation + TTS caches from
+    /// `config.effective_cache_dir()` (A3 / gh #2). Kept on the app so the
+    /// Settings "clear cache" action can reach the same `Arc`s the
+    /// pipeline uses, even before the pipeline ever started.
+    pub(crate) fn ensure_caches(
+        &mut self,
+    ) -> Result<(Arc<TranslationCache>, Arc<TtsCache>), String> {
+        if let (Some(t), Some(a)) = (&self.translation_cache, &self.tts_cache) {
+            return Ok((Arc::clone(t), Arc::clone(a)));
+        }
+        let dir = self
+            .config
+            .effective_cache_dir()
+            .map_err(|err| err.to_string())?;
+        let translation = Arc::new(TranslationCache::load(&dir).map_err(|err| err.to_string())?);
+        let tts = Arc::new(TtsCache::load(&dir).map_err(|err| err.to_string())?);
+        self.translation_cache = Some(Arc::clone(&translation));
+        self.tts_cache = Some(Arc::clone(&tts));
+        Ok((translation, tts))
+    }
+
+    pub(crate) fn handle_start_pipeline(&mut self, ctx: &egui::Context) {
+        if !self
+            .state
+            .request_start(self.config.general.region.is_some())
+        {
+            return;
+        }
+        let Some(server) = &self.server else {
+            self.state.ui_notice = Some("Server dịch/TTS chưa sẵn sàng".to_string());
+            return;
+        };
+
+        let settings = match build_live_pipeline_settings(&self.config, &self.state) {
+            Ok(s) => s,
+            Err(err) => {
+                self.state.ui_notice = Some(err.to_string());
+                return;
+            }
+        };
+
+        if self.ocr.is_none() {
+            match resolve_wechat_paths_from_config(&self.config.general) {
+                Ok(paths) => {
+                    self.ocr = Some(Arc::new(WeChatOcrAdapter::new(paths)));
+                }
+                Err(err) => {
+                    self.state.ui_notice = Some(err.to_string());
+                    return;
+                }
+            }
+        }
+        let Some(ocr) = self.ocr.clone() else {
+            return;
+        };
+
+        if self.audio.is_none() {
+            match AudioPlayer::new(self.config.voice.volume) {
+                Ok(player) => {
+                    self.audio = Some(Arc::new(player));
+                }
+                Err(err) => {
+                    self.state.ui_notice = Some(format!("Lỗi âm thanh: {err}"));
+                    return;
+                }
+            }
+        }
+        let Some(audio) = self.audio.clone() else {
+            return;
+        };
+
+        let base_url = server.base_url().to_string();
+        let translator = match HttpTranslator::with_base_url(
+            base_url.clone(),
+            DEFAULT_CONNECT_TIMEOUT,
+            DEFAULT_TRANSLATE_TIMEOUT,
+        ) {
+            Ok(client) => Arc::new(client),
+            Err(err) => {
+                self.state.ui_notice = Some(err.to_string());
+                return;
+            }
+        };
+        let tts = match HttpTtsEngine::with_base_url(
+            base_url,
+            DEFAULT_CONNECT_TIMEOUT,
+            DEFAULT_TTS_TIMEOUT,
+        ) {
+            Ok(client) => Arc::new(client),
+            Err(err) => {
+                self.state.ui_notice = Some(err.to_string());
+                return;
+            }
+        };
+
+        let logger = if self.config.general.enable_subtitle_log {
+            match self.config.effective_log_dir() {
+                Ok(dir) => Some(Arc::new(SubtitleLogger::new(dir))),
+                Err(err) => {
+                    self.state.ui_notice = Some(format!("Không xác định được thư mục log: {err}"));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
+        // Translation + TTS caches (A3 / gh #2). A load failure is not
+        // fatal: the pipeline runs uncached and retries the load next start.
+        let (translation_cache, tts_cache) = match self.ensure_caches() {
+            Ok(caches) => (Some(caches.0), Some(caches.1)),
+            Err(err) => {
+                self.state.ui_notice = Some(format!(
+                    "Không tải được bộ nhớ đệm, chạy không cache: {err}"
+                ));
+                (None, None)
+            }
+        };
+
+        let deps = PipelineDeps {
+            capturer: Arc::clone(&self.capturer),
+            ocr,
+            translator,
+            tts,
+            audio,
+            logger,
+            translation_cache,
+            tts_cache,
+        };
+
+        match PipelineRunner::start_on(self.runtime.handle(), settings, deps) {
+            Ok(handle) => {
+                let rx = handle.subscribe();
+                self.state.apply_pipeline_snapshot(rx.borrow().clone());
+                self.pipeline_rx = Some(rx.clone());
+                self.pipeline_handle = Some(handle);
+                self.start_repaint_forwarder(rx, ctx.clone());
+            }
+            Err(err) => {
+                self.state.ui_notice = Some(err.to_string());
+            }
+        }
+    }
+
+    pub(crate) fn start_repaint_forwarder(
+        &mut self,
+        mut rx: watch::Receiver<PipelineSnapshot>,
+        ctx: egui::Context,
+    ) {
+        if let Some(old) = self.repaint_forwarder.take() {
+            old.abort();
+        }
+        let task = self.runtime.spawn(async move {
+            while rx.changed().await.is_ok() {
+                ctx.request_repaint();
+            }
+        });
+        self.repaint_forwarder = Some(task);
+    }
+
+    pub(crate) fn handle_stop_pipeline(&mut self, ctx: &egui::Context) {
+        if let Some(forwarder) = self.repaint_forwarder.take() {
+            forwarder.abort();
+        }
+        if let Some(handle) = self.pipeline_handle.take() {
+            self.state.pipeline.status = PipelineStatus::Idle;
+            let ctx_wake = ctx.clone();
+            self.runtime.spawn(async move {
+                handle.stop().await;
+                ctx_wake.request_repaint();
+            });
+        }
+    }
+}

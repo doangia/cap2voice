@@ -12,7 +12,7 @@
 Every change in this repository must obey the floor. Violating any rule below blocks the task immediately:
 
 - **No new checker suppressions:** No new `#[allow(clippy::...)]`, `#[allow(warnings)]`, `#[allow(dead_code)]`, `# noqa`, `# type: ignore`, `gitleaks:allow`, or `nosemgrep` without a tracked row in the Exceptions table below.
-- **No unimplemented stubs or silent error swallowing:** No `todo!()`, `unimplemented!()`, `panic!("not implemented")`, `.unwrap()` / `.expect(...)` in non-test production paths, `except Exception: pass`, bare `except:`, or `Err(_) => {}` that hides network, OCR, TTS, audio, or config failures.
+- **No unimplemented stubs or silent error swallowing:** No `todo!()`, `unimplemented!()`, `panic!("not implemented")`, `.unwrap()` / `.expect(...)` in non-test production paths, `except Exception: pass`, bare `except:`, or `Err(_) => {}` that hides network, OCR, TTS, audio, or config failures. (The `.unwrap()` / `.expect(` ban is enforced in CI by `scripts/check_no_unwrap.py`, job `no-unwrap`.)
 - **No weakened, skipped, or deleted tests:** No `@pytest.mark.skip`, no `#[ignore]` except on explicitly labeled real-PC hardware/WeChat tests, no deleted test files, and no removed assertions from surviving tests without an explicit reason in the commit message and user approval.
 - **No self-answering tests:** Tests must execute real business logic and assert concrete values (outputs, serialized bytes, HTTP status/bodies, file contents) — never mock returning `X` and immediately assert `X`.
 - **No secrets or WeChat OCR binaries in source:** Never commit API keys, credentials, `.env`, `wxocr.dll`, `mmmojo*.dll`, `WeChatOCR*`, or `Weixin/` files. WeChat OCR is strictly personal-use loaded at runtime from the local PC installation.
@@ -23,7 +23,7 @@ Every change in this repository must obey the floor. Violating any rule below bl
 
 ## 2. Enforced with Numbers
 
-Every row below names a concrete, executable command verified against the toolchain installed on this Windows PC (`rustc 1.93.1`, `clippy 0.1.93`, `rustfmt 1.8.0`, `Python 3.11.9`, `mypy 1.17.1`, `pytest 8.2.2`) and `.github/workflows/ci.yml`.
+Every row below names a concrete, executable command verified against the toolchain installed on this Windows PC (`rustc 1.93.1`, `clippy 0.1.93`, `rustfmt 1.8.0`, `Python 3.11.9`, `mypy 1.17.1`, `ruff 0.17.6`, `pytest 8.2.2`) and `.github/workflows/ci.yml`.
 
 > **SSH note:** Over SSH on Windows, prepend `C:\Users\doanv\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin` to `PATH` before running `cargo` commands.
 
@@ -32,7 +32,8 @@ Every row below names a concrete, executable command verified against the toolch
 | Rust formatting | `<= 0` formatting diffs | Eliminates noisy diffs and matches CI gate | `cargo fmt --all -- --check` | every edit, task end, CI | External (`rustfmt`) |
 | Rust lint & safety | `<= 0` compiler or clippy warnings | Catches bug patterns, dead code, and type/ownership pitfalls before runtime | `cargo clippy --workspace --all-targets -- -D warnings` | every edit, task end, CI | External (`rustc` + `clippy`) |
 | Rust unit & integration suite | `>= 100%` tests passing (`<= 0` failures) | Verifies pixel-diff, CJK filter, dedupe, config, audio queue, HTTP error mapping, pipeline | `cargo test --workspace` | task end, CI | Project suite |
-| Python static types | `<= 0` strict type errors | Prevents untyped dict/JSON drift in the temporary FastAPI bridge | `mypy --strict server/server.py` | every Python edit, task end | External (`mypy`) |
+| Python static types | `<= 0` strict type errors | Prevents untyped dict/JSON drift in the temporary FastAPI bridge | `mypy --strict server/server.py server/vietphrase/translator.py server/vietphrase/rule_engine.py` | every Python edit, task end | External (`mypy`) |
+| Python lint & format | `<= 0` ruff violations and `<= 0` files needing reformat | Keeps the temporary Python server lint-clean and uniformly formatted (`pyproject.toml` documents the two deliberate ignores: `B008` FastAPI `Depends`, `FLY002` test fixtures) | `python -m ruff check server/` + `python -m ruff format --check server/` | every Python edit, task end | External (`ruff`) |
 | Python API test suite | `>= 100%` tests passing (`<= 0` failures) | Verifies `/health`, `/translate`, `/tts` happy paths and `400`/`429`/`502` error contracts | `python -m pytest server/ -v` | task end, CI | Project suite |
 | Forbidden WeChat binaries & secrets in git tree | `<= 0` matched files or leaked secret patterns | Prevents redistributing proprietary WeChat DLLs or committing credentials | `git ls-files` check against `(mmmojo\|wxocr\|WeChatOCR\|\.env\|\.pem\|\.key)` + diff scan | task end, review | External (repo policy) |
 | Real-PC capture latency | `<= 30 ms` median and `<= 50 ms` p95 per cropped frame (100 frames) | Leaves `>= 50 ms` headroom within a `100 ms` (10 fps) frame budget; triggers `windows-capture` fallback if breached | `cargo test -p cap2voice-app --test capture_bench -- --ignored --nocapture` | Task 5 gate, review, ship | External (real hardware) |
@@ -49,7 +50,7 @@ Do not stall the edit loop with slow checks. Run each check at the cheapest stag
 
 | Phase | What Runs | Target Budget | Behavior on Failure |
 |---|---|---|---|
-| **BUILD (per edit)** | `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `mypy --strict server/server.py` (when editing Python), floor scan on changed files | `<= 15 s` | **Block** — fix before continuing |
+| **BUILD (per edit)** | `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `mypy --strict server/server.py server/vietphrase/translator.py server/vietphrase/rule_engine.py` + `ruff check server/` + `ruff format --check server/` (when editing Python), floor scan on changed files | `<= 15 s` | **Block** — fix before continuing |
 | **VERIFY (task end)** | BUILD checks + `cargo test --workspace` + `python -m pytest server/ -v` + task-specific real-PC check when required by `tasks/todo.md` | `<= 90 s` (automated); real-PC run as needed | **Block** — task cannot be checked off |
 | **REVIEW (checkpoint / PR)** | VERIFY checks + 5-move floor guard review on full branch diff (`CONSTRAINTS.md` diff, deleted/weakened tests, new suppressions, stubs, unapproved exceptions) + real-PC UI screenshots | Minutes | **Block** on any Critical/Required finding |
 | **SHIP (V1 release)** | Full CI green (`.github/workflows/ci.yml`) + 15-min real-video E2E run (local player + browser) + network-offline failure test + orphan-process forced-kill test | Pre-release gate | **NO-GO** until all pass and user gives explicit GO |

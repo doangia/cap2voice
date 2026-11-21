@@ -165,9 +165,7 @@ def test_translate_names_and_rules() -> None:
     name_translator = VietPhraseTranslator(
         DictionarySet(names={"张三": "Trương Tam"}, pa={"来": "đến"})
     )
-    rule_translator = VietPhraseTranslator(
-        DictionarySet(rules="<n:1-3>倍=gấp {0} lần")
-    )
+    rule_translator = VietPhraseTranslator(DictionarySet(rules="<n:1-3>倍=gấp {0} lần"))
 
     assert name_translator.translate("张三来了") == "Trương Tam đến"
 
