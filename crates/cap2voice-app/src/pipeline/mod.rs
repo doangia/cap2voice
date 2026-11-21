@@ -729,14 +729,11 @@ impl SentenceBuffer {
     /// incomplete remainder, if any.
     fn drain_completed(&mut self) -> Vec<SentenceEvent> {
         let mut events = Vec::new();
-        loop {
-            let Some(end) = self.buffer.char_indices().find_map(|(i, ch)| {
-                SENTENCE_FINAL_PUNCT
-                    .contains(&ch)
-                    .then_some(i + ch.len_utf8())
-            }) else {
-                break;
-            };
+        while let Some(end) = self.buffer.char_indices().find_map(|(i, ch)| {
+            SENTENCE_FINAL_PUNCT
+                .contains(&ch)
+                .then_some(i + ch.len_utf8())
+        }) {
             let sentence: String = self.buffer.drain(..end).collect();
             events.push(SentenceEvent::Completed(sentence));
         }
