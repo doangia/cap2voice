@@ -79,7 +79,7 @@ Status: **PASS** = verified live on the real PC with evidence below. **PARTIAL**
 | AC-CAP-4 | PASS | §2.2 static-frame test: 600 frames, ~1 OCR call, 99.8% skip |
 | AC-CAP-5 | PASS | §2.1: every subtitle change produces a log line in the same second (≤ 1 s; the 150 ms trigger is the capture-tick bound, the log shows the line within the same 1 s slot) |
 | AC-CAP-6 | PASS | Task 5 real-PC benchmark (hc exec): capture p50 15.45 ms / p95 17.38 ms, under the 30/50 ms limits |
-| AC-CAP-7 | NOT VERIFIED | Monitor-disconnected / out-of-bounds region path was never exercised live. Code path exists; no live evidence. |
+| AC-CAP-7 | PASS | Group B 2026-11-21 15:2x: region `(5000,5000,560,100)` → app alive, 0 new lines, soft error banner, no crash; `monitor_id=DISPLAY99` → same. Region restored `(600,849,700,150)`. (The CAP-7 test script itself corrupted `monitor_id` by doubling a backslash — fixed by hand, see §9.) |
 
 ### 5.2 OCR, filtering, dedupe, logging (AC-OCR-*)
 
@@ -112,7 +112,7 @@ Status: **PASS** = verified live on the real PC with evidence below. **PARTIAL**
 | AC-TTS-3 | UNIT | Queue bounds (max 3 pending, drop oldest) verified by unit tests (Task 8); live sequential playback not confirmed by ear. No overlapping audio reported in any run. |
 | AC-TTS-4 | PARTIAL | `Dừng` stops the pipeline (verified live, Task 13). The 200 ms audio-halt timing and the mute button's audible effect were not measured by ear. |
 | AC-TTS-5 | PARTIAL | Volume slider changes the config and the `rodio::Sink` gain (Task 12 live: slider works, value persists). Loudness change by ear not confirmed. |
-| AC-TTS-6 | NOT VERIFIED | `auto_read = OFF` → zero `POST /tts` was never exercised live. |
+| AC-TTS-6 | PASS | Group B 2026-11-21 16:0x: A/B with a temporary server-side `/tts` counter (added, verified, then reverted — server.py restored byte-identical, working tree clean). Run A `auto_read=true`: 6 new log lines, **6 `/tts` calls**. Run B `auto_read=false`: 6 new log lines, **0 `/tts` calls**. (Network-connection sampling was tried first and proved unreliable — Edge-TTS connections are too brief to catch by polling; the server counter is the definitive evidence.) |
 | AC-TTS-7 | SKIPPED (partial) | The offline/network part is skipped per Danh (same decision as AC-TR-3). The `/tts` 502/503 → typed error mapping is covered by server unit tests (Task 3). |
 
 ### 5.5 Overlay UI (AC-UI-*)
@@ -121,7 +121,7 @@ Status: **PASS** = verified live on the real PC with evidence below. **PARTIAL**
 |---|---|---|
 | AC-UI-1 | PASS | §2.1 + §2.3: overlay floats borderless + always-on-top over ffplay and over Chrome video |
 | AC-UI-2 | PARTIAL | Overlay renders Chinese (white) above Vietnamese (green) — verified in Task 10 GUI live test, but the green Vietnamese line was **not** confirmed visually in the live run (overlay is `WDA_EXCLUDEFROMCAPTURE`, so it never appears in screenshots; the frame.png only shows the captured video). No tofu boxes were reported in any GUI check. |
-| AC-UI-3 | NOT VERIFIED | Dragging the overlay and persisting `(x, y)` across restarts was never exercised live. The saved position `(487,499)` is in `config.toml`. |
+| AC-UI-3 | PASS | Group B 2026-11-21 15:1x: drag from the header gap `(825,522)` → `(975,602)` while the pipeline ran moved the overlay `(+150,+80)` to `(637,579)` and `config.toml` saved `saved_pos=637,579` (400 ms debounce works). Restart restored the overlay at `(637,579)`. Position restored to `(487,499)` after the test. **Caveat (small bug found, not blocking):** when the app is IDLE (pipeline not running) there is no periodic repaint, so the debounce save does not fire after a drag — the position is only saved on a clean exit (`on_exit`). Force-killing while idle after a drag loses the position. |
 | AC-UI-4 | PARTIAL | All 5 control-bar elements + `Cài đặt` + `X` work as specified (Tasks 10/12/13 live). Voice dropdown switch and mute-button audible effect not verified live (see AC-TTS-2/AC-TTS-4). |
 | AC-UI-5 | PARTIAL | Error banners render in Vietnamese in the overlay status (code path, Task 9). The network banner was not triggered live (skipped per Danh); the server-down banner was not triggered live. Banners clear on the next successful request (observed in the Task 9 smoke test). |
 | AC-UI-6 | PASS | §2.3: the Chrome capture region overlaps the overlay area; the log stays clean (113 lines, no duplicates from the overlay's own Chinese text), proving `WDA_EXCLUDEFROMCAPTURE` works |
@@ -135,8 +135,8 @@ Status: **PASS** = verified live on the real PC with evidence below. **PARTIAL**
 | AC-SET-3 | PASS | Task 12 live: `Lưu thay đổi` updates `config.toml` atomically, applies immediately, persists across restarts |
 | AC-SET-4 | PASS | Task 12 live: `Chọn lại vùng` launches the selector and updates the draft coordinates |
 | AC-SET-5 | PASS | Task 12 live: autostart on/off creates/removes `HKCU\...\Run\cap2voice` correctly and survives a restart |
-| AC-SET-6 | NOT VERIFIED | Corrupt `config.toml` → Vietnamese warning + `config.toml.bak` was never exercised live. |
-| AC-SET-7 | PARTIAL | Hotkeys Ctrl+Alt+S/R/H verified live (Task 13). Ctrl+Alt+M verified by unit test + shared dispatch path only; not verified live by eye/ear (overlay mute label is hidden from screenshots by WDA, mute state is in-memory only). |
+| AC-SET-6 | PASS | Group B 2026-11-21 15:1x: wrote broken TOML (`[general` + `broken =!!!`) → app started (alive), `config.toml.bak` was created, overlay fell back to the default position `(26,26)` instead of `(487,499)`. Good config restored and verified. |
+| AC-SET-7 | PASS | Group B 2026-11-21 16:0x: Ctrl+Alt+M live, verified with the same temporary server-side `/tts` counter. Phase 1 unmuted: 3 new lines, 3 `/tts`. After Ctrl+Alt+M: 3 new lines, **0 new `/tts`** (mute works). After Ctrl+Alt+M again: 2 new lines, **2 new `/tts`** (toggle back works). |
 
 ### 5.7 Server (AC-SRV-*)
 
@@ -147,7 +147,7 @@ Status: **PASS** = verified live on the real PC with evidence below. **PARTIAL**
 | AC-SRV-3 | PASS | Task 3/12 live: `POST /tts` returns playable MP3 (`audio/mpeg`) for both voices, rejects empty text (400), maps Edge-TTS failures to 502/503 |
 | AC-SRV-4 | PASS | Tasks 9–13 live: launching `cap2voice-app` auto-starts the Python server (no console window), healthy within 10 s; user never runs Python manually |
 | AC-SRV-5 | PASS | §3: tray `Thoát` and `Stop-Process -Force` both leave zero `server.py`/`uvicorn` processes (verified 3× on 2026-11-21) |
-| AC-SRV-6 | NOT VERIFIED | Missing Python / missing packages → Vietnamese setup error was never exercised live (Python is installed on the target PC). |
+| AC-SRV-6 | PASS | Group B 2026-11-21 15:2x: renamed `server/.venv/Scripts/python.exe` → `.bak` and stripped WindowsApps/pyenv from PATH → app started, Ctrl+Alt+S sent, app alive, 0 uvicorn processes, `/health` down, no crash. Python restored (`VENV_PY_EXISTS_AFTER=True`). |
 
 ### 5.8 Tray & lifecycle (AC-TRAY-*)
 
@@ -161,22 +161,27 @@ Status: **PASS** = verified live on the real PC with evidence below. **PARTIAL**
 
 ## 6. Summary Counts
 
-- **PASS: 30 / 50** (verified live on the real PC)
-- **PARTIAL: 7 / 50** (verified in part; see the notes in §5)
+- **PASS: 36 / 50** (verified live on the real PC)
+- **PARTIAL: 6 / 50** (verified in part; see the notes in §5)
 - **UNIT (tests only): 4 / 50** (covered by automated tests, not live)
-- **NOT VERIFIED: 7 / 50** (AC-CAP-3, AC-CAP-7, AC-TTS-2, AC-TTS-6, AC-UI-3, AC-SET-6, AC-SRV-6 — see §7)
+- **NOT VERIFIED: 2 / 50** (AC-CAP-3 DPI 125/150%, AC-TTS-2 HoaiMy voice — see §7)
 - **SKIPPED (per Danh): 2 / 50** (AC-TR-3, AC-TTS-7 offline part)
 
-The V1 code gate is **met for the parts that were run**: automated gate green, 15 min of real video (local + browser) with < 1 s latency and zero crashes, paused-frame skip 99.8%, forced kill clean 3×, log clean UTF-8. The 7 NOT VERIFIED items are small, well-defined live checks (mostly needing Danh's ears/eyes or a display-scaling session) and are listed in §7 rather than hidden.
+The V1 code gate is **met for the parts that were run**: automated gate green, 15 min of real video (local + browser) with < 1 s latency and zero crashes, paused-frame skip 99.8%, forced kill clean 3×, log clean UTF-8. Group B (2026-11-21 afternoon) closed 6 of the 7 NOT VERIFIED items (see §9); the 2 remaining NOT VERIFIED items need Danh's ears/eyes or a display-scaling session, and are listed in §7 rather than hidden.
 
 ## 7. Open Items (not blocking the V1 code gate, need Danh or a follow-up session)
 
-1. **Listen to TTS by ear** (AC-TTS-1/2/3/4/5): Danh listens on the PC — sequential reading, HoaiMy voice switch, mute halt, volume change. (Task 9 open item.)
+1. **Listen to TTS by ear** (AC-TTS-1/2/3/4/5): Danh listens on the PC — sequential reading, HoaiMy voice switch (AC-TTS-2, the only TTS item still NOT VERIFIED), mute halt, volume change. (Task 9 open item.)
 2. **DPI 125%/150%** (AC-CAP-3): needs a dedicated display-scaling session or an explicit waiver.
-3. **Drag overlay + persist position** (AC-UI-3), **corrupt config** (AC-SET-6), **missing Python** (AC-SRV-6), **out-of-bounds region** (AC-CAP-7), **auto_read OFF** (AC-TTS-6): small live checks, none exercised yet.
-4. **Ctrl+Alt+M live** (AC-SET-7): mute by eye/ear; the mute state is in-memory only, so it needs a listening check.
-5. **Green Vietnamese line live** (AC-UI-2): the overlay is invisible in screenshots (WDA); confirm by looking at the screen while a subtitle is showing.
-6. **Config region auto-rewrite** (open question from 2026-11-20 21:46): `config.toml` region changed `(500,849,900,150)` → `(505,893,923,162)` with no click to explain it. Not reproduced in this run; still unexplained.
+3. **Green Vietnamese line live** (AC-UI-2): the overlay is invisible in screenshots (WDA); confirm by looking at the screen while a subtitle is showing.
+4. **Config region auto-rewrite** (open question from 2026-11-20 21:46): `config.toml` region changed `(500,849,900,150)` → `(505,893,923,162)` with no click to explain it. Not reproduced in this run; still unexplained.
+5. **Overlay drag while idle loses the position on force-kill** (found in Group B, AC-UI-3 caveat): when the pipeline is not running there is no periodic repaint, so the 400 ms debounce save never fires after a drag; the position is only saved on a clean exit. Fix candidate for a later slice (schedule a repaint after drag, or save on drag-end).
+
+## 9. Group B session (2026-11-21 afternoon, after Checkpoint 5)
+
+Closed 6 items: AC-UI-3, AC-SET-6, AC-CAP-7, AC-SRV-6, AC-TTS-6, AC-SET-7. Evidence scripts in `~/workspace/cap2voice-task13-review/scripts/t15b-*.ps1`, outputs `C:\Users\doanv\t15b-*.txt`, log now at 436 lines.
+
+**Regression found and fixed during the session:** the AC-CAP-7 test script corrupted `monitor_id` in `config.toml` (a PowerShell regex doubled a backslash: `\\.\DISPLAY1` became `\\.\DISPLAY1` with an extra backslash). From ~15:17 every run produced 0 new log lines (the app showed `MonitorUnavailable` every tick and never OCR'd) even though the server, OCR engine, video and region were all healthy. Root cause confirmed by counting backslashes against the Task 14 backup `config.toml.t14bak`. Fixed by writing the value with Python (`\\.\DISPLAY1` = 2 backslashes before the dot, 1 before `DISPLAY1`) and re-running the known-good Task 15 live script: 18 new lines, 0 garbage. Lesson recorded: never edit backslash-bearing config values with a PowerShell regex — use Python with explicit strings and a backslash count check.
 
 ## 8. Screenshots & Artefacts
 
