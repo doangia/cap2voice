@@ -747,6 +747,10 @@ fn render_display_tab(ui: &mut egui::Ui, state: &mut SettingsDraftState) {
         "Hiển thị dòng tiếng Việt",
     );
     ui.checkbox(
+        &mut state.draft.display.show_pinyin_line,
+        "Hiển thị pinyin trên dòng tiếng Trung",
+    );
+    ui.checkbox(
         &mut state.draft.display.always_on_top,
         "Luôn hiển thị overlay trên cùng",
     );
@@ -763,6 +767,13 @@ fn render_display_tab(ui: &mut egui::Ui, state: &mut SettingsDraftState) {
         .inner_margin(egui::Margin::symmetric(12, 8))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
+            if state.draft.display.show_pinyin_line && state.draft.display.show_chinese_line {
+                ui.label(
+                    egui::RichText::new("yè shēn le, yǔ hái zài xià。")
+                        .size((state.draft.display.font_size_px * 0.8).clamp(11.0, 20.0))
+                        .color(egui::Color32::from_rgb(148, 163, 184)),
+                );
+            }
             if state.draft.display.show_chinese_line {
                 let zh_color = parse_hex_color(&state.draft.display.chinese_color_hex)
                     .unwrap_or(egui::Color32::WHITE);

@@ -9,10 +9,18 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 /// Default floating overlay dimensions in logical pixels.
-pub const DEFAULT_OVERLAY_SIZE: [f32; 2] = [620.0, 178.0];
+/// Height grew from 178 to 204 in D2 to fit the pinyin line above the
+/// Chinese line (pinyin ~18 px + spacing).
+pub const DEFAULT_OVERLAY_SIZE: [f32; 2] = [620.0, 204.0];
 
 /// Chinese subtitle line scale factor relative to `base_font_size_px` (`docs/spec.md` §3.5).
 pub const CHINESE_FONT_SCALE: f32 = 1.35;
+
+/// Pinyin line scale factor relative to the Chinese line size (D2).
+pub const PINYIN_FONT_SCALE: f32 = 0.72;
+
+/// Pinyin line text color (muted slate, distinct from the white Chinese line).
+pub const PINYIN_TEXT_COLOR: egui::Color32 = egui::Color32::from_rgb(148, 163, 184);
 
 /// Built-in Edge-TTS Vietnamese voice options (`id`, Vietnamese UI label).
 pub const AVAILABLE_VOICES: &[(&str, &str)] = &[
@@ -41,6 +49,9 @@ pub enum OverlayCommand {
     ToggleRegionPanel,
     ToggleSettingsPanel,
     CloseWindow,
+    /// Replay the current Chinese line in Chinese (click on the pinyin or
+    /// Chinese line, D2). The shell no-ops when no Chinese line is shown.
+    ReplayChinese,
 }
 
 /// Typed errors emitted when applying `WDA_EXCLUDEFROMCAPTURE` to the overlay HWND.
@@ -61,6 +72,9 @@ pub enum DisplayAffinityError {
 pub struct OverlayState {
     pub server_status: ServerUiStatus,
     pub pipeline: PipelineSnapshot,
+    /// Tone-marked pinyin of `pipeline.chinese_line` (D2), recomputed in
+    /// `apply_pipeline_snapshot` whenever the Chinese line changes.
+    pub pinyin_line: String,
     pub muted: bool,
     pub selected_voice: String,
     pub ui_notice: Option<String>,
@@ -75,6 +89,7 @@ impl OverlayState {
         Self {
             server_status: ServerUiStatus::Starting,
             pipeline: PipelineSnapshot::default(),
+            pinyin_line: String::new(),
             muted: false,
             selected_voice: config.voice.voice.clone(),
             ui_notice: None,
@@ -132,6 +147,9 @@ impl OverlayState {
     pub fn apply_pipeline_snapshot(&mut self, snapshot: PipelineSnapshot) {
         if snapshot.error_banner.is_some() || !snapshot.vietnamese_line.is_empty() {
             self.ui_notice = None;
+        }
+        if snapshot.chinese_line != self.pipeline.chinese_line {
+            self.pinyin_line = crate::pinyin::to_pinyin_line(&snapshot.chinese_line);
         }
         self.pipeline = snapshot;
     }
@@ -458,6 +476,28 @@ pub fn render_overlay_ui(
             let body_resp = ui.vertical_centered(|ui| {
                 ui.set_min_width(ui.available_width());
                 if config.display.show_chinese_line {
+                    // Pinyin line (D2) above the Chinese line. Both lines
+                    // share click-to-replay: a click replays the current
+                    // Chinese line in Chinese; a drag still moves the
+                    // window (egui separates click from drag by movement).
+                    if config.display.show_pinyin_line && !state.pinyin_line.is_empty() {
+                        let py_resp = ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(state.pinyin_line.as_str())
+                                    .size(zh_size * PINYIN_FONT_SCALE)
+                                    .color(PINYIN_TEXT_COLOR),
+                            )
+                            .wrap()
+                            .sense(egui::Sense::click_and_drag()),
+                        );
+                        if py_resp.clicked() {
+                            commands.push(OverlayCommand::ReplayChinese);
+                        }
+                        if py_resp.drag_started_by(egui::PointerButton::Primary) {
+                            start_drag = true;
+                        }
+                        ui.add_space(2.0);
+                    }
                     let (zh_text, color) = if state.pipeline.chinese_line.is_empty() {
                         (
                             "Chờ phụ đề tiếng Trung...",
@@ -466,10 +506,17 @@ pub fn render_overlay_ui(
                     } else {
                         (state.pipeline.chinese_line.as_str(), zh_color)
                     };
-                    ui.add(
+                    let zh_resp = ui.add(
                         egui::Label::new(egui::RichText::new(zh_text).size(zh_size).color(color))
-                            .wrap(),
+                            .wrap()
+                            .sense(egui::Sense::click_and_drag()),
                     );
+                    if zh_resp.clicked() && !state.pipeline.chinese_line.is_empty() {
+                        commands.push(OverlayCommand::ReplayChinese);
+                    }
+                    if zh_resp.drag_started_by(egui::PointerButton::Primary) {
+                        start_drag = true;
+                    }
                 }
 
                 if config.display.show_vietnamese_line {
@@ -756,6 +803,55 @@ mod tests {
             apply_exclude_from_capture_hwnd(0),
             Err(DisplayAffinityError::MissingHwnd)
         );
+    }
+
+    #[test]
+    fn overlay_state_recomputes_pinyin_when_chinese_line_changes() {
+        let cfg = AppConfig::default();
+        let mut state = OverlayState::from_config(&cfg, Vec::new());
+        assert_eq!(state.pinyin_line, "");
+
+        state.apply_pipeline_snapshot(PipelineSnapshot {
+            status: PipelineStatus::Running,
+            latest_seq: 1,
+            chinese_line: "你好，我是小明。".to_string(),
+            vietnamese_line: "Ngươi tốt, ta là tiểu Minh.".to_string(),
+            error_banner: None,
+            metrics: PipelineMetrics::default(),
+        });
+        assert_eq!(state.pinyin_line, "nǐ hǎo， wǒ shì xiǎo míng。");
+
+        // Same line again: pinyin stays (no recompute needed).
+        state.apply_pipeline_snapshot(PipelineSnapshot {
+            status: PipelineStatus::Running,
+            latest_seq: 2,
+            chinese_line: "你好，我是小明。".to_string(),
+            vietnamese_line: "Ngươi tốt, ta là tiểu Minh.".to_string(),
+            error_banner: None,
+            metrics: PipelineMetrics::default(),
+        });
+        assert_eq!(state.pinyin_line, "nǐ hǎo， wǒ shì xiǎo míng。");
+
+        // New line: pinyin follows. Empty line: pinyin clears.
+        state.apply_pipeline_snapshot(PipelineSnapshot {
+            status: PipelineStatus::Running,
+            latest_seq: 3,
+            chinese_line: "再见。".to_string(),
+            vietnamese_line: "Tái kiến.".to_string(),
+            error_banner: None,
+            metrics: PipelineMetrics::default(),
+        });
+        assert_eq!(state.pinyin_line, "zài jiàn。");
+
+        state.apply_pipeline_snapshot(PipelineSnapshot {
+            status: PipelineStatus::Idle,
+            latest_seq: 4,
+            chinese_line: String::new(),
+            vietnamese_line: String::new(),
+            error_banner: None,
+            metrics: PipelineMetrics::default(),
+        });
+        assert_eq!(state.pinyin_line, "");
     }
 
     #[test]

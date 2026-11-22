@@ -24,6 +24,11 @@ use eframe::egui;
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc};
 
+/// Edge-TTS voice for the Chinese click-to-replay (D2): a clear standard
+/// female Mandarin voice. Added to the server's `SUPPORTED_VOICES` so
+/// `POST /tts` accepts it.
+pub(crate) const CHINESE_REPLAY_VOICE: &str = "zh-CN-XiaoxiaoNeural";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RegionSelectionTarget {
     LiveConfig,
@@ -53,6 +58,104 @@ impl super::Cap2VoiceApp {
         if let Some(handle) = &self.pipeline_handle {
             if let Err(err) = handle.set_voice(voice) {
                 self.state.ui_notice = Some(err.to_string());
+            }
+        }
+    }
+
+    /// Replay the current Chinese line in Chinese (D2: click on the pinyin
+    /// or Chinese line). Uses the A3 TTS cache first (the key includes the
+    /// voice, so Chinese entries never collide with Vietnamese ones); on a
+    /// miss synthesizes via `POST /tts` and stores the result in the cache.
+    /// An explicit user action, so it plays even while muted (mute only
+    /// silences automatic Vietnamese reading). No-ops when no Chinese line
+    /// is shown or the server is not ready.
+    pub(crate) fn handle_replay_chinese(&mut self, ctx: &egui::Context) {
+        let chinese = self.state.pipeline.chinese_line.trim().to_string();
+        if chinese.is_empty() {
+            return;
+        }
+        // Take the server URL as an owned string up front: holding a
+        // borrow of `self.server` would conflict with the `&mut self`
+        // calls below (`ensure_caches`, channel setup).
+        let Some(base_url) = self.server.as_ref().map(|s| s.base_url().to_string()) else {
+            self.state.ui_notice = Some("Server dịch/TTS chưa sẵn sàng".to_string());
+            return;
+        };
+
+        let voice = CHINESE_REPLAY_VOICE;
+        let rate = self.config.voice.speech_rate.clone();
+        let volume = self.config.voice.volume;
+
+        // Fast path: cached audio for this exact (line, voice, rate).
+        let tts_cache = match self.ensure_caches() {
+            Ok((_, cache)) => Some(cache),
+            Err(_) => None,
+        };
+        if let Some(cache) = &tts_cache {
+            if let Some(mp3) = cache.get(&chinese, voice, &rate) {
+                self.play_replay_audio(mp3, volume);
+                return;
+            }
+        }
+
+        if self.audio.is_none() {
+            match AudioPlayer::new(volume) {
+                Ok(player) => {
+                    self.audio = Some(Arc::new(player));
+                }
+                Err(err) => {
+                    self.state.ui_notice = Some(format!("Lỗi âm thanh: {err}"));
+                    return;
+                }
+            }
+        }
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.chinese_replay_rx = Some(rx);
+        let ctx_wake = ctx.clone();
+        self.runtime.spawn(async move {
+            let res = match HttpTtsEngine::with_base_url(
+                base_url,
+                DEFAULT_CONNECT_TIMEOUT,
+                DEFAULT_TTS_TIMEOUT,
+            ) {
+                Ok(client) => client
+                    .synthesize(&chinese, voice, &rate)
+                    .await
+                    .map(|mp3_bytes| {
+                        if let Some(cache) = &tts_cache {
+                            let _ = cache.put(&chinese, voice, &rate, mp3_bytes.clone());
+                        }
+                        TtsPreviewAudio { mp3_bytes, volume }
+                    }),
+                Err(err) => Err(err),
+            };
+            let _ = tx.send(res);
+            ctx_wake.request_repaint();
+        });
+        ctx.request_repaint();
+    }
+
+    /// Ensure the audio player exists and enqueue already-synthesized MP3
+    /// bytes for immediate playback (cache-hit path of click-to-replay).
+    fn play_replay_audio(&mut self, mp3_bytes: Vec<u8>, volume: f32) {
+        if self.audio.is_none() {
+            match AudioPlayer::new(volume) {
+                Ok(player) => {
+                    self.audio = Some(Arc::new(player));
+                }
+                Err(err) => {
+                    self.state.ui_notice = Some(format!("Lỗi âm thanh: {err}"));
+                    return;
+                }
+            }
+        }
+        if let Some(audio) = &self.audio {
+            let play_res = audio
+                .set_volume(volume)
+                .and_then(|()| audio.enqueue_mp3(mp3_bytes));
+            if let Err(err) = play_res {
+                self.state.ui_notice = Some(format!("Lỗi phát âm thanh: {err}"));
             }
         }
     }
@@ -415,6 +518,7 @@ impl super::Cap2VoiceApp {
                     self.open_region_selector(ctx, RegionSelectionTarget::LiveConfig);
                 }
                 OverlayCommand::ToggleSettingsPanel => self.open_settings_window(ctx),
+                OverlayCommand::ReplayChinese => self.handle_replay_chinese(ctx),
                 OverlayCommand::CloseWindow => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }

@@ -4,7 +4,8 @@ Exposes three strictly typed endpoints used by the Rust application:
 
 * ``GET /health``  — readiness probe managed by ``ServerProcess``.
 * ``POST /translate`` — offline Vietphrase dictionary translation (zh -> vi).
-* ``POST /tts`` — Edge-TTS synthesis (vi text -> MP3 bytes).
+* ``POST /tts`` — Edge-TTS synthesis (text -> MP3 bytes; Vietnamese voices
+  for auto-TTS, plus ``zh-CN-XiaoxiaoNeural`` for the Chinese click-to-replay).
 
 Translation runs fully offline through ``server.vietphrase`` (a port of the
 GPL-3.0 ``duongden/script-vietphrase-translator`` userscript; dictionaries are
@@ -35,7 +36,13 @@ BIND_HOST = "127.0.0.1"
 DEFAULT_PORT = 18765
 
 DEFAULT_VOICE = "vi-VN-NamMinhNeural"
-SUPPORTED_VOICES = frozenset({DEFAULT_VOICE, "vi-VN-HoaiMyNeural"})
+# Chinese replay voice for the overlay click-to-replay (D2): a clear standard
+# female Mandarin voice. The Rust app only ever requests it for replaying the
+# current Chinese line; Vietnamese auto-TTS still uses the configured voice.
+CHINESE_REPLAY_VOICE = "zh-CN-XiaoxiaoNeural"
+SUPPORTED_VOICES = frozenset(
+    {DEFAULT_VOICE, "vi-VN-HoaiMyNeural", CHINESE_REPLAY_VOICE}
+)
 DEFAULT_RATE = "+0%"
 
 _RATE_PATTERN = re.compile(r"[+-]\d{1,3}%")

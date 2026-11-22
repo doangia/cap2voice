@@ -219,6 +219,24 @@ def test_tts_accepts_female_voice_and_custom_rate(client: TestClient) -> None:
     assert created[0].rate == "+10%"
 
 
+def test_tts_accepts_chinese_replay_voice(client: TestClient) -> None:
+    """D2: the Chinese click-to-replay voice must be accepted by /tts."""
+    factory, created = stub_factory()
+    override_tts(factory)
+
+    response = client.post(
+        "/tts",
+        json={"text": ZH_LINE, "voice": "zh-CN-XiaoxiaoNeural"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("audio/mpeg")
+    assert len(created) == 1
+    assert created[0].text == ZH_LINE
+    assert created[0].voice == "zh-CN-XiaoxiaoNeural"
+    assert created[0].rate == "+0%"
+
+
 def test_tts_rejects_empty_text_with_structured_400(client: TestClient) -> None:
     factory, created = stub_factory()
     override_tts(factory)

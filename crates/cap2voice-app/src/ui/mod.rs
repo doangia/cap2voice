@@ -68,6 +68,10 @@ pub struct Cap2VoiceApp {
     settings_focused: bool,
     health_check_rx: Option<mpsc::Receiver<Result<HealthStatus, HealthError>>>,
     tts_preview_rx: Option<mpsc::Receiver<Result<TtsPreviewAudio, TtsError>>>,
+    /// In-flight Chinese click-to-replay synthesis (D2), same payload shape
+    /// as the voice preview channel but reported via `ui_notice` instead of
+    /// the settings draft.
+    chinese_replay_rx: Option<mpsc::Receiver<Result<TtsPreviewAudio, TtsError>>>,
     server_rx: Option<mpsc::Receiver<Result<ServerProcess, ServerProcessError>>>,
     server: Option<ServerProcess>,
     capturer: Arc<dyn FrameCapturer>,
@@ -239,6 +243,7 @@ impl Cap2VoiceApp {
             settings_focused: false,
             health_check_rx: None,
             tts_preview_rx: None,
+            chinese_replay_rx: None,
             server_rx: Some(server_rx),
             server: None,
             capturer: Arc::new(XcapCapturer::new()),
@@ -366,6 +371,7 @@ impl eframe::App for Cap2VoiceApp {
             || self.state.is_running()
             || self.health_check_rx.is_some()
             || self.tts_preview_rx.is_some()
+            || self.chinese_replay_rx.is_some()
         {
             ctx.request_repaint_after(Duration::from_millis(100));
         }

@@ -112,6 +112,7 @@ pub struct DisplayConfig {
     pub overlay_opacity: f32,
     pub show_chinese_line: bool,
     pub show_vietnamese_line: bool,
+    pub show_pinyin_line: bool,
     pub always_on_top: bool,
     pub chinese_color_hex: String,
     pub vietnamese_color_hex: String,
@@ -125,6 +126,7 @@ impl Default for DisplayConfig {
             overlay_opacity: 0.85,
             show_chinese_line: true,
             show_vietnamese_line: true,
+            show_pinyin_line: true,
             always_on_top: true,
             chinese_color_hex: "#FFFFFF".to_string(),
             vietnamese_color_hex: "#4ADE80".to_string(),
@@ -351,6 +353,7 @@ mod tests {
         assert!((cfg.display.overlay_opacity - 0.85).abs() < f32::EPSILON);
         assert!(cfg.display.show_chinese_line);
         assert!(cfg.display.show_vietnamese_line);
+        assert!(cfg.display.show_pinyin_line);
         assert!(cfg.display.always_on_top);
         assert_eq!(cfg.display.chinese_color_hex, "#FFFFFF");
         assert_eq!(cfg.display.vietnamese_color_hex, "#4ADE80");

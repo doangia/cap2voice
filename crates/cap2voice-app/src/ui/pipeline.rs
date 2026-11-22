@@ -270,6 +270,53 @@ impl super::Cap2VoiceApp {
                 }
             }
         }
+
+        let replay_result = if let Some(rx) = &self.chinese_replay_rx {
+            match rx.try_recv() {
+                Ok(res) => {
+                    self.chinese_replay_rx = None;
+                    Some(Ok(res))
+                }
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.chinese_replay_rx = None;
+                    Some(Err("Luồng nghe lại tiếng Trung đã dừng bất ngờ".to_string()))
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Some(outcome) = replay_result {
+            match outcome {
+                Ok(Ok(TtsPreviewAudio { mp3_bytes, volume })) => {
+                    if self.audio.is_none() {
+                        match AudioPlayer::new(volume) {
+                            Ok(player) => {
+                                self.audio = Some(Arc::new(player));
+                            }
+                            Err(err) => {
+                                self.state.ui_notice = Some(format!("Lỗi âm thanh: {err}"));
+                            }
+                        }
+                    }
+                    if let Some(audio) = &self.audio {
+                        let play_res = audio
+                            .set_volume(volume)
+                            .and_then(|()| audio.enqueue_mp3(mp3_bytes));
+                        if let Err(err) = play_res {
+                            self.state.ui_notice = Some(format!("Lỗi phát âm thanh: {err}"));
+                        }
+                    }
+                }
+                Ok(Err(err)) => {
+                    self.state.ui_notice = Some(format!("Không nghe lại được tiếng Trung: {err}"));
+                }
+                Err(msg) => {
+                    self.state.ui_notice = Some(msg);
+                }
+            }
+        }
     }
 
     pub(crate) fn persist_config(&mut self) {
