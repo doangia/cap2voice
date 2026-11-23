@@ -6,7 +6,7 @@ pub mod logger;
 pub use cache::{normalize_cache_key, CacheError, TranslationCache, TtsCache};
 pub use logger::{daily_log_path, format_subtitle_log_line, SubtitleLogError, SubtitleLogger};
 
-use crate::api::{TranslateError, Translator, TtsEngine};
+use crate::api::{TranslateError, Translator, TtsEngine, TtsSynthesis};
 use crate::audio::{validate_volume, AudioError, AudioPlayback};
 use crate::capture::{validate_region_dimensions, FrameCapturer, PixelDiffGate};
 use crate::config::{AppConfig, CaptureRegion};
@@ -17,9 +17,6 @@ use thiserror::Error;
 use tokio::sync::{watch, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, MissedTickBehavior};
-
-/// Default backoff delay after an upstream Google Translate HTTP 429 rate-limit response.
-pub const DEFAULT_RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(2);
 
 /// Default hold window for the subtitle hold-and-replace debounce (Task 15).
 /// A newly OCRed line is held for this long before emission; if a different
@@ -39,12 +36,11 @@ pub const MAX_INFLIGHT_TRANSLATIONS: usize = 4;
 /// Visible Vietnamese error banner for network/upstream translation failures (`docs/spec.md` §3.3).
 pub const ERR_BANNER_TRANSLATE_NETWORK: &str = "Mất kết nối mạng — không thể dịch";
 
-/// Visible Vietnamese error banner for Google Translate HTTP 429 rate limits (`docs/spec.md` §3.3).
-pub const ERR_BANNER_TRANSLATE_RATE_LIMIT: &str =
-    "Google Translate bị giới hạn tốc độ — tạm chờ...";
-
-/// Visible Vietnamese error banner when the local Python server is down (`docs/spec.md` §3.3).
-pub const ERR_BANNER_SERVER_UNAVAILABLE: &str = "Server dịch/TTS chưa sẵn sàng";
+/// Visible Vietnamese error banner when no translation engine can
+/// translate (`docs/spec.md` §3.3): both the Helsinki model and the
+/// Vietphrase dictionaries are unavailable.
+pub const ERR_BANNER_ENGINE_UNAVAILABLE: &str =
+    "Không có engine dịch khả dụng — kiểm tra model/từ điển";
 
 /// Typed startup and runtime control errors emitted by `PipelineRunner` and `PipelineHandle`.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -78,8 +74,7 @@ pub enum PipelineErrorKind {
     Capture,
     Ocr,
     TranslateNetwork,
-    TranslateRateLimited,
-    TranslateServerUnavailable,
+    TranslateEngineUnavailable,
     TranslateOther,
     Tts,
     Audio,
@@ -150,7 +145,6 @@ pub struct PipelineSettings {
     pub muted: bool,
     pub volume: f32,
     pub enable_subtitle_log: bool,
-    pub rate_limit_backoff: Duration,
 }
 
 fn validate_unit_f32(name: &str, value: f32, min: f32, max: f32) -> Result<(), PipelineError> {
@@ -186,7 +180,6 @@ impl PipelineSettings {
             muted: false,
             volume: config.voice.volume,
             enable_subtitle_log: config.general.enable_subtitle_log,
-            rate_limit_backoff: DEFAULT_RATE_LIMIT_BACKOFF,
         };
         settings.validate()?;
         Ok(settings)
@@ -238,17 +231,13 @@ impl PipelineSettings {
 /// Map a typed `TranslateError` into the explicit Vietnamese UI error banner.
 pub fn map_translate_error_banner(err: &TranslateError) -> PipelineErrorBanner {
     match err {
-        TranslateError::RateLimited { .. } => PipelineErrorBanner {
-            kind: PipelineErrorKind::TranslateRateLimited,
-            message: ERR_BANNER_TRANSLATE_RATE_LIMIT.to_string(),
-        },
         TranslateError::Upstream { .. } | TranslateError::Timeout { .. } => PipelineErrorBanner {
             kind: PipelineErrorKind::TranslateNetwork,
             message: ERR_BANNER_TRANSLATE_NETWORK.to_string(),
         },
-        TranslateError::ServerUnavailable { .. } => PipelineErrorBanner {
-            kind: PipelineErrorKind::TranslateServerUnavailable,
-            message: ERR_BANNER_SERVER_UNAVAILABLE.to_string(),
+        TranslateError::EngineUnavailable { .. } => PipelineErrorBanner {
+            kind: PipelineErrorKind::TranslateEngineUnavailable,
+            message: ERR_BANNER_ENGINE_UNAVAILABLE.to_string(),
         },
         TranslateError::EmptyInput
         | TranslateError::InvalidInput { .. }
@@ -291,7 +280,6 @@ struct SharedPipelineState {
     settings: PipelineSettings,
     snapshot: PipelineSnapshot,
     snapshot_tx: watch::Sender<PipelineSnapshot>,
-    rate_limit_until: Option<Instant>,
     stopped: bool,
 }
 
@@ -358,7 +346,6 @@ impl PipelineRunner {
             settings,
             snapshot: initial_snapshot,
             snapshot_tx,
-            rate_limit_until: None,
             stopped: false,
         }));
 
@@ -1101,25 +1088,6 @@ async fn process_emitted_subtitle(
     // them stale and they are discarded entirely. A completed sentence is
     // never discarded as stale — it must be logged and spoken even when a
     // newer preliminary exists; only its display update is skipped then.
-    let backoff_until = {
-        let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
-        if state.stopped {
-            return;
-        }
-        if !is_completed && seq < state.snapshot.latest_seq {
-            state.snapshot.metrics.stale_translations_discarded += 1;
-            state.publish();
-            return;
-        }
-        state.rate_limit_until
-    };
-
-    if let Some(until) = backoff_until {
-        if until > Instant::now() {
-            tokio::time::sleep_until(until).await;
-        }
-    }
-
     {
         let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
         if state.stopped {
@@ -1133,12 +1101,15 @@ async fn process_emitted_subtitle(
     }
 
     // Completed sentences consult the translation cache (A3 / gh #2); the
-    // preliminary translation never does. `get` normalizes the key
+    // preliminary translation never does. The key is engine-scoped
+    // (`helsinki|…` / `vietphrase|…`) so switching engines never serves
+    // the other engine's translation. `get` normalizes the key
     // internally, so the raw sentence is passed here.
+    let engine_id = deps.translator.engine_id().unwrap_or("unknown");
     let cached_vietnamese = if is_completed {
         deps.translation_cache
             .as_ref()
-            .and_then(|cache| cache.get(&chinese))
+            .and_then(|cache| cache.get(&chinese, engine_id))
     } else {
         None
     };
@@ -1171,7 +1142,6 @@ async fn process_emitted_subtitle(
 
         match translate_res {
             Ok(vi) => {
-                state.rate_limit_until = None;
                 if !display_stale {
                     state.snapshot.vietnamese_line = vi.clone();
                 }
@@ -1181,7 +1151,7 @@ async fn process_emitted_subtitle(
                 // preliminary translation is never cached.
                 if is_completed {
                     if let Some(cache) = &deps.translation_cache {
-                        let _ = cache.put(&chinese, vi.clone());
+                        let _ = cache.put(&chinese, vi.clone(), engine_id);
                     }
                 }
                 let enable_log = is_completed && state.settings.enable_subtitle_log;
@@ -1194,12 +1164,6 @@ async fn process_emitted_subtitle(
             Err(err) => {
                 if !display_stale {
                     state.snapshot.vietnamese_line.clear();
-                }
-                if matches!(err, TranslateError::RateLimited { .. }) {
-                    let backoff = state.settings.rate_limit_backoff;
-                    if !backoff.is_zero() {
-                        state.rate_limit_until = Some(Instant::now() + backoff);
-                    }
                 }
                 let banner = map_translate_error_banner(&err);
                 state.set_banner(banner.kind, banner.message);
@@ -1239,9 +1203,36 @@ async fn process_emitted_subtitle(
     };
 
     let tts_res = match cached_mp3 {
-        Some(mp3) => Ok(mp3),
+        Some(mp3) => Ok(TtsSynthesis {
+            audio: mp3,
+            retries: Vec::new(),
+        }),
         None => deps.tts.synthesize(&vietnamese, &voice, &rate).await,
     };
+
+    // Retries and ultimate failures go to the subtitle log file, not just
+    // the transient overlay banner: a 429 the client rode out must still
+    // be visible afterwards, and a sentence that lost its audio must not
+    // vanish silently. A cache hit has no retries to report. The log
+    // write is best-effort (a failure here must not break the TTS path).
+    if let Some(logger) = &deps.logger {
+        match &tts_res {
+            Ok(synthesis) => {
+                for attempt in &synthesis.retries {
+                    let _ = logger.log_tts_retry(&vietnamese, &voice, attempt);
+                }
+            }
+            Err(err) => {
+                // Log every retry attempt first, then the failure summary,
+                // so a sentence that lost its audio still shows the full
+                // 429 → retry → 429 → … trail in the file.
+                for attempt in err.retries() {
+                    let _ = logger.log_tts_retry(&vietnamese, &voice, attempt);
+                }
+                let _ = logger.log_tts_failure(&vietnamese, &voice, err);
+            }
+        }
+    }
 
     let mp3_bytes = {
         let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -1253,14 +1244,14 @@ async fn process_emitted_subtitle(
             return;
         }
         match tts_res {
-            Ok(bytes) => {
+            Ok(synthesis) => {
                 // Store freshly synthesized audio in the TTS cache (A3).
                 if !tts_cache_hit {
                     if let Some(cache) = &deps.tts_cache {
-                        let _ = cache.put(&vietnamese, &voice, &rate, bytes.clone());
+                        let _ = cache.put(&vietnamese, &voice, &rate, synthesis.audio.clone());
                     }
                 }
-                bytes
+                synthesis.audio
             }
             Err(err) => {
                 state.set_banner(PipelineErrorKind::Tts, format!("Lỗi giọng đọc TTS: {err}"));
@@ -1283,8 +1274,8 @@ mod tests {
     use super::{
         map_translate_error_banner, Duration, Instant, PipelineError, PipelineErrorBanner,
         PipelineErrorKind, PipelineSettings, SentenceBuffer, SentenceEvent, SubtitleHold,
-        DEFAULT_HOLD_DELAY, DEFAULT_SENTENCE_BLANK_FRAMES, ERR_BANNER_SERVER_UNAVAILABLE,
-        ERR_BANNER_TRANSLATE_NETWORK, ERR_BANNER_TRANSLATE_RATE_LIMIT, MAX_SENTENCE_BUFFER_AGE,
+        DEFAULT_HOLD_DELAY, DEFAULT_SENTENCE_BLANK_FRAMES, ERR_BANNER_ENGINE_UNAVAILABLE,
+        ERR_BANNER_TRANSLATE_NETWORK, MAX_SENTENCE_BUFFER_AGE,
     };
     use crate::api::TranslateError;
     use crate::config::{AppConfig, CaptureRegion};
@@ -1576,15 +1567,6 @@ mod tests {
     #[test]
     fn translate_error_maps_to_expected_vietnamese_banner_kinds() {
         assert_eq!(
-            map_translate_error_banner(&TranslateError::RateLimited {
-                detail: "429".to_string(),
-            }),
-            PipelineErrorBanner {
-                kind: PipelineErrorKind::TranslateRateLimited,
-                message: ERR_BANNER_TRANSLATE_RATE_LIMIT.to_string(),
-            }
-        );
-        assert_eq!(
             map_translate_error_banner(&TranslateError::Upstream {
                 status: 502,
                 detail: "bad gateway".to_string(),
@@ -1602,12 +1584,12 @@ mod tests {
             }
         );
         assert_eq!(
-            map_translate_error_banner(&TranslateError::ServerUnavailable {
-                detail: "connection refused".to_string(),
+            map_translate_error_banner(&TranslateError::EngineUnavailable {
+                detail: "no model, no dictionaries".to_string(),
             }),
             PipelineErrorBanner {
-                kind: PipelineErrorKind::TranslateServerUnavailable,
-                message: ERR_BANNER_SERVER_UNAVAILABLE.to_string(),
+                kind: PipelineErrorKind::TranslateEngineUnavailable,
+                message: ERR_BANNER_ENGINE_UNAVAILABLE.to_string(),
             }
         );
     }

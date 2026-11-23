@@ -1,5 +1,13 @@
 //! Daily UTF-8 `[YYYY-MM-DD HH:MM:SS] <Chinese> : <Vietnamese>` subtitle logger.
+//!
+//! The same daily file also carries TTS diagnostics: a retry line for each
+//! transient Edge-TTS failure the client rode out, and a failure line when
+//! a sentence ultimately lost its audio. Both keep the file's shape — one
+//! sanitized single line per event, same `[timestamp]` prefix, same daily
+//! rotation — so the log stays one chronological stream instead of a
+//! second format.
 
+use crate::api::{TtsError, TtsRetryAttempt, TTS_MAX_RETRIES};
 use chrono::{NaiveDate, NaiveDateTime};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -51,6 +59,56 @@ pub fn format_subtitle_log_line(
     format_clean_log_line(timestamp, &clean_zh, &clean_vi)
 }
 
+/// Format a TTS retry line, e.g.
+/// `[2026-11-23 15:30:00] TTS thử lại 1/3 (vi-VN-NamMinhNeural, HTTP 429, chờ 500ms): Xin chào.`
+/// The status is `HTTP <status>` for upstream failures, `lỗi mạng` for
+/// network errors with no response.
+pub fn format_tts_retry_line(
+    timestamp: NaiveDateTime,
+    vietnamese: &str,
+    voice: &str,
+    attempt: &TtsRetryAttempt,
+) -> String {
+    let clean_vi = sanitize_single_line(vietnamese);
+    let clean_voice = sanitize_single_line(voice);
+    let status = attempt
+        .status
+        .map_or("lỗi mạng".to_string(), |s| format!("HTTP {s}"));
+    format!(
+        "[{}] TTS thử lại {}/{} ({}, {}, chờ {}ms): {}\n",
+        timestamp.format("%Y-%m-%d %H:%M:%S"),
+        attempt.attempt,
+        TTS_MAX_RETRIES,
+        clean_voice,
+        status,
+        attempt.backoff_ms,
+        clean_vi
+    )
+}
+
+/// Format a TTS failure line, e.g.
+/// `[2026-11-23 15:30:02] TTS THẤT BẠI (vi-VN-NamMinhNeural) sau 3 lần thử: lỗi tạo giọng đọc TTS (HTTP 429): … : Xin chào.`
+/// The retry count is omitted when the error came from the first attempt.
+pub fn format_tts_failure_line(
+    timestamp: NaiveDateTime,
+    vietnamese: &str,
+    voice: &str,
+    error: &TtsError,
+) -> String {
+    let clean_vi = sanitize_single_line(vietnamese);
+    let clean_voice = sanitize_single_line(voice);
+    let clean_err = sanitize_single_line(&error.to_string());
+    let ts = timestamp.format("%Y-%m-%d %H:%M:%S");
+    if error.retries().is_empty() {
+        format!("[{ts}] TTS THẤT BẠI ({clean_voice}): {clean_err} : {clean_vi}\n")
+    } else {
+        format!(
+            "[{ts}] TTS THẤT BẠI ({clean_voice}) sau {} lần thử: {clean_err} : {clean_vi}\n",
+            error.retries().len()
+        )
+    }
+}
+
 struct OpenDailyFile {
     date: NaiveDate,
     path: PathBuf,
@@ -100,6 +158,69 @@ impl SubtitleLogger {
         }
 
         let line = format_clean_log_line(timestamp, &clean_zh, &clean_vi);
+        self.write_line_at(timestamp, line)
+    }
+
+    /// Append and flush one TTS retry line using the current local
+    /// timestamp. Best-effort diagnostics: the caller ignores the error
+    /// (the overlay banner already shows the failure, if any).
+    pub fn log_tts_retry(
+        &self,
+        vietnamese: &str,
+        voice: &str,
+        attempt: &TtsRetryAttempt,
+    ) -> Result<PathBuf, SubtitleLogError> {
+        let now = chrono::Local::now().naive_local();
+        self.log_tts_retry_at(now, vietnamese, voice, attempt)
+    }
+
+    /// Append and flush one TTS retry line at an explicit timestamp.
+    pub fn log_tts_retry_at(
+        &self,
+        timestamp: NaiveDateTime,
+        vietnamese: &str,
+        voice: &str,
+        attempt: &TtsRetryAttempt,
+    ) -> Result<PathBuf, SubtitleLogError> {
+        self.write_line_at(
+            timestamp,
+            format_tts_retry_line(timestamp, vietnamese, voice, attempt),
+        )
+    }
+
+    /// Append and flush one TTS failure line using the current local
+    /// timestamp (sentence, voice, status/error, retry count).
+    pub fn log_tts_failure(
+        &self,
+        vietnamese: &str,
+        voice: &str,
+        error: &TtsError,
+    ) -> Result<PathBuf, SubtitleLogError> {
+        let now = chrono::Local::now().naive_local();
+        self.log_tts_failure_at(now, vietnamese, voice, error)
+    }
+
+    /// Append and flush one TTS failure line at an explicit timestamp.
+    pub fn log_tts_failure_at(
+        &self,
+        timestamp: NaiveDateTime,
+        vietnamese: &str,
+        voice: &str,
+        error: &TtsError,
+    ) -> Result<PathBuf, SubtitleLogError> {
+        self.write_line_at(
+            timestamp,
+            format_tts_failure_line(timestamp, vietnamese, voice, error),
+        )
+    }
+
+    /// Append one pre-formatted line to the daily file for `timestamp`,
+    /// opening (or rotating) the file as needed, and flush immediately.
+    fn write_line_at(
+        &self,
+        timestamp: NaiveDateTime,
+        line: String,
+    ) -> Result<PathBuf, SubtitleLogError> {
         let date = timestamp.date();
 
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -321,5 +442,127 @@ mod tests {
             bad_logger.log_pair_at(dt(2026, 11, 20, 12, 0, 0), "你好", "Xin chào"),
             Err(SubtitleLogError::Io { .. })
         ));
+    }
+
+    #[test]
+    fn format_tts_retry_and_failure_lines_carry_attempt_status_voice_and_sentence() {
+        use super::{format_tts_failure_line, format_tts_retry_line};
+        use crate::api::{TtsError, TtsRetryAttempt};
+        let ts = dt(2026, 11, 23, 15, 30, 0);
+        assert_eq!(
+            format_tts_retry_line(
+                ts,
+                "Xin chào, tôi là Tiểu Minh.",
+                "vi-VN-NamMinhNeural",
+                &TtsRetryAttempt {
+                    attempt: 1,
+                    status: Some(429),
+                    detail: "Too Many Requests".to_string(),
+                    backoff_ms: 500,
+                },
+            ),
+            "[2026-11-23 15:30:00] TTS thử lại 1/3 (vi-VN-NamMinhNeural, HTTP 429, chờ 500ms): Xin chào, tôi là Tiểu Minh.\n"
+        );
+        // Network failure: no HTTP status.
+        assert_eq!(
+            format_tts_retry_line(
+                ts,
+                "Xin chào.",
+                "vi-VN-NamMinhNeural",
+                &TtsRetryAttempt {
+                    attempt: 2,
+                    status: None,
+                    detail: "reset".to_string(),
+                    backoff_ms: 1000,
+                },
+            ),
+            "[2026-11-23 15:30:00] TTS thử lại 2/3 (vi-VN-NamMinhNeural, lỗi mạng, chờ 1000ms): Xin chào.\n"
+        );
+        // Failure after retries names the count; without retries it is omitted.
+        let mut err = TtsError::Upstream {
+            status: 429,
+            detail: "Too Many Requests".to_string(),
+            retries: vec![
+                TtsRetryAttempt {
+                    attempt: 1,
+                    status: Some(429),
+                    detail: "Too Many Requests".to_string(),
+                    backoff_ms: 500,
+                },
+                TtsRetryAttempt {
+                    attempt: 2,
+                    status: Some(429),
+                    detail: "Too Many Requests".to_string(),
+                    backoff_ms: 1000,
+                },
+                TtsRetryAttempt {
+                    attempt: 3,
+                    status: Some(429),
+                    detail: "Too Many Requests".to_string(),
+                    backoff_ms: 2000,
+                },
+            ],
+        };
+        assert_eq!(
+            format_tts_failure_line(ts, "Xin chào.", "vi-VN-NamMinhNeural", &err),
+            "[2026-11-23 15:30:00] TTS THẤT BẠI (vi-VN-NamMinhNeural) sau 3 lần thử: lỗi tạo giọng đọc TTS (HTTP 429): Too Many Requests : Xin chào.\n"
+        );
+        err.set_retries(Vec::new());
+        assert_eq!(
+            format_tts_failure_line(ts, "Xin chào.", "vi-VN-NamMinhNeural", &err),
+            "[2026-11-23 15:30:00] TTS THẤT BẠI (vi-VN-NamMinhNeural): lỗi tạo giọng đọc TTS (HTTP 429): Too Many Requests : Xin chào.\n"
+        );
+    }
+
+    #[test]
+    fn subtitle_logger_appends_tts_retry_and_failure_lines_to_the_daily_file() {
+        use crate::api::{TtsError, TtsRetryAttempt};
+        let temp = TempDirGuard::new("tts_log");
+        let logger = SubtitleLogger::new(temp.path().to_path_buf());
+        let path = match logger.log_pair_at(
+            dt(2026, 11, 23, 15, 30, 0),
+            "你好，我是小明。",
+            "Xin chào, tôi là Tiểu Minh.",
+        ) {
+            Ok(p) => p,
+            Err(err) => panic!("log_pair failed: {err}"),
+        };
+        logger
+            .log_tts_retry_at(
+                dt(2026, 11, 23, 15, 30, 0),
+                "Xin chào, tôi là Tiểu Minh.",
+                "vi-VN-NamMinhNeural",
+                &TtsRetryAttempt {
+                    attempt: 1,
+                    status: Some(429),
+                    detail: "Too Many Requests".to_string(),
+                    backoff_ms: 500,
+                },
+            )
+            .expect("log_tts_retry");
+        logger
+            .log_tts_failure_at(
+                dt(2026, 11, 23, 15, 30, 0),
+                "Xin chào, tôi là Tiểu Minh.",
+                "vi-VN-NamMinhNeural",
+                &TtsError::Upstream {
+                    status: 429,
+                    detail: "Too Many Requests".to_string(),
+                    retries: vec![TtsRetryAttempt {
+                        attempt: 1,
+                        status: Some(429),
+                        detail: "Too Many Requests".to_string(),
+                        backoff_ms: 500,
+                    }],
+                },
+            )
+            .expect("log_tts_failure");
+        let content = std::fs::read_to_string(&path).expect("read log file");
+        assert_eq!(
+            content,
+            "[2026-11-23 15:30:00] 你好，我是小明。 : Xin chào, tôi là Tiểu Minh.\n\
+             [2026-11-23 15:30:00] TTS thử lại 1/3 (vi-VN-NamMinhNeural, HTTP 429, chờ 500ms): Xin chào, tôi là Tiểu Minh.\n\
+             [2026-11-23 15:30:00] TTS THẤT BẠI (vi-VN-NamMinhNeural) sau 1 lần thử: lỗi tạo giọng đọc TTS (HTTP 429): Too Many Requests : Xin chào, tôi là Tiểu Minh.\n"
+        );
     }
 }

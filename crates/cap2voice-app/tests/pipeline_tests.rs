@@ -2,9 +2,7 @@
 //! error surfacing, live settings updates, and clean stop, plus real-PC 60s smoke test.
 
 use cap2voice_app::api::{
-    BoxFuture, HttpTranslator, HttpTtsEngine, ServerProcess, ServerProcessConfig, TranslateError,
-    Translator, TtsEngine, TtsError, DEFAULT_CONNECT_TIMEOUT, DEFAULT_TRANSLATE_TIMEOUT,
-    DEFAULT_TTS_TIMEOUT,
+    BoxFuture, TranslateError, Translator, TtsEngine, TtsError, TtsRetryAttempt, TtsSynthesis,
 };
 use cap2voice_app::audio::{AudioError, AudioPlayback, AudioPlayer, EnqueueOutcome};
 use cap2voice_app::capture::{
@@ -20,8 +18,12 @@ use cap2voice_app::ocr::{
 use cap2voice_app::pipeline::{
     daily_log_path, PipelineDeps, PipelineErrorKind, PipelineRunner, PipelineSettings,
     PipelineSnapshot, PipelineStatus, SubtitleLogger, TranslationCache, TtsCache,
-    ERR_BANNER_SERVER_UNAVAILABLE, ERR_BANNER_TRANSLATE_NETWORK, ERR_BANNER_TRANSLATE_RATE_LIMIT,
+    ERR_BANNER_ENGINE_UNAVAILABLE, ERR_BANNER_TRANSLATE_NETWORK,
 };
+use cap2voice_app::translate::{
+    default_model_dir, load_default_dictionaries, SwitchableTranslator,
+};
+use cap2voice_app::tts::EdgeTtsEngine;
 use chrono::Local;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -179,7 +181,6 @@ fn test_settings(fps: u32) -> PipelineSettings {
         muted: false,
         volume: 0.75,
         enable_subtitle_log: true,
-        rate_limit_backoff: Duration::from_millis(20),
     }
 }
 
@@ -386,7 +387,7 @@ impl Translator for ControllableTranslator {
                 self.notify_in.notify_waiters();
                 return match rx.await {
                     Ok(res) => res,
-                    Err(_) => Err(TranslateError::ServerUnavailable {
+                    Err(_) => Err(TranslateError::EngineUnavailable {
                         detail: "aborted".to_string(),
                     }),
                 };
@@ -413,12 +414,12 @@ struct RecordedTtsCall {
 }
 
 struct MockTtsEngine {
-    scripted: Mutex<VecDeque<Result<Vec<u8>, TtsError>>>,
+    scripted: Mutex<VecDeque<Result<TtsSynthesis, TtsError>>>,
     calls: Mutex<Vec<RecordedTtsCall>>,
 }
 
 impl MockTtsEngine {
-    fn new(scripted: Vec<Result<Vec<u8>, TtsError>>) -> Self {
+    fn new(scripted: Vec<Result<TtsSynthesis, TtsError>>) -> Self {
         Self {
             scripted: Mutex::new(VecDeque::from(scripted)),
             calls: Mutex::new(Vec::new()),
@@ -436,7 +437,7 @@ impl TtsEngine for MockTtsEngine {
         text: &'a str,
         voice: &'a str,
         rate: &'a str,
-    ) -> BoxFuture<'a, Result<Vec<u8>, TtsError>> {
+    ) -> BoxFuture<'a, Result<TtsSynthesis, TtsError>> {
         let req = RecordedTtsCall {
             text: text.to_string(),
             voice: voice.to_string(),
@@ -454,7 +455,10 @@ impl TtsEngine for MockTtsEngine {
                 .pop_front();
             match next {
                 Some(res) => res,
-                None => Ok(format!("MP3({}:{})", req.voice, req.text).into_bytes()),
+                None => Ok(TtsSynthesis {
+                    audio: format!("MP3({}:{})", req.voice, req.text).into_bytes(),
+                    retries: Vec::new(),
+                }),
             }
         })
     }
@@ -1409,7 +1413,7 @@ async fn pipeline_auto_read_false_makes_zero_tts_calls_while_translating_and_log
 }
 
 #[tokio::test]
-async fn pipeline_translation_and_network_errors_clear_stale_vietnamese_and_emit_vietnamese_banners_with_429_backoff(
+async fn pipeline_translation_and_network_errors_clear_stale_vietnamese_and_emit_vietnamese_banners(
 ) {
     let temp = TempDirGuard::new("tr_err");
     let capturer = Arc::new(MockCapturer::new(
@@ -1467,43 +1471,28 @@ async fn pipeline_translation_and_network_errors_clear_stale_vietnamese_and_emit
         Some(ERR_BANNER_TRANSLATE_NETWORK)
     );
 
-    // Next subtitle hits 429 rate-limit -> explicit 429 banner, then server down, then recovery clears banner.
-    translator.push_response(Err(TranslateError::RateLimited {
-        detail: "429".to_string(),
-    }));
-    ocr.push_result(Ok(ocr_block("第三句。")));
-    capturer.push_frame(Ok(solid_frame(240)));
-
-    let rate_err = wait_for_snapshot(&mut rx, "429 banner", |s| {
-        s.error_banner
-            .as_ref()
-            .is_some_and(|b| b.kind == PipelineErrorKind::TranslateRateLimited)
-    })
-    .await;
-    assert_eq!(
-        rate_err.error_banner.as_ref().map(|b| b.message.as_str()),
-        Some(ERR_BANNER_TRANSLATE_RATE_LIMIT)
-    );
-
-    translator.push_response(Err(TranslateError::ServerUnavailable {
+    // Next subtitle hits an unavailable engine -> explicit engine
+    // banner, then recovery clears the banner. (D1+A5: there is no
+    // HTTP server anymore, so no 429 rate-limit path exists.)
+    translator.push_response(Err(TranslateError::EngineUnavailable {
         detail: "down".to_string(),
     }));
-    ocr.push_result(Ok(ocr_block("第四句。")));
+    ocr.push_result(Ok(ocr_block("第三句。")));
     capturer.push_frame(Ok(frame_with_band(240, 20)));
 
-    let srv_err = wait_for_snapshot(&mut rx, "server unavailable banner", |s| {
+    let srv_err = wait_for_snapshot(&mut rx, "engine unavailable banner", |s| {
         s.error_banner
             .as_ref()
-            .is_some_and(|b| b.kind == PipelineErrorKind::TranslateServerUnavailable)
+            .is_some_and(|b| b.kind == PipelineErrorKind::TranslateEngineUnavailable)
     })
     .await;
     assert_eq!(
         srv_err.error_banner.as_ref().map(|b| b.message.as_str()),
-        Some(ERR_BANNER_SERVER_UNAVAILABLE)
+        Some(ERR_BANNER_ENGINE_UNAVAILABLE)
     );
 
     translator.push_response(Ok("Phục hồi thành công.".to_string()));
-    ocr.push_result(Ok(ocr_block("第五句。")));
+    ocr.push_result(Ok(ocr_block("第四句。")));
     capturer.push_frame(Ok(solid_frame(120)));
 
     let recovered = wait_for_snapshot(&mut rx, "recovered clears error banner", |s| {
@@ -1535,8 +1524,12 @@ async fn pipeline_tts_and_audio_errors_surface_non_blocking_warning_while_keepin
         Err(TtsError::Upstream {
             status: 503,
             detail: "Edge-TTS offline".to_string(),
+            retries: Vec::new(),
         }),
-        Ok(b"MP3_OK".to_vec()),
+        Ok(TtsSynthesis {
+            audio: b"MP3_OK".to_vec(),
+            retries: Vec::new(),
+        }),
     ]));
     let audio = Arc::new(MockAudioPlayback::new());
     audio.push_enqueue_result(Err(AudioError::DecodeFailed {
@@ -1584,6 +1577,119 @@ async fn pipeline_tts_and_audio_errors_surface_non_blocking_warning_while_keepin
     assert_eq!(audio_warn.vietnamese_line, "Bản dịch hai.");
 
     handle.stop().await;
+}
+
+#[tokio::test]
+async fn pipeline_tts_retries_then_failure_land_in_the_subtitle_log_in_order() {
+    // A 429 that exhausts its retries must leave the full trail in the
+    // log file — one line per retry attempt, then the failure summary —
+    // not just the transient overlay banner.
+    let temp = TempDirGuard::new("tts_retry_log");
+    let capturer = Arc::new(MockCapturer::new(
+        vec![Ok(solid_frame(15)), Ok(frame_with_band(15, 220))],
+        Ok(frame_with_band(15, 220)),
+    ));
+    let ocr = Arc::new(MockOcrEngine::new(
+        vec![Ok(ocr_block("第一句。")), Ok(ocr_block("第二句。"))],
+        Ok(ocr_block("第二句。")),
+    ));
+    let translator = Arc::new(ControllableTranslator::scripted(vec![
+        Ok("Bản dịch một.".to_string()),
+        Ok("Bản dịch hai.".to_string()),
+    ]));
+    let tts = Arc::new(MockTtsEngine::new(vec![
+        Err(TtsError::Upstream {
+            status: 429,
+            detail: "Too Many Requests".to_string(),
+            retries: vec![
+                TtsRetryAttempt {
+                    attempt: 1,
+                    status: Some(429),
+                    detail: "Too Many Requests".to_string(),
+                    backoff_ms: 500,
+                },
+                TtsRetryAttempt {
+                    attempt: 2,
+                    status: Some(429),
+                    detail: "Too Many Requests".to_string(),
+                    backoff_ms: 1000,
+                },
+            ],
+        }),
+        Ok(TtsSynthesis {
+            audio: b"MP3_OK".to_vec(),
+            retries: Vec::new(),
+        }),
+    ]));
+    let audio = Arc::new(MockAudioPlayback::new());
+    let logger = Arc::new(SubtitleLogger::new(temp.path().to_path_buf()));
+
+    let handle = match PipelineRunner::start(
+        test_settings(60),
+        PipelineDeps {
+            capturer,
+            ocr,
+            translator,
+            tts,
+            audio,
+            logger: Some(logger),
+            translation_cache: None,
+            tts_cache: None,
+        },
+    ) {
+        Ok(h) => h,
+        Err(err) => panic!("PipelineRunner::start failed: {err}"),
+    };
+
+    let mut rx = handle.subscribe();
+    let tts_warn = wait_for_snapshot(&mut rx, "TTS error banner", |s| {
+        s.error_banner
+            .as_ref()
+            .is_some_and(|b| b.kind == PipelineErrorKind::Tts)
+    })
+    .await;
+    assert_eq!(tts_warn.vietnamese_line, "Bản dịch một.");
+
+    handle.stop().await;
+
+    let today_log = daily_log_path(temp.path(), Local::now().date_naive());
+    let content = match std::fs::read_to_string(&today_log) {
+        Ok(s) => s,
+        Err(err) => panic!("failed reading daily log {}: {err}", today_log.display()),
+    };
+    let lines: Vec<&str> = content.lines().collect();
+    let pair = lines
+        .iter()
+        .position(|l| l.ends_with("] 第一句。 : Bản dịch một."))
+        .expect("pair line");
+    let retry1 = lines
+        .iter()
+        .position(|l| {
+            l.contains("TTS thử lại 1/3")
+                && l.contains("HTTP 429")
+                && l.contains("chờ 500ms")
+                && l.ends_with("Bản dịch một.")
+        })
+        .expect("retry 1 line");
+    let retry2 = lines
+        .iter()
+        .position(|l| {
+            l.contains("TTS thử lại 2/3")
+                && l.contains("HTTP 429")
+                && l.contains("chờ 1000ms")
+                && l.ends_with("Bản dịch một.")
+        })
+        .expect("retry 2 line");
+    let failure = lines
+        .iter()
+        .position(|l| {
+            l.contains("TTS THẤT BẠI")
+                && l.contains("sau 2 lần thử")
+                && l.contains("HTTP 429")
+                && l.ends_with("Bản dịch một.")
+        })
+        .expect("failure line");
+    assert!(pair < retry1 && retry1 < retry2 && retry2 < failure);
 }
 
 #[tokio::test]
@@ -1872,16 +1978,6 @@ fn start_on_from_non_tokio_thread_drives_pipeline_and_stops_via_block_on() {
     assert_eq!(rx.borrow().status, PipelineStatus::Idle);
 }
 
-fn unused_loopback_port() -> u16 {
-    let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:0") else {
-        panic!("failed binding ephemeral TCP port");
-    };
-    let Ok(addr) = listener.local_addr() else {
-        panic!("failed reading ephemeral port");
-    };
-    addr.port()
-}
-
 fn resolve_smoke_region(
     capturer: &XcapCapturer,
     configured: Option<&CaptureRegion>,
@@ -1971,31 +2067,26 @@ async fn real_pc_60s_headless_pipeline_smoke_test() {
         panic!("WeChatOcrAdapter warmup failed: {err}");
     }
 
-    let server_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("server");
-    let port = unused_loopback_port();
-    let server = match ServerProcess::start(ServerProcessConfig::for_port(port, server_dir)).await {
-        Ok(srv) => srv,
-        Err(err) => panic!("ServerProcess::start failed: {err}"),
+    // Native engines (D1+A5): no Python server. The translator loads
+    // Vietphrase dictionaries synchronously and the Helsinki model in
+    // the background; the smoke video's first sentences translate via
+    // the fallback until the model is ready.
+    let dicts = match load_default_dictionaries() {
+        Ok(dicts) => Some(dicts),
+        Err(err) => {
+            println!("Vietphrase dictionaries unavailable ({err}); Helsinki only");
+            None
+        }
     };
-    let translator = match HttpTranslator::with_base_url(
-        server.base_url().to_string(),
-        DEFAULT_CONNECT_TIMEOUT,
-        DEFAULT_TRANSLATE_TIMEOUT,
-    ) {
-        Ok(t) => Arc::new(t),
-        Err(err) => panic!("HttpTranslator init failed: {err}"),
+    let model_dir = match default_model_dir() {
+        Ok(dir) => dir,
+        Err(err) => panic!("failed resolving Helsinki model dir: {err}"),
     };
-    let tts = match HttpTtsEngine::with_base_url(
-        server.base_url().to_string(),
-        DEFAULT_CONNECT_TIMEOUT,
-        DEFAULT_TTS_TIMEOUT,
-    ) {
-        Ok(t) => Arc::new(t),
-        Err(err) => panic!("HttpTtsEngine init failed: {err}"),
+    let translator = match SwitchableTranslator::new(dicts, model_dir, cfg.translation.engine) {
+        Ok(t) => t,
+        Err(err) => panic!("no translation engine available: {err}"),
     };
+    let tts = Arc::new(EdgeTtsEngine::new());
     let audio = match AudioPlayer::new(settings.volume) {
         Ok(p) => Arc::new(p),
         Err(err) => panic!("AudioPlayer init failed: {err}"),
@@ -2057,7 +2148,6 @@ async fn real_pc_60s_headless_pipeline_smoke_test() {
     let final_snap = handle.snapshot();
     handle.stop().await;
     assert_eq!(rx.borrow().status, PipelineStatus::Idle);
-    drop(server);
 
     let today_log = daily_log_path(&log_dir, Local::now().date_naive());
     println!(

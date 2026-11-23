@@ -10,6 +10,7 @@ pub use io::{
     default_cache_dir, default_config_path, default_log_dir, load_config_from, save_config_to,
 };
 
+use crate::translate::TranslationEngine;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use thiserror::Error;
@@ -62,11 +63,12 @@ impl Default for GeneralConfig {
     }
 }
 
-/// Translation API bridge and pre-OCR/deduplication thresholds (`Dịch` tab).
+/// Translation engine selection and pre-OCR/deduplication thresholds (`Dịch` tab).
+/// (D1+A5: no local server anymore; `engine` picks the in-process translator.)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TranslationConfig {
-    pub server_port: u16,
+    pub engine: TranslationEngine,
     pub dedupe_threshold: f32,
     pub pixel_diff_threshold: f32,
     pub blank_reset_frames: u32,
@@ -75,7 +77,7 @@ pub struct TranslationConfig {
 impl Default for TranslationConfig {
     fn default() -> Self {
         Self {
-            server_port: 18765,
+            engine: TranslationEngine::default(),
             dedupe_threshold: 0.93,
             pixel_diff_threshold: 0.02,
             blank_reset_frames: 5,
@@ -254,12 +256,6 @@ impl AppConfig {
                 )));
             }
         }
-        if self.translation.server_port < 1024 {
-            return Err(ConfigError::Validation(format!(
-                "server_port must be >= 1024 (got {})",
-                self.translation.server_port
-            )));
-        }
         validate_f32_range(
             "dedupe_threshold",
             self.translation.dedupe_threshold,
@@ -325,7 +321,7 @@ impl AppConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppConfig, CaptureRegion, ConfigError};
+    use super::{AppConfig, CaptureRegion, ConfigError, TranslationEngine};
 
     #[test]
     fn default_config_matches_spec_v1_values() {
@@ -339,7 +335,7 @@ mod tests {
         assert!(!cfg.general.start_with_windows);
         assert!(!cfg.general.start_minimized_to_tray);
 
-        assert_eq!(cfg.translation.server_port, 18765);
+        assert_eq!(cfg.translation.engine, TranslationEngine::Helsinki);
         assert!((cfg.translation.dedupe_threshold - 0.93).abs() < f32::EPSILON);
         assert!((cfg.translation.pixel_diff_threshold - 0.02).abs() < f32::EPSILON);
         assert_eq!(cfg.translation.blank_reset_frames, 5);
@@ -381,10 +377,6 @@ mod tests {
             height: 16,
         });
         cases.push(("region too narrow", c));
-
-        let mut c = AppConfig::default();
-        c.translation.server_port = 80;
-        cases.push(("privileged port", c));
 
         let mut c = AppConfig::default();
         c.translation.dedupe_threshold = 1.2;

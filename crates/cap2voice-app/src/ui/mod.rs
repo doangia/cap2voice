@@ -11,16 +11,16 @@ pub mod region;
 pub mod settings;
 pub mod tray;
 
-use crate::api::{HealthError, HealthStatus, ServerProcess, ServerProcessError, TtsError};
+use crate::api::TtsError;
 use crate::audio::AudioPlayback;
 use crate::capture::{FrameCapturer, XcapCapturer};
 use crate::config::{AppConfig, WindowPosition};
 use crate::ocr::OcrEngine;
 use crate::pipeline::{PipelineHandle, PipelineSnapshot, TranslationCache, TtsCache};
-#[cfg(test)]
-pub(crate) use bootstrap::format_server_startup_error;
+use crate::translate::SwitchableTranslator;
+use crate::tts::EdgeTtsEngine;
 pub(crate) use bootstrap::{
-    apply_wda_to_handle, build_native_options, load_bootstrap, spawn_server_startup,
+    apply_wda_to_handle, build_native_options, build_native_translator, load_bootstrap,
     stop_pipeline_with_timeout, AppBootstrap,
 };
 pub(crate) use commands::RegionSelectionTarget;
@@ -50,7 +50,12 @@ use tray::{should_cancel_close, tray_action_for_menu_event, TrayIconHandle, Tray
 use tray_icon::menu::MenuEvent;
 use tray_icon::TrayIconEvent;
 
-/// Root `eframe` application shell coordinating server lifecycle, pipeline, and overlay UI.
+/// Payload delivered by the background translator loader thread: the
+/// built translator (`None` when no engine is available) plus
+/// user-visible warnings about missing dictionaries/models.
+type TranslatorLoadResult = (Option<Arc<SwitchableTranslator>>, Vec<String>);
+
+/// Root `eframe` application shell coordinating native engine lifecycle, pipeline, and overlay UI.
 pub struct Cap2VoiceApp {
     runtime: tokio::runtime::Runtime,
     config_path: Option<PathBuf>,
@@ -66,14 +71,25 @@ pub struct Cap2VoiceApp {
     region_selection_target: RegionSelectionTarget,
     settings_draft: Option<SettingsDraftState>,
     settings_focused: bool,
-    health_check_rx: Option<mpsc::Receiver<Result<HealthStatus, HealthError>>>,
     tts_preview_rx: Option<mpsc::Receiver<Result<TtsPreviewAudio, TtsError>>>,
     /// In-flight Chinese click-to-replay synthesis (D2), same payload shape
     /// as the voice preview channel but reported via `ui_notice` instead of
     /// the settings draft.
     chinese_replay_rx: Option<mpsc::Receiver<Result<TtsPreviewAudio, TtsError>>>,
-    server_rx: Option<mpsc::Receiver<Result<ServerProcess, ServerProcessError>>>,
-    server: Option<ServerProcess>,
+    /// Shared native translation engine (D1+A5). Built on a background
+    /// thread at startup because Vietphrase dictionary load takes seconds;
+    /// `None` until the loader thread delivers it (see `translator_rx`).
+    translator: Option<Arc<SwitchableTranslator>>,
+    /// Loader-thread channel for the native translator (see above). Carries
+    /// the built translator (or `None` when no engine is available) plus
+    /// user-visible warnings about missing dictionaries/models.
+    translator_rx: Option<mpsc::Receiver<TranslatorLoadResult>>,
+    /// Set when the translator loader thread reports that no engine is
+    /// available (or dies): shown as the overlay engine status. `None`
+    /// while the loader is still running.
+    translator_error: Option<String>,
+    /// Native Edge-TTS client (D1): stateless, always available.
+    tts_engine: Arc<EdgeTtsEngine>,
     capturer: Arc<dyn FrameCapturer>,
     ocr: Option<Arc<dyn OcrEngine>>,
     audio: Option<Arc<dyn AudioPlayback>>,
@@ -114,11 +130,32 @@ impl Cap2VoiceApp {
             }
         }
 
-        let server_rx = spawn_server_startup(
-            &runtime,
-            bootstrap.config.translation.server_port,
-            cc.egui_ctx.clone(),
-        );
+        // Build the native translator on a background thread (D1+A5):
+        // loading the Vietphrase dictionaries takes ~7 s on the real PC,
+        // so it must never block the first overlay paint. The loader sends
+        // the built translator (or `None`) plus warnings; the overlay
+        // header shows "Đang tải model dịch…" meanwhile (see
+        // `poll_background_channels`).
+        let (translator_tx, translator_rx) = mpsc::sync_channel::<TranslatorLoadResult>(1);
+        let translator_config = bootstrap.config.clone();
+        let ctx_wake = cc.egui_ctx.clone();
+        let translator_spawn = std::thread::Builder::new()
+            .name("cap2voice-translator-load".to_string())
+            .spawn(move || {
+                let (translator, warnings) = build_native_translator(&translator_config);
+                let _ = translator_tx.send((translator, warnings));
+                ctx_wake.request_repaint();
+            });
+        let mut translator_error = None;
+        let translator_rx = match translator_spawn {
+            Ok(_) => Some(translator_rx),
+            Err(err) => {
+                translator_error = Some(format!(
+                    "Không tạo được luồng tải engine dịch: {err} — kiểm tra model/từ điển"
+                ));
+                None
+            }
+        };
 
         let position_tracker = PositionTracker::new(
             bootstrap.config.display.overlay_position.clone(),
@@ -241,11 +278,12 @@ impl Cap2VoiceApp {
             region_selection_target: RegionSelectionTarget::LiveConfig,
             settings_draft: None,
             settings_focused: false,
-            health_check_rx: None,
             tts_preview_rx: None,
             chinese_replay_rx: None,
-            server_rx: Some(server_rx),
-            server: None,
+            translator: None,
+            translator_rx,
+            translator_error,
+            tts_engine: Arc::new(EdgeTtsEngine::new()),
             capturer: Arc::new(XcapCapturer::new()),
             ocr: None,
             audio: None,
@@ -369,7 +407,6 @@ impl eframe::App for Cap2VoiceApp {
 
         if matches!(self.state.server_status, ServerUiStatus::Starting)
             || self.state.is_running()
-            || self.health_check_rx.is_some()
             || self.tts_preview_rx.is_some()
             || self.chinese_replay_rx.is_some()
         {
@@ -390,7 +427,6 @@ impl eframe::App for Cap2VoiceApp {
             let _ = stop_pipeline_with_timeout(&self.runtime, handle, Duration::from_secs(2));
         }
         self.audio = None;
-        self.server = None;
     }
 }
 
@@ -419,13 +455,9 @@ mod tests {
     use super::settings::SettingsDraftState;
     use super::{
         apply_region_selection_outcome, build_native_options, commit_settings_to_state,
-        format_server_startup_error, stop_pipeline_with_timeout, SettingsCommitEffects,
+        stop_pipeline_with_timeout, SettingsCommitEffects,
     };
-    use crate::api::{
-        BoxFuture, HttpTranslator, HttpTtsEngine, ServerProcessError, TranslateError, Translator,
-        TtsEngine, TtsError, DEFAULT_CONNECT_TIMEOUT, DEFAULT_TRANSLATE_TIMEOUT,
-        DEFAULT_TTS_TIMEOUT,
-    };
+    use crate::api::{BoxFuture, TranslateError, Translator, TtsEngine, TtsError, TtsSynthesis};
     use crate::audio::{AudioError, AudioPlayback, EnqueueOutcome};
     use crate::capture::{CaptureError, CapturedFrame, FrameCapturer, MonitorInfo};
     use crate::config::{load_config_from, AppConfig, CaptureRegion, ConfigError, WindowPosition};
@@ -433,6 +465,7 @@ mod tests {
     use crate::pipeline::{
         PipelineDeps, PipelineRunner, PipelineSettings, PipelineStatus, SubtitleLogger,
     };
+    use crate::translate::TranslationEngine;
     use eframe::egui::{Pos2, WindowLevel};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -546,9 +579,14 @@ mod tests {
             _text: &'a str,
             _voice: &'a str,
             _rate: &'a str,
-        ) -> BoxFuture<'a, Result<Vec<u8>, TtsError>> {
+        ) -> BoxFuture<'a, Result<TtsSynthesis, TtsError>> {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            Box::pin(async move { Ok(vec![0x49, 0x44, 0x33, 0x01]) })
+            Box::pin(async move {
+                Ok(TtsSynthesis {
+                    audio: vec![0x49, 0x44, 0x33, 0x01],
+                    retries: Vec::new(),
+                })
+            })
         }
     }
 
@@ -657,7 +695,6 @@ mod tests {
             muted: false,
             volume: 0.75,
             enable_subtitle_log: false,
-            rate_limit_backoff: Duration::from_millis(20),
         }
     }
 
@@ -678,22 +715,6 @@ mod tests {
         let normal_opts = build_native_options(&cfg);
         assert_eq!(normal_opts.viewport.window_level, Some(WindowLevel::Normal));
         assert_eq!(normal_opts.viewport.position, None);
-    }
-
-    #[test]
-    fn server_startup_error_formats_clear_vietnamese_diagnostics() {
-        let py_err = format_server_startup_error(&ServerProcessError::PythonNotFound {
-            searched: "PATH".to_string(),
-        });
-        assert!(py_err.contains("Python"));
-        assert!(py_err.contains("requirements.txt"));
-
-        let early_err = format_server_startup_error(&ServerProcessError::ExitedEarly {
-            exit_code: Some(1),
-            stderr: "ModuleNotFoundError: No module named 'fastapi'".to_string(),
-        });
-        assert!(early_err.contains("fastapi"));
-        assert!(early_err.contains("requirements.txt"));
     }
 
     #[test]
@@ -762,25 +783,6 @@ mod tests {
         assert!(
             tokio::runtime::Handle::try_current().is_err(),
             "test must run on a plain non-Tokio UI thread"
-        );
-
-        let translator_http = HttpTranslator::with_base_url(
-            "http://127.0.0.1:18765",
-            DEFAULT_CONNECT_TIMEOUT,
-            DEFAULT_TRANSLATE_TIMEOUT,
-        );
-        assert!(
-            translator_http.is_ok(),
-            "HttpTranslator client init should work outside Tokio runtime: {translator_http:?}"
-        );
-        let tts_http = HttpTtsEngine::with_base_url(
-            "http://127.0.0.1:18765",
-            DEFAULT_CONNECT_TIMEOUT,
-            DEFAULT_TTS_TIMEOUT,
-        );
-        assert!(
-            tts_http.is_ok(),
-            "HttpTtsEngine client init should work outside Tokio runtime: {tts_http:?}"
         );
 
         let temp_dir = TestTempDir::new("ui_start_on");
@@ -1015,7 +1017,7 @@ mod tests {
         draft_state.draft.voice.volume = 0.55;
         draft_state.draft.display.font_size_px = 24.0;
         draft_state.draft.display.always_on_top = false;
-        draft_state.server_port_input = "18888".to_string();
+        draft_state.draft.translation.engine = TranslationEngine::Vietphrase;
 
         let committed = match draft_state.try_commit() {
             Ok(c) => c,
@@ -1043,7 +1045,7 @@ mod tests {
         assert_eq!(
             effects,
             SettingsCommitEffects {
-                port_changed: true,
+                engine_changed: true,
                 wechat_paths_changed: false,
                 always_on_top_changed: true,
             }

@@ -243,8 +243,12 @@ struct TranslationIndex {
     entries: HashMap<String, String>,
 }
 
-/// Translation cache: normalized Chinese → Vietnamese, in-memory LRU plus a
-/// `translations.json` index under the cache dir.
+/// Translation cache: engine-scoped normalized Chinese → Vietnamese,
+/// in-memory LRU plus a `translations.json` index under the cache dir.
+/// Keys are `{engine}|{normalized_chinese}` (`helsinki|…` /
+/// `vietphrase|…`) so switching engines never serves the other engine's
+/// translation. Legacy unprefixed entries (written before the engine
+/// option existed) are dropped on load — a one-time migration.
 pub struct TranslationCache {
     dir: PathBuf,
     inner: Mutex<Lru<String, String>>,
@@ -265,6 +269,12 @@ impl TranslationCache {
         if let Ok(bytes) = fs::read(&index_path) {
             if let Ok(index) = serde_json::from_slice::<TranslationIndex>(&bytes) {
                 for (key, value) in index.entries {
+                    // One-time migration (D1+A5): entries written before the
+                    // engine option existed have no `engine|` prefix and
+                    // cannot be attributed to an engine, so drop them.
+                    if !key.contains('|') {
+                        continue;
+                    }
                     let size = (key.len() + value.len()) as u64;
                     let _ = lru.insert(key, value, size, MAX_TRANSLATION_ENTRIES, u64::MAX);
                 }
@@ -277,19 +287,25 @@ impl TranslationCache {
         })
     }
 
-    /// Look up a translation by raw Chinese text. The key is normalized
-    /// internally (same as `put`), so `是。` and `是` hit the same entry.
-    pub fn get(&self, chinese: &str) -> Option<String> {
-        let key = normalize_cache_key(chinese);
+    /// Compose the engine-scoped cache key (`{engine}|{normalized}`).
+    pub fn cache_key(chinese: &str, engine: &str) -> String {
+        format!("{engine}|{}", normalize_cache_key(chinese))
+    }
+
+    /// Look up a translation by raw Chinese text and engine id. The key is
+    /// normalized internally (same as `put`), so `是。` and `是` hit the
+    /// same entry — but only within the same engine.
+    pub fn get(&self, chinese: &str, engine: &str) -> Option<String> {
+        let key = Self::cache_key(chinese, engine);
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.get(&key).cloned()
     }
 
     /// Store a translation (normalizing the key first). Empty keys are
     /// ignored. Persists the index to disk.
-    pub fn put(&self, chinese: &str, vietnamese: String) -> Result<(), CacheError> {
-        let key = normalize_cache_key(chinese);
-        if key.is_empty() {
+    pub fn put(&self, chinese: &str, vietnamese: String, engine: &str) -> Result<(), CacheError> {
+        let key = Self::cache_key(chinese, engine);
+        if normalize_cache_key(chinese).is_empty() {
             return Ok(());
         }
         let size = (key.len() + vietnamese.len()) as u64;
@@ -544,16 +560,23 @@ mod tests {
         ));
         let cache = TranslationCache::load(&dir).expect("load empty cache");
         assert!(cache.is_empty());
-        cache.put("是。", "Vâng.".to_string()).expect("put");
-        cache.put("你好", "Xin chào".to_string()).expect("put");
-        assert_eq!(cache.get("是"), Some("Vâng.".to_string()));
-        assert_eq!(cache.get("你好"), Some("Xin chào".to_string()));
-        assert_eq!(cache.get("没有"), None);
+        cache
+            .put("是。", "Vâng.".to_string(), "helsinki")
+            .expect("put");
+        cache
+            .put("你好", "Xin chào".to_string(), "helsinki")
+            .expect("put");
+        assert_eq!(cache.get("是", "helsinki"), Some("Vâng.".to_string()));
+        assert_eq!(cache.get("你好", "helsinki"), Some("Xin chào".to_string()));
+        assert_eq!(cache.get("没有", "helsinki"), None);
         // Reload from disk: the entries survive a restart.
         let reloaded = TranslationCache::load(&dir).expect("reload cache");
         assert_eq!(reloaded.len(), 2);
-        assert_eq!(reloaded.get("是。"), Some("Vâng.".to_string()));
-        assert_eq!(reloaded.get("你好"), Some("Xin chào".to_string()));
+        assert_eq!(reloaded.get("是。", "helsinki"), Some("Vâng.".to_string()));
+        assert_eq!(
+            reloaded.get("你好", "helsinki"),
+            Some("Xin chào".to_string())
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -571,15 +594,15 @@ mod tests {
         // Fill past the cap by inserting directly into the LRU via put.
         for i in 0..(MAX_TRANSLATION_ENTRIES + 10) {
             cache
-                .put(&format!("句子{i}"), format!("Câu {i}"))
+                .put(&format!("句子{i}"), format!("Câu {i}"), "helsinki")
                 .expect("put");
         }
         assert_eq!(cache.len(), MAX_TRANSLATION_ENTRIES);
         // The first 10 inserted are gone (oldest first); the last one stays.
-        assert_eq!(cache.get("句子0"), None);
-        assert_eq!(cache.get("句子9"), None);
+        assert_eq!(cache.get("句子0", "helsinki"), None);
+        assert_eq!(cache.get("句子9", "helsinki"), None);
         assert_eq!(
-            cache.get(&format!("句子{}", MAX_TRANSLATION_ENTRIES + 9)),
+            cache.get(&format!("句子{}", MAX_TRANSLATION_ENTRIES + 9), "helsinki"),
             Some(format!("Câu {}", MAX_TRANSLATION_ENTRIES + 9))
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -596,13 +619,65 @@ mod tests {
                 .unwrap_or(0)
         ));
         let cache = TranslationCache::load(&dir).expect("load empty cache");
-        cache.put("是", "Vâng.".to_string()).expect("put");
+        cache
+            .put("是", "Vâng.".to_string(), "helsinki")
+            .expect("put");
         assert!(dir.join(TRANSLATION_INDEX_FILE).exists());
         cache.clear().expect("clear");
         assert!(cache.is_empty());
         assert!(!dir.join(TRANSLATION_INDEX_FILE).exists());
         let reloaded = TranslationCache::load(&dir).expect("reload after clear");
         assert!(reloaded.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn translation_cache_keys_are_engine_scoped() {
+        let dir = std::env::temp_dir().join(format!(
+            "cap2voice_cache_test_eng_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let cache = TranslationCache::load(&dir).expect("load empty cache");
+        cache
+            .put("你好", "Xin chào".to_string(), "helsinki")
+            .expect("put helsinki");
+        cache
+            .put("你好", "Ngươi tốt".to_string(), "vietphrase")
+            .expect("put vietphrase");
+        assert_eq!(cache.get("你好", "helsinki"), Some("Xin chào".to_string()));
+        assert_eq!(
+            cache.get("你好", "vietphrase"),
+            Some("Ngươi tốt".to_string())
+        );
+        assert_eq!(cache.get("你好", "unknown"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn translation_cache_load_drops_legacy_unprefixed_entries() {
+        let dir = std::env::temp_dir().join(format!(
+            "cap2voice_cache_test_legacy_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        // A pre-engine index: one legacy unprefixed entry, one engine-scoped.
+        std::fs::write(
+            dir.join(TRANSLATION_INDEX_FILE),
+            r#"{"entries":{"你好":"Xin chào","helsinki|再见":"Tạm biệt"}}"#,
+        )
+        .expect("write legacy index");
+        let cache = TranslationCache::load(&dir).expect("load legacy index");
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.get("你好", "helsinki"), None);
+        assert_eq!(cache.get("再见", "helsinki"), Some("Tạm biệt".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

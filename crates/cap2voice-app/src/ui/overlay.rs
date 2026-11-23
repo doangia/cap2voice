@@ -31,7 +31,11 @@ pub const AVAILABLE_VOICES: &[(&str, &str)] = &[
 /// Debounce interval before persisting dragged `(x, y)` coordinates to `config.toml`.
 pub const POSITION_SAVE_DEBOUNCE: Duration = Duration::from_millis(400);
 
-/// Local Python server readiness status shown in the overlay header.
+/// Native translation engine readiness status shown in the overlay
+/// header (D1+A5: there is no server anymore). `Starting` means the
+/// Helsinki model is still loading in the background (translations fall
+/// back to Vietphrase meanwhile); `Ready` means at least one engine can
+/// translate; `Failed` means no engine is available at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerUiStatus {
     Starting,
@@ -105,7 +109,13 @@ impl OverlayState {
     }
 
     pub fn can_start(&self) -> bool {
-        matches!(self.server_status, ServerUiStatus::Ready) && !self.is_running()
+        // Starting only means the Helsinki model is still loading;
+        // translations fall back to Vietphrase meanwhile, so starting
+        // the pipeline is allowed. Only a failed engine blocks it.
+        matches!(
+            self.server_status,
+            ServerUiStatus::Starting | ServerUiStatus::Ready
+        ) && !self.is_running()
     }
 
     pub fn can_stop(&self) -> bool {
@@ -114,8 +124,8 @@ impl OverlayState {
 
     pub fn status_label(&self) -> &str {
         match &self.server_status {
-            ServerUiStatus::Starting => "Đang khởi động server...",
-            ServerUiStatus::Failed(_) => "Lỗi server",
+            ServerUiStatus::Starting => "Đang tải model dịch…",
+            ServerUiStatus::Failed(_) => "Lỗi engine dịch",
             ServerUiStatus::Ready => {
                 if self.is_running() {
                     "Đang dịch"
@@ -156,8 +166,8 @@ impl OverlayState {
 
     /// Validate preconditions for clicking `Bắt đầu`; sets explicit Vietnamese notice when invalid.
     pub fn request_start(&mut self, has_region: bool) -> bool {
-        if !matches!(self.server_status, ServerUiStatus::Ready) {
-            self.ui_notice = Some("Server dịch/TTS chưa sẵn sàng".to_string());
+        if matches!(self.server_status, ServerUiStatus::Failed(_)) {
+            self.ui_notice = Some("Engine dịch chưa sẵn sàng — kiểm tra model/từ điển".to_string());
             return false;
         }
         if !has_region {
@@ -526,8 +536,7 @@ pub fn render_overlay_ui(
                             matches!(
                                 b.kind,
                                 PipelineErrorKind::TranslateNetwork
-                                    | PipelineErrorKind::TranslateRateLimited
-                                    | PipelineErrorKind::TranslateServerUnavailable
+                                    | PipelineErrorKind::TranslateEngineUnavailable
                                     | PipelineErrorKind::TranslateOther
                             )
                         });
@@ -648,9 +657,11 @@ mod tests {
         let cfg = AppConfig::default();
         let mut state = OverlayState::from_config(&cfg, Vec::new());
 
-        assert!(!state.can_start());
+        // Starting = Helsinki model still loading; the pipeline may
+        // start (Vietphrase covers translations until the model is ready).
+        assert!(state.can_start());
         assert!(!state.can_stop());
-        assert_eq!(state.status_label(), "Đang khởi động server...");
+        assert_eq!(state.status_label(), "Đang tải model dịch…");
 
         state.server_status = ServerUiStatus::Ready;
         assert!(state.can_start());
@@ -669,15 +680,15 @@ mod tests {
         assert!(state.can_stop());
         assert_eq!(state.status_label(), "Đang dịch");
 
-        state.server_status = ServerUiStatus::Failed("Python missing".to_string());
+        state.server_status = ServerUiStatus::Failed("Không có engine dịch khả dụng".to_string());
         state.pipeline.status = PipelineStatus::Idle;
         assert!(!state.can_start());
         assert!(!state.can_stop());
-        assert_eq!(state.status_label(), "Lỗi server");
+        assert_eq!(state.status_label(), "Lỗi engine dịch");
         assert!(state
             .active_error_banner()
             .as_deref()
-            .is_some_and(|msg| msg.contains("Python missing")));
+            .is_some_and(|msg| msg.contains("Không có engine dịch khả dụng")));
     }
 
     #[test]

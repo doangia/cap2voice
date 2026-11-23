@@ -8,18 +8,35 @@ description = "Windows desktop subtitle OCR, translation, and Vietnamese TTS ove
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 eframe = { version = "0.35", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
+futures-util = "0.3"
 global-hotkey = "0.6"
 image = { version = "0.25", default-features = false, features = ["png"] }
 muda = "0.16"
+# ort 2.x is the current release line (2.0.0-rc.15 latest; 1.x is legacy).
+# Pinned exact: the rc is mature (15th RC). `download-binaries` fetches
+# onnxruntime.dll at build time. No `ndarray` feature: tensors are built
+# from (shape, Vec) tuples.
+ort = { version = "=2.0.0-rc.15", features = ["download-binaries"] }
 pinyin = { version = "0.11", default-features = false, features = ["with_tone"] }
-reqwest = { version = "0.13", default-features = false, features = ["json"] }
+regex = "1"
 rodio = { version = "0.23", default-features = false, features = ["playback", "symphonia-mp3"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+# Native Edge-TTS over WebSocket (D1). `native-tls` uses Windows SChannel,
+# so no OpenSSL DLLs are needed at runtime.
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+# tokenizers default = [progressbar, onig, esaxx_fast]; esaxx_fast is
+# dropped because its C++ build forces static CRT (/MT), conflicting with
+# ort-sys's dynamic CRT (/MD) on MSVC (LNK2038). The pure-Rust esaxx
+# fallback remains.
+tokenizers = { version = "0.22", default-features = false, features = ["progressbar", "onig"] }
 toml = "0.8"
 tray-icon = "0.20"
+unicode-normalization = "0.1"
+uuid = { version = "1", features = ["v4"] }
 wcocr-rs = { path = "../wcocr-rs" }
 xcap = "0.9.10"
 

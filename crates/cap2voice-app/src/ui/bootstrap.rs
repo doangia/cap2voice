@@ -1,13 +1,15 @@
-//! Application bootstrap: config load, native window options, server
-//! startup, and shutdown helpers.
+//! Application bootstrap: config load, native window options, native
+//! engine construction, and shutdown helpers (D1+A5: no Python server).
 
 use super::overlay::{apply_exclude_from_capture_hwnd, DisplayAffinityError, DEFAULT_OVERLAY_SIZE};
-use crate::api::{discover_server_dir, ServerProcess, ServerProcessConfig, ServerProcessError};
 use crate::config::{default_config_path, load_config_from, AppConfig};
 use crate::pipeline::PipelineHandle;
+use crate::translate::{
+    default_dict_dir, default_model_dir, load_default_dictionaries, SwitchableTranslator,
+};
 use eframe::egui;
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub(crate) fn configured_window_level(config: &AppConfig) -> egui::WindowLevel {
@@ -38,34 +40,6 @@ pub fn build_native_options(config: &AppConfig) -> eframe::NativeOptions {
         viewport,
         ..Default::default()
     }
-}
-
-/// Format `ServerProcessError` into a clear, actionable Vietnamese banner for the user.
-pub fn format_server_startup_error(err: &ServerProcessError) -> String {
-    match err {
-        ServerProcessError::ExitedEarly { stderr, .. }
-            if stderr.contains("ModuleNotFoundError") || stderr.contains("No module named") =>
-        {
-            format!(
-                "Không khởi động được server dịch/TTS local: {err} — hãy cài thư viện từ server/requirements.txt"
-            )
-        }
-        _ => format!("Không khởi động được server dịch/TTS local: {err}"),
-    }
-}
-
-fn resolve_server_directory() -> Result<PathBuf, ServerProcessError> {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            if let Ok(dir) = discover_server_dir(parent) {
-                return Ok(dir);
-            }
-        }
-    }
-    let cwd = std::env::current_dir().map_err(|err| ServerProcessError::ServerDirNotFound {
-        searched: format!("current_dir error: {err}"),
-    })?;
-    discover_server_dir(&cwd)
 }
 
 #[cfg(windows)]
@@ -135,23 +109,42 @@ pub(crate) fn load_bootstrap() -> AppBootstrap {
     }
 }
 
-pub(crate) fn spawn_server_startup(
-    runtime: &tokio::runtime::Runtime,
-    port: u16,
-    ctx: egui::Context,
-) -> mpsc::Receiver<Result<ServerProcess, ServerProcessError>> {
-    let (server_tx, server_rx) = mpsc::sync_channel(1);
-    runtime.spawn(async move {
-        let res = match resolve_server_directory() {
-            Ok(server_dir) => {
-                ServerProcess::start(ServerProcessConfig::for_port(port, server_dir)).await
-            }
-            Err(err) => Err(err),
-        };
-        let _ = server_tx.send(res);
-        ctx.request_repaint();
-    });
-    server_rx
+/// Build the shared native translator (D1+A5): Vietphrase dictionaries from
+/// `%APPDATA%\cap2voice\vietphrase\data` when present, Helsinki model
+/// from `%APPDATA%\cap2voice\models\opus-mt-zh-vi` (lazy-loaded in the
+/// background when it is the configured engine). Returns `None` plus a
+/// user-visible warning when NEITHER engine is available; a missing
+/// Vietphrase dictionary set alone only warns (Helsinki still works).
+pub(crate) fn build_native_translator(
+    config: &AppConfig,
+) -> (Option<Arc<SwitchableTranslator>>, Vec<String>) {
+    let mut warnings = Vec::new();
+    let dicts = match load_default_dictionaries() {
+        Ok(dicts) => Some(dicts),
+        Err(err) => {
+            let dir = default_dict_dir()
+                .map(|d| d.display().to_string())
+                .unwrap_or_else(|_| "<không xác định>".to_string());
+            warnings.push(format!(
+                "Không tải được từ điển Vietphrase tại {dir} ({err}) — engine Vietphrase không khả dụng"
+            ));
+            None
+        }
+    };
+    let model_dir = match default_model_dir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            warnings.push(format!("Không xác định được thư mục model Helsinki: {err}"));
+            PathBuf::new()
+        }
+    };
+    match SwitchableTranslator::new(dicts, model_dir, config.translation.engine) {
+        Ok(translator) => (Some(translator), warnings),
+        Err(err) => {
+            warnings.push(format!("Không có engine dịch khả dụng: {err}"));
+            (None, warnings)
+        }
+    }
 }
 
 pub(crate) fn stop_pipeline_with_timeout(

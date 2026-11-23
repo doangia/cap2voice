@@ -1,6 +1,7 @@
 # Spec: cap2voice — V1 (MVP)
 
 > **Status:** Approved — 2026-11-19 (Danh via delegation to Muse; all 12 assumptions in §11 confirmed as-is)
+> **D1+A5 amendment — 2026-11-23:** The temporary Python server is **gone**. Translation and TTS are now native in-process Rust (§3.8 rewritten): a selectable engine (Helsinki-NLP `opus-mt-zh-vi` ONNX, lazy-loaded, or offline Vietphrase) and a native Edge-TTS WebSocket client. §3.8's `AC-SRV-1..5`, the `429`/`RateLimited` path, and the server-port/`GET /health` UI are superseded; `AC-TR-2`'s mock-HTTP-server wording is superseded by native-engine error tests. The rest of this spec stands.
 > **Version:** V1 (MVP)  
 > **Date:** 2026-11-19  
 > **Owner / Approver:** Danh  
@@ -15,7 +16,7 @@
 
 - The app **only observes a user-selected screen region** — it is **not** a video player and never reads video files or inspects browser tabs/DOM.
 - In real time, it captures the subtitle region, skips visually unchanged frames, runs local WeChat OCR (`wcocr-rs`), filters to Chinese text, deduplicates repeated subtitle lines, translates Chinese → Vietnamese, displays both lines (Chinese above in white, Vietnamese below in green) on a borderless always-on-top floating overlay, reads the Vietnamese translation aloud via TTS, and logs each `Chinese : Vietnamese` pair to disk.
-- To reach a working V1 quickly without blocking on native Rust Edge-TTS WebSocket work, translation (offline Vietphrase dictionary engine) and TTS (Edge-TTS) run behind a **temporary local Python FastAPI server** automatically started and stopped by the Rust application. The Rust app communicates with it through clean trait boundaries so V2 can replace both endpoints with native Rust without changing the UI, capture, OCR, or tray layers.
+- Translation and TTS run **natively in-process** (D1+A5, 2026-11-23): a selectable translation engine — Helsinki-NLP `opus-mt-zh-vi` ONNX model (lazy-loaded in the background) or the offline Vietphrase dictionary engine — and a native Rust Edge-TTS WebSocket client. No Python, no local HTTP server, no port. Dictionaries live in `%APPDATA%\cap2voice\vietphrase\data`, the model in `%APPDATA%\cap2voice\models\opus-mt-zh-vi`.
 
 ### End-to-End Pipeline
 
@@ -32,9 +33,11 @@ wcocr-rs (internal Rust library → WeChat 4.x mmmojo IPC)
 Fuzzy Deduplicator (threshold 0.93 + blank-frame reset)
    │  4. Emit only when new Chinese line differs from previous line
    ▼
-Local Python API Server (127.0.0.1:<port>, managed by Rust app)
-   ├─ POST /translate  (zh → vi, offline Vietphrase)
-   └─ POST /tts        (vi → MP3, Edge-TTS, default vi-VN-NamMinhNeural)
+Native translation engines (in-process, §3.8)
+   ├─ Helsinki-NLP opus-mt-zh-vi (ONNX, lazy-loaded) — selectable, default
+   └─ Vietphrase (offline dictionaries) — selectable, fallback while Helsinki loads
+Native Edge-TTS client (WebSocket, §3.8)
+   └─ vi → MP3, default vi-VN-NamMinhNeural
    ▼
 Floating egui Overlay (Chinese white + Vietnamese green)
    ├─ rodio Audio Player (non-overlapping bounded FIFO queue)
@@ -50,13 +53,14 @@ Each capability maps to a single responsibility with one-way dependencies (no cy
 | `config` | Typed settings model, TOML load/save, validation, Windows autostart registry helper | — |
 | `ocr` | `wcocr-rs` pure Rust crate (WeChat 4.x mmmojo), path auto-detection, CJK filtering, line assembly | — |
 | `capture` | Region coordinates (DPI/monitor-aware), screen capture (`xcap` only — no fallback backend), pixel-diff gate | `config` |
-| `api-server` | Temporary Python FastAPI server (`GET /health`, `POST /translate`, `POST /tts`) + Rust child-process lifecycle & Windows Job Object cleanup | `config` |
-| `pipeline` | Capture loop orchestration, fuzzy deduplicator, `Translator` HTTP client, `TtsClient` HTTP client, `rodio` FIFO audio player, UTF-8 subtitle logger | `config`, `capture`, `ocr`, `api-server` |
+| `translate` | Selectable in-process engines: Helsinki-NLP `opus-mt-zh-vi` ONNX (lazy background load) + offline Vietphrase dictionaries; per-engine translation cache | `config` |
+| `tts` | Native Rust Edge-TTS WebSocket client (no HTTP server, no Python) | `config` |
+| `pipeline` | Capture loop orchestration, fuzzy deduplicator, `Translator` + `TtsEngine` trait clients, `rodio` FIFO audio player, UTF-8 subtitle logger | `config`, `capture`, `ocr`, `translate`, `tts` |
 | `overlay-ui` | `eframe`/`egui` borderless always-on-top 2-line overlay, region-selector fullscreen overlay, CJK+Vietnamese font chain, visible error/status banner | `config`, `pipeline` |
 | `settings-ui` | 5-tab Settings window (`Chung`, `Dịch`, `Giọng đọc`, `Hiển thị`, `Phím tắt`) with draft state (`Huỷ` / `Lưu thay đổi`) | `config`, `overlay-ui` |
 | `tray` | Windows system tray icon, 5-item context menu, close-to-tray background mode, clean shutdown trigger | `overlay-ui`, `settings-ui`, `pipeline` |
 
-**Build Order:** `config`, `ocr`, `api-server` → `capture` → `pipeline` → `overlay-ui` → `settings-ui`, `tray`.
+**Build Order:** `config`, `ocr`, `translate`, `tts` → `capture` → `pipeline` → `overlay-ui` → `settings-ui`, `tray`.
 
 ---
 
@@ -68,11 +72,11 @@ Each capability maps to a single responsibility with one-way dependencies (no cy
 | GUI & Overlay | `eframe` / `egui` | `eframe` `0.35` (pure Rust, no Tauri, no WebView) |
 | Screen Capture | `xcap` | `xcap` `0.9.10` (only backend; measured on the real PC: p50 15.45 ms / p95 17.38 ms, well under the 30/50 ms budget — no fallback exists) |
 | Local OCR | `wcocr-rs` (internal workspace crate, refactored from `C:\Users\doanv\wechat-ocr-rs`) | `libloading` `0.8`, `prost` `0.13`, `serde` `1`; WeChat 4.x `mmmojo_64.dll` + `wxocr.dll` (plugin 8022, Weixin `4.0.2.28` — user's PC, personal-use only) |
-| HTTP Client | `reqwest` (with `tokio` runtime) | `reqwest` `0.13` (Rust app → local Python server) |
+| Translation engines | Helsinki-NLP `opus-mt-zh-vi` via `ort` ONNX (`2.0.0-rc.15`) + `tokenizers`; offline Vietphrase rule engine (Rust port) | Model + dictionaries in `%APPDATA%\cap2voice` (not committed) |
+| TTS | Native Edge-TTS WebSocket client (`tokio-tungstenite`) | Direct `wss://` to Microsoft Edge-TTS; no server, no Python |
 | Audio Playback | `rodio` (MP3 decoder enabled) | `rodio` `0.23` |
 | System Tray & Hotkeys | `tray-icon` (with `muda` menu), `global-hotkey` | Latest compatible stable versions on crates.io |
-| Config / Logging / Errors | `serde`, `toml`, `chrono`, `thiserror`, `tracing`, `image`, `windows-sys` | Explicit typed errors; Windows Job Object + display affinity via `windows-sys` |
-| Temporary API Server | Python 3.11+ (`fastapi`, `uvicorn`, `httpx`, `edge-tts`) | Verified locally: Python `3.11.9`; `pytest` + `httpx` for server tests |
+| Config / Logging / Errors | `serde`, `toml`, `chrono`, `thiserror`, `tracing`, `image`, `windows-sys` | Explicit typed errors; display affinity via `windows-sys` |
 
 ---
 
@@ -154,33 +158,33 @@ Reference mockup: `docs/mockups/media-generation-region-select-*.webp`.
 ### 3.3 Translation (`translate`)
 
 - Rust defines an async `Translator` trait: `async fn translate(&self, zh: &str) -> Result<String, TranslateError>`.
-- V1 implements `HttpTranslator` using `reqwest` `0.13` calling `POST http://127.0.0.1:<port>/translate` with JSON `{"text": "<zh>"}`, connect timeout `3 s`, request timeout `8 s`.
+- V1 implements the `Translator` trait with two selectable in-process engines (§3.8): Helsinki-NLP `opus-mt-zh-vi` (ONNX, lazy-loaded) and offline Vietphrase. The selected engine is stored in `config.toml` (`translation.engine = "helsinki" | "vietphrase"`, default Helsinki) and can be switched live in Settings → `Dịch` without restarting.
 - Runs asynchronously off the UI thread. If a newer Chinese subtitle arrives while a previous translation is in flight, sequence numbers ensure stale responses never overwrite newer subtitles on screen.
 - **Explicit Error Handling (non-negotiable):**
   - Network unreachable / DNS error / upstream `502`/`503`: show visible error banner `"Mất kết nối mạng — không thể dịch"`, keep displaying the latest Chinese OCR line, do **not** display fake text or reuse the previous Vietnamese translation under a new Chinese line (clear or mark Vietnamese line as `[Lỗi dịch — kiểm tra kết nối mạng]`).
-  - Translation is offline (Vietphrase dictionaries, no network call), so there is no upstream rate limit for `/translate`: no `429` is produced by the server. The Rust client's `429` → `TranslateError::RateLimited` mapping is retained only as defensive code for a future network-backed translator, and must not be presented as a live V1 path.
-  - Local server down/refused: show `"Server dịch/TTS chưa sẵn sàng"` and attempt controlled health-check recovery or surface restart error.
+  - Translation is offline-capable (Helsinki ONNX runs locally; Vietphrase dictionaries are local), so there is no upstream rate limit: no `429` is produced. The `TranslateError::RateLimited` variant and any rate-limit handling were removed in D1+A5 and must not be presented as a live path.
+  - No engine available (model + dictionaries missing): show `"Không có engine dịch khả dụng — kiểm tra model/từ điển"` and block pipeline start; the overlay header shows the engine status (`Đang tải model dịch…` / `Lỗi engine dịch`).
 
 **Acceptance Criteria:**
 - `AC-TR-1`: Sending a real Chinese subtitle line (`"夜深了，雨还在下。"`) returns a non-empty Vietnamese translation displayed beneath the Chinese line within 1.5 s under normal broadband conditions.
-- `AC-TR-2`: Automated tests against a local mock HTTP server verify exact request/response JSON contract and proper mapping of HTTP `400`, `429`, `502`, timeout, and connection-refused errors to typed `TranslateError` variants.
+- `AC-TR-2`: Automated tests verify the native engines' error mapping (invalid input, engine unavailable, timeout) to typed `TranslateError` variants, and the Helsinki/Vietphrase 25-sentence benchmark fixtures stay green.
 - `AC-TR-3`: Disconnecting network on the real PC causes the overlay to display the explicit Vietnamese network-error banner within 1 translation attempt (never silently stuck on stale Vietnamese text).
 - `AC-TR-4`: Out-of-order responses from slow requests (sequence `N` completing after sequence `N+1`) are discarded and never overwrite subtitle `N+1`.
-- `AC-TR-5`: UI remains responsive (buttons clickable, overlay draggable) while a slow translation request is waiting up to the 8 s timeout.
+- `AC-TR-5`: UI remains responsive (buttons clickable, overlay draggable) while a slow translation request is waiting.
 
 ---
 
 ### 3.4 Text-to-Speech & Audio Playback (`tts`)
 
 - Rust defines an async `TtsEngine` trait: `async fn synthesize(&self, text: &str, voice: &str, rate: &str) -> Result<Vec<u8>, TtsError>`.
-- V1 implements `HttpTtsEngine` calling `POST http://127.0.0.1:<port>/tts` with `{"text": "<vi>", "voice": "<voice>", "rate": "<rate>"}`, receiving `audio/mpeg` bytes (timeout `10 s`).
+- V1 implements the `TtsEngine` trait with a native Rust Edge-TTS WebSocket client (`wss://api.msedgeservices.com/tts/cognitiveservices/websocket/v1`), receiving raw MP3 bytes. No HTTP server or Python is involved.
 - Default voice: `vi-VN-NamMinhNeural`. Built-in selectable Vietnamese voices: `vi-VN-NamMinhNeural` (Nam — mặc định) and `vi-VN-HoaiMyNeural` (Nữ).
 - Audio playback uses `rodio` `0.23` on a dedicated background audio worker thread:
   - **Non-overlapping FIFO queue:** One sentence plays at a time; incoming sentences wait in queue until the current sentence finishes.
   - **Bounded queue depth (max 3 pending items):** When the queue already has 3 unplayed items and a new item arrives, drop the **oldest unplayed** item (never interrupt the currently playing clip) so speech stays synchronized with fast dialogue.
   - **Volume & Mute:** Volume (`0.0..=1.0`, default `0.75`) adjusts `rodio::Sink` gain in real time. Toggling Mute or clicking `Dừng` immediately stops active playback and clears the pending queue.
-  - **Auto-read toggle (`Tự động đọc phụ đề`):** When OFF (default ON), `/tts` is not called and no audio plays; OCR, translation, overlay display, and logging continue normally.
-  - **Failure visibility:** If `/tts` fails (network offline / Edge-TTS error) or audio output device fails to open, show a non-blocking warning in the overlay status bar while continuing to translate and display subtitles.
+  - **Auto-read toggle (`Tự động đọc phụ đề`):** When OFF (default ON), no TTS synthesis is requested and no audio plays; OCR, translation, overlay display, and logging continue normally.
+  - **Failure visibility:** If TTS synthesis fails (network offline / Edge-TTS error) or audio output device fails to open, show a non-blocking warning in the overlay status bar while continuing to translate and display subtitles.
 
 **Acceptance Criteria:**
 - `AC-TTS-1`: With `Tự động đọc phụ đề` ON and unmuted, each newly translated Vietnamese subtitle is read aloud clearly using `vi-VN-NamMinhNeural` on the PC's default audio output.
@@ -188,8 +192,8 @@ Reference mockup: `docs/mockups/media-generation-region-select-*.webp`.
 - `AC-TTS-3`: Rapidly feeding 5 subtitle lines plays them strictly sequentially without audio overlap; unit tests on the queue verify bounded capacity (max 3 pending) drops oldest unplayed items first.
 - `AC-TTS-4`: Clicking `Dừng` or the overlay speaker mute button halts currently playing audio within 200 ms and empties queued items.
 - `AC-TTS-5`: Adjusting the `Âm lượng` slider changes playback loudness linearly (`0%` = silent, `75%` default, `100%` max).
-- `AC-TTS-6`: With `Tự động đọc phụ đề` OFF, zero `POST /tts` requests are issued while subtitles still translate and display.
-- `AC-TTS-7`: When `/tts` returns `502`/`503` or times out, a visible TTS warning appears in the overlay without crashing or halting translation.
+- `AC-TTS-6`: With `Tự động đọc phụ đề` OFF, zero TTS synthesis requests are issued while subtitles still translate and display.
+- `AC-TTS-7`: When Edge-TTS fails (network error / timeout), a visible TTS warning appears in the overlay without crashing or halting translation.
 
 ---
 
@@ -220,7 +224,7 @@ Reference mockup: `docs/mockups/media-generation-overlay-main-*.webp`.
 - `AC-UI-2`: Chinese line renders in white above Vietnamese line in green; verified visually via real-PC screenshot with mixed Chinese + Vietnamese diacritics (e.g. `"夜深了，雨还在下。"` / `"Đêm đã khuya, mưa vẫn còn rơi."`) showing zero missing-glyph tofu boxes.
 - `AC-UI-3`: Dragging the overlay moves it smoothly and persists its coordinates across app restarts.
 - `AC-UI-4`: All 5 control-bar elements (`Chọn vùng`, `Bắt đầu`, `Dừng`, speaker mute button, voice dropdown) plus `Cài đặt` and `X` work as specified and reflect live running/muted/voice state.
-- `AC-UI-5`: Network, server, or OCR errors render visibly inside the overlay status banner in Vietnamese and clear automatically once a subsequent request succeeds.
+- `AC-UI-5`: Network, engine, or OCR errors render visibly inside the overlay status banner in Vietnamese and clear automatically once a subsequent request succeeds.
 - `AC-UI-6`: Placing the overlay partially over the captured subtitle region does not cause an OCR feedback loop (verified via `WDA_EXCLUDEFROMCAPTURE` on Windows 10/11).
 
 ---
@@ -241,8 +245,7 @@ Reference mockup: `docs/mockups/media-generation-settings-tray-*.webp`.
        - Checkbox: `Khởi động cùng Windows` (default unchecked)
        - Checkbox: `Khởi động ở chế độ ẩn xuống khay` (default unchecked)
     2. `Dịch` (Translation):
-       - Translation provider display (`Vietphrase (offline — qua server local)`)
-       - Local API server port (default `18765`) + `Kiểm tra kết nối` button calling `GET /health`
+       - Engine selector (`Helsinki (mô hình AI)` / `Vietphrase (từ điển)`, default Helsinki) + live engine status line; switching applies immediately without restart
        - Fuzzy deduplication threshold slider (`0.80`–`0.99`, default `0.93`)
        - Pixel-diff sensitivity threshold slider (`0.5%`–`10.0%`, default `2.0%`)
     3. `Giọng đọc` (Voice / TTS):
@@ -250,7 +253,7 @@ Reference mockup: `docs/mockups/media-generation-settings-tray-*.webp`.
        - `Âm lượng` slider (`0%`–`100%`, default `75%`)
        - Speech rate selector (`-20%`, `-10%`, `0% (Mặc định)`, `+10%`, `+20%`)
        - Toggle: `Tự động đọc phụ đề` (default ON)
-       - `Nghe thử` button (plays a short Vietnamese sample sentence via `/tts`)
+       - `Nghe thử` button (plays a short Vietnamese sample sentence via native Edge-TTS)
     4. `Hiển thị` (Display):
        - `Cỡ chữ phụ đề` slider (`12 px`–`40 px`, default `18 px`)
        - Overlay background opacity slider (`30%`–`100%`, default `85%`)
@@ -290,7 +293,7 @@ Reference mockup: `docs/mockups/media-generation-settings-tray-*.webp`.
   2. `Bắt đầu dịch` — starts the capture/OCR/translate/TTS pipeline (disabled if already running).
   3. `Dừng` — stops the pipeline and clears TTS queue (disabled if idle).
   4. `Cài đặt` — opens/focuses the Settings window.
-  5. `Thoát` — stops pipeline, shuts down the Python API server, destroys tray icon, and exits the application cleanly.
+  5. `Thoát` — stops pipeline, destroys tray icon, and exits the application cleanly.
 - Left double-click (or single-click) on tray icon restores and brings the overlay to the foreground.
 - **Close-to-tray behavior:** When `Ẩn xuống khay hệ thống khi đóng cửa sổ` is checked (default), clicking `X` on the overlay hides the window without stopping translation or TTS playback. When unchecked, clicking `X` performs a full graceful exit identical to `Thoát`.
 
@@ -299,42 +302,27 @@ Reference mockup: `docs/mockups/media-generation-settings-tray-*.webp`.
 - `AC-TRAY-2`: With translation active and close-to-tray checked, clicking `X` on the overlay hides the window while OCR, translation, TTS audio, and subtitle logging continue uninterrupted in the background.
 - `AC-TRAY-3`: Selecting `Hiện cửa sổ` (or clicking the tray icon) restores the overlay displaying the latest translated subtitle.
 - `AC-TRAY-4`: `Bắt đầu dịch`, `Dừng`, and `Cài đặt` from the tray menu execute their respective actions while the overlay is hidden.
-- `AC-TRAY-5`: Selecting `Thoát` stops playback, terminates the Python server process (verified via Task Manager / `Get-Process`), removes the tray icon with no ghost icon left behind, and exits cleanly with code `0`.
+- `AC-TRAY-5`: Selecting `Thoát` stops playback, removes the tray icon with no ghost icon left behind, and exits cleanly with code `0`.
 
 ---
 
-### 3.8 Temporary Local Python API Server (`api-server`)
+### 3.8 Native Translation & TTS Engines (`translate` + `tts`) — D1+A5 (2026-11-23)
 
-Located in `server/server.py` and `server/requirements.txt`. Strictly temporary; designed to be deleted in V2 once native Rust translation & Edge-TTS replace it.
+The temporary Python server (`server/`, `AC-SRV-1..6`) was **removed in D1+A5**. Translation and TTS are now native in-process Rust; the app needs no Python at runtime and opens no local port. The `AC-SRV-*` criteria are superseded and kept only as a record of the removed design.
 
-- **Binding & Security:** Binds strictly to `127.0.0.1:<port>` (default `18765`), never `0.0.0.0`. No secrets or API keys stored in code.
-- **HTTP Contract:**
-  1. `GET /health`
-     - `200 OK`
-     - Body: `{"status": "ok", "version": "0.1.0", "translator": "vietphrase", "tts": "edge-tts"}`
-  2. `POST /translate`
-     - Request (`application/json`): `{"text": "夜深了，雨还在下。"}`
-     - `200 OK`: `{"text": "Đêm đã khuya, mưa vẫn còn rơi."}`
-     - `400 Bad Request`: empty/whitespace-only `text` → `{"error": "invalid_input", "detail": "text must not be empty"}`
-     - `503 Service Unavailable`: translator dictionaries missing/unloadable → `{"error": "translator_unavailable", "detail": "..."}` (no `429` and no upstream `502` are produced: translation is offline, there is no upstream network call)
-  3. `POST /tts`
-     - Request (`application/json`): `{"text": "Đêm đã khuya, mưa vẫn còn rơi.", "voice": "vi-VN-NamMinhNeural", "rate": "+0%"}` (`voice` defaults to `"vi-VN-NamMinhNeural"`, `rate` defaults to `"+0%"`).
-     - `200 OK`: `Content-Type: audio/mpeg`, raw non-empty MP3 bytes.
-     - `400 Bad Request`: empty `text` or invalid `voice`/`rate` format → `{"error": "invalid_input", "detail": "..."}`
-     - `502 Bad Gateway` / `503 Service Unavailable`: Edge-TTS network/upstream failure → `{"error": "upstream_error", "detail": "..."}`
-- **Rust-Managed Process Lifecycle:**
-  - On startup, `cap2voice-app` resolves Python (`server/.venv/Scripts/python.exe` first, then `python` on `PATH`), spawns `uvicorn server:app --app-dir <server_dir> --host 127.0.0.1 --port <port>` with `CREATE_NO_WINDOW` (no flashing console window on Windows).
-  - Assigns the spawned child process to a Windows Job Object configured with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` so even an unexpected crash or Task Manager kill of `cap2voice-app` automatically terminates the Python server (zero orphaned processes).
-  - Polls `GET /health` every `200 ms` up to `10 s`. If startup fails or exits early, displays stderr diagnostics in the overlay error banner and logs.
-  - On graceful shutdown (`Thoát`), terminates the child process cleanly and waits up to `2 s` before force-closing the Job Object.
+- **Translation — selectable engine (`SwitchableTranslator`, `translation.engine` in `config.toml`, default `helsinki`):**
+  - **Helsinki-NLP `opus-mt-zh-vi`** (ONNX, `ort` `2.0.0-rc.15`, greedy decoding, max 64 new tokens): model files in `%APPDATA%\cap2voice\models\opus-mt-zh-vi` (override `CAP2VOICE_HELSINKI_MODEL_DIR`). Loads lazily in a background thread after startup so the overlay is interactive before the ~3 s load finishes; the overlay header shows `Đang tải model dịch…` meanwhile.
+  - **Vietphrase** (Rust port of the dictionary rule engine): dictionaries in `%APPDATA%\cap2voice\vietphrase\data` (override `CAP2VOICE_VP_DATA_DIR`). Offline, correct on proper names.
+  - **Fallback:** while the Helsinki model is still loading, sentences translate via Vietphrase; each fallback is counted (`helsinki_fallbacks`) and shown in Settings → `Dịch`. Switching engines in Settings applies live, without restart.
+  - **Cache:** per-engine cache keys (`helsinki|…` / `vietphrase|…`) so the same sentence cached under one engine is never served as the other engine's output.
+- **TTS — native Edge-TTS WebSocket client (`EdgeTtsEngine`):** direct `wss://` connection to Microsoft Edge-TTS, SSML chunks ≤ 4096 bytes, MP3 bytes returned. Default voice `vi-VN-NamMinhNeural`; Chinese click-to-replay uses `zh-CN-XiaoxiaoNeural`. No API key; network failure surfaces as a visible non-blocking warning, never a silent stall.
 
-**Acceptance Criteria:**
-- `AC-SRV-1`: `GET /health` returns `200 OK` with expected JSON schema within 100 ms once ready.
-- `AC-SRV-2`: `POST /translate` translates valid Chinese text to Vietnamese (`200 OK`), rejects empty input (`400`), and returns structured `429`/`502` JSON errors when upstream fails (never `200` with empty/fake translation).
-- `AC-SRV-3`: `POST /tts` returns valid playable MP3 bytes (`Content-Type: audio/mpeg`) for Vietnamese text with `vi-VN-NamMinhNeural` and `vi-VN-HoaiMyNeural`, rejects empty text (`400`), and maps Edge-TTS failures to `502`/`503`.
-- `AC-SRV-4`: Launching `cap2voice-app` automatically starts the Python server without a visible console window and becomes healthy within 10 s; user never runs Python manually.
-- `AC-SRV-5`: Exiting via tray `Thoát` — AND force-killing `cap2voice-app.exe` via `Stop-Process -Force` — leaves zero running `server.py` / `uvicorn` Python child processes.
-- `AC-SRV-6`: If Python or required packages are missing on the machine, `cap2voice-app` reports a clear Vietnamese setup error message instead of hanging indefinitely.
+**Acceptance Criteria (replacing `AC-SRV-1..6`):**
+- `AC-NAT-1`: With no Python on `PATH` and `server/` deleted, the app builds, starts, translates, and speaks normally.
+- `AC-NAT-2`: Switching the engine in Settings → `Dịch` changes the translation of the same Chinese line on the next subtitle (Helsinki vs Vietphrase outputs differ as benchmarked), without restart.
+- `AC-NAT-3`: With Helsinki selected, the overlay is usable (region selectable, pipeline startable) before the model finishes loading; the header shows the loading status and translations fall back to Vietphrase meanwhile.
+- `AC-NAT-4`: Exiting via tray `Thoát` — AND force-killing `cap2voice-app.exe` via `Stop-Process -Force` — leaves zero lingering `cap2voice-app.exe` processes.
+- ~~`AC-SRV-1`–`AC-SRV-6`~~ — superseded (Python server removed 2026-11-23).
 
 ---
 
@@ -364,20 +352,6 @@ cargo build --workspace --release
 cargo run -p cap2voice-app
 ```
 
-### Python Temporary API Server
-```powershell
-# Create virtual environment & install dependencies
-python -m venv server/.venv
-server/.venv/Scripts/pip.exe install -r server/requirements.txt
-
-# Run server tests
-server/.venv/Scripts/python.exe -m pytest server/ -v
-
-# Run server manually (debugging only; app manages it in normal use)
-server/.venv/Scripts/python.exe -m uvicorn server:app --app-dir server --host 127.0.0.1 --port 18765
-```
-
----
 
 ## 5. Project Structure
 
@@ -416,9 +390,9 @@ cap2voice/
 │           │   ├── mod.rs          # OcrEngine trait, WeChat path auto-discovery
 │           │   └── filter.rs       # Line sorting, CJK filtering, fuzzy deduplicator
 │           ├── api/
-│           │   ├── mod.rs          # Translator & TtsEngine traits + error types
-│           │   ├── http_client.rs  # reqwest 0.13 client for /health, /translate, /tts
-│           │   └── server_proc.rs  # Python child spawn, health wait, Windows Job Object
+│           │   └── mod.rs          # Translator & TtsEngine traits + error types
+│           ├── translate/          # SwitchableTranslator: Helsinki ONNX + Vietphrase
+│           └── tts/                # Native Edge-TTS WebSocket client
 │           ├── audio/
 │           │   └── mod.rs          # rodio 0.23 playback worker & bounded FIFO queue
 │           ├── pipeline/
@@ -431,17 +405,14 @@ cap2voice/
 │               ├── settings.rs     # 5-tab Settings window (draft + Save/Cancel)
 │               ├── tray.rs         # Windows tray icon & 5-item context menu
 │               └── hotkeys.rs      # Global hotkey registration & dispatch
-└── server/                         # Temporary local Python API server (removed in V2)
-    ├── server.py                   # FastAPI app: /health, /translate, /tts
-    ├── requirements.txt            # Pinned Python dependencies
-    └── tests/
-        └── test_server.py          # pytest suite with mocked upstream clients
 ```
 
 ### Runtime User Data Paths (Windows)
 - Configuration: `%APPDATA%\cap2voice\config.toml`
 - Subtitle logs: `%APPDATA%\cap2voice\logs\subtitles-YYYY-MM-DD.log`
 - Temporary OCR frame buffer: `%TEMP%\cap2voice\frame.png`
+- Helsinki ONNX model: `%APPDATA%\cap2voice\models\opus-mt-zh-vi` (override `CAP2VOICE_HELSINKI_MODEL_DIR`)
+- Vietphrase dictionaries: `%APPDATA%\cap2voice\vietphrase\data` (override `CAP2VOICE_VP_DATA_DIR`)
 
 ---
 
@@ -450,7 +421,7 @@ cap2voice/
 ### Conventions
 - **Languages:** All source code, identifiers, comments, commit messages, and technical docs are in **English**. User-facing UI strings are in **Vietnamese** and centralized as constants.
 - **Zero silent fallbacks / zero `unwrap()` in runtime paths:** Return typed `Result<T, E>` using `thiserror`; surface every network, OCR, config, or audio failure explicitly to the UI status state and structured `tracing` logs.
-- **Strict typing:** Explicit types across Rust and Python (Pydantic models + type annotations everywhere; no untyped `dict` payloads or `Any`).
+- **Strict typing:** Explicit types across Rust (no untyped `dict` payloads or `Any` anywhere).
 - **Modular boundaries:** Keep UI rendering (`ui/`), capture/OCR/network workers (`pipeline/`, `api/`), and config (`config.rs`) strictly decoupled through channels and traits so components remain unit-testable without a GUI or network.
 - **Formatting & Linting:** `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets -- -D warnings` must pass cleanly on every commit.
 
@@ -464,8 +435,8 @@ use thiserror::Error;
 pub enum TranslateError {
     #[error("input text is empty")]
     EmptyInput,
-    #[error("translation service rate-limited: {0}")]
-    RateLimited(String),
+    #[error("no translation engine available: {0}")]
+    EngineUnavailable(String),
     #[error("network or upstream translation failure: {0}")]
     Upstream(String),
 }
@@ -490,39 +461,6 @@ pub fn normalized_similarity(a: &str, b: &str) -> f32 {
 }
 ```
 
-### Representative Python Example (`server/server.py`)
-```python
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
-
-app = FastAPI(title="cap2voice-local-api", version="0.1.0")
-
-
-class TranslateRequest(BaseModel):
-    text: str = Field(min_length=1, max_length=2000)
-
-
-class TranslateResponse(BaseModel):
-    text: str
-
-
-@app.post("/translate", response_model=TranslateResponse)
-async def translate(
-    req: TranslateRequest,
-    translator: Translator = Depends(get_translator),
-) -> TranslateResponse:
-    cleaned = req.text.strip()
-    if not cleaned:
-        raise HTTPException(
-            status_code=400,
-            detail={"error": "invalid_input", "detail": "text must not be empty"},
-        )
-    # Offline Vietphrase dictionary lookup (server.vietphrase); synchronous,
-    # so it runs in a worker thread. No network call, no upstream rate limit.
-    translated = await asyncio.to_thread(translator.translate, cleaned)
-    return TranslateResponse(text=translated)
-```
-
 ---
 
 ## 7. Testing Strategy
@@ -531,9 +469,8 @@ Testing follows `AGENTS.md` and TDD (RED → GREEN → REFACTOR): every function
 
 | Level | Tooling & Location | Scope | Runs On |
 |---|---|---|---|
-| **Rust Unit Tests** | `cargo test --workspace` (`#[cfg(test)]` modules & `tests/`) | Pixel-diff gate, CJK character filter, OCR line ordering, fuzzy deduplicator (`0.93` threshold + blank reset), log formatter, TOML config round-trip & corrupt-file backup, bounded TTS FIFO queue, stale-sequence dropping, `HttpTranslator` / `HttpTtsEngine` error mapping against local mock HTTP listener | VM & Real PC |
-| **Python Server Tests** | `pytest server/ -v` (`fastapi.testclient` + mocked `httpx` / `edge_tts`) | `/health` schema, `/translate` success + empty input `400` + mocked `429` + timeout/network `502`, `/tts` MP3 bytes + voice validation + mocked Edge-TTS failure `502` | VM & Real PC |
-| **Real-PC Integration Tests** | `cargo test --workspace -- --ignored` (hardware/WeChat-tagged tests) | `wcocr-rs` direct Rust OCR on Chinese subtitle PNG fixtures, `xcap` cropped capture latency benchmark (100 frames p50/p95), Python server spawn + health check + forced-kill orphan check | Real PC (mandatory) |
+| **Rust Unit Tests** | `cargo test --workspace` (`#[cfg(test)]` modules & `tests/`) | Pixel-diff gate, CJK character filter, OCR line ordering, fuzzy deduplicator (`0.93` threshold + blank reset), log formatter, TOML config round-trip & corrupt-file backup, bounded TTS FIFO queue, stale-sequence dropping, native Helsinki/Vietphrase + Edge-TTS error mapping, 25-sentence benchmark fixtures | VM & Real PC |
+| **Real-PC Integration Tests** | `cargo test --workspace -- --ignored` (hardware/WeChat-tagged tests) | `wcocr-rs` direct Rust OCR on Chinese subtitle PNG fixtures, `xcap` cropped capture latency benchmark (100 frames p50/p95), native Helsinki/Vietphrase + Edge-TTS live tests, forced-kill orphan check | Real PC (mandatory) |
 | **Real-Video E2E Verification** | Live run on Danh's Windows PC + recorded test log + screenshots | Real Chinese drama / Bilibili video with hardcoded subtitles (both local player & browser), verifying every `AC-*` item, DPI alignment, Vietnamese/CJK font rendering, audio non-overlap, close-to-tray background run, and explicit network-offline error reporting | Real PC (mandatory before ticket sign-off) |
 
 ### Build-Time Risk Register (from `brief.md` §9)
@@ -553,9 +490,9 @@ Testing follows `AGENTS.md` and TDD (RED → GREEN → REFACTOR): every function
 
 ### Always
 - Follow the spec-first lifecycle (`SPEC → CONSTRAINTS → PLAN → BUILD → VERIFY → REVIEW → SHIP`).
-- Run `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and `pytest server/ -v` before marking any slice complete.
+- Run `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` before marking any slice complete.
 - Write tests alongside every feature change and regression tests for every bug fix, asserting concrete values.
-- Report all network, rate-limit, OCR, audio, and config failures explicitly in the UI and structured logs.
+- Report all network, engine, OCR, audio, and config failures explicitly in the UI and structured logs.
 - Verify UI and pipeline behavior on the real Windows PC with real hardcoded-subtitle video, saving actual output and screenshots to the test log.
 - Keep commits atomic (one vertical slice per commit, English conventional messages: `feat:`, `fix:`, `test:`, `docs:`).
 
@@ -563,14 +500,14 @@ Testing follows `AGENTS.md` and TDD (RED → GREEN → REFACTOR): every function
 - Any Git state-modifying operation (`commit`, `push`, `pull`, `merge`, `rebase`, `reset`, branch creation/deletion, tagging) or publish/deploy/delete action — requires an explicit "go" for that exact action.
 - Modifying existing original files outside newly created project artifacts.
 - Adding new major crates/dependencies (including any new capture backend — there is no `windows-capture` fallback to swap to).
-- Changing the HTTP contract (`/health`, `/translate`, `/tts`), `config.toml` schema, or `CONSTRAINTS.md` quality thresholds.
+- Changing the `Translator`/`TtsEngine` trait contracts, `config.toml` schema, or `CONSTRAINTS.md` quality thresholds.
 
 ### Never
 - Bundle, redistribute, or commit WeChat OCR binaries/DLLs (`wxocr.dll`, `mmmojo_64.dll`, `Weixin.exe`). WeChat OCR is strictly personal-use via the user's existing local Weixin installation.
 - Commit secrets, API keys, tokens, or credentials.
 - Silently swallow network/OCR/TTS errors, fabricate placeholder translations, or add hidden fallback chains that mask failures.
 - Implement out-of-MVP (V2+) features during V1 build cycles.
-- Leave orphaned Python server processes or ghost tray icons after shutdown or crash.
+- Leave orphaned processes or ghost tray icons after shutdown or crash.
 - Touch video files, inject scripts into browsers, or disable/delete failing tests to make CI green.
 
 ---
@@ -579,12 +516,12 @@ Testing follows `AGENTS.md` and TDD (RED → GREEN → REFACTOR): every function
 
 V1 is ready for user acceptance and packaging when **all** conditions below pass with recorded evidence:
 
-1. **Automated Quality Gate:** `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and `pytest server/ -v` all exit with code `0` and zero skipped tests.
+1. **Automated Quality Gate:** `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` all exit with code `0` and zero skipped tests.
 2. **Real-Video End-to-End Run (Local + Browser):** Running against a real hardcoded-Chinese-subtitle video in both a local player and a web browser for ≥ 15 continuous minutes:
    - End-to-end latency from subtitle appearance on screen to Vietnamese text appearing on the overlay is ≤ 2.0 s median under normal broadband.
    - Zero crashes, zero UI freezes, zero overlapping TTS audio clips, and zero redundant OCR calls during paused frames.
 3. **Visual & UX Fidelity:** Screenshots on the real PC confirm all 3 mockup views (`overlay-main`, `region-select`, `settings-tray`) match approved layout, colors (Chinese white, Vietnamese green), CJK + Vietnamese typography, and exact Vietnamese labels.
-4. **Tray & Lifecycle Integrity:** Closing the overlay hides it to tray while background translation + TTS continue; `Hiện cửa sổ` restores it; `Thoát` and forced kill both leave zero lingering `python.exe` server processes.
+4. **Tray & Lifecycle Integrity:** Closing the overlay hides it to tray while background translation + TTS continue; `Hiện cửa sổ` restores it; `Thoát` and forced kill both leave zero lingering `cap2voice-app.exe` processes.
 5. **Failure Honesty:** Disconnecting internet mid-playback surfaces the clear Vietnamese network-error banner within 1 subtitle cycle and recovers cleanly once connectivity returns; missing WeChat OCR path surfaces a clear setup error.
    > **Note (2026-11-21, Danh):** the network-disconnect check in this item is skipped for V1 ("task 14 không cần ngắt mạng"). `AC-TR-3` and the offline part of `AC-TTS-7` are recorded as skipped in `docs/test-log-v1.md`, not as verified.
 6. **Log Integrity:** The generated `%APPDATA%\cap2voice\logs\subtitles-YYYY-MM-DD.log` file contains accurate timestamped `Chinese : Vietnamese` pairs with zero mojibake.
@@ -595,10 +532,10 @@ V1 is ready for user acceptance and packaging when **all** conditions below pass
 
 The following items from `brief.md` §8 and `AGENTS.md` are explicitly excluded from V1 and must not be implemented in this cycle:
 
-- **Local offline translation model (`Helsinki-NLP/opus-mt-zh-vi`, ~300 MB):** Deferred to V2 to avoid shipping heavy ML inference runtimes in V1.
-- **DeepL API translation backend:** Deferred to V2 pending real-subtitle quality evaluation of Vietphrase in V1.
-- **Native Rust Edge-TTS (direct WebSocket protocol) & Python server removal:** Deferred to V2; V1 isolates the Python server behind `Translator`/`TtsEngine` traits for a clean drop-in swap later.
-- **Pinyin display above the Chinese line & click-to-replay Chinese audio:** Deferred to V2 language-learning enhancements.
+~~- **Local offline translation model (`Helsinki-NLP/opus-mt-zh-vi`, ~300 MB):** Deferred to V2 to avoid shipping heavy ML inference runtimes in V1.~~ — **DONE in Phase 2 (D1+A5, 2026-11-23):** selectable Helsinki engine, ONNX via `ort`.
+- **DeepL API translation backend:** Dropped by Danh 2026-11-21 (A4 cancelled); not planned.
+~~- **Native Rust Edge-TTS (direct WebSocket protocol) & Python server removal:** Deferred to V2; V1 isolates the Python server behind `Translator`/`TtsEngine` traits for a clean drop-in swap later.~~ — **DONE in Phase 2 (D1+A5, 2026-11-23):** native Edge-TTS client, Python server deleted.
+~~- **Pinyin display above the Chinese line & click-to-replay Chinese audio:** Deferred to V2 language-learning enhancements.~~ — **DONE in Phase 2 (D2, 2026-11-22):** pinyin line + click-to-replay.
 - **Searchable translation history table UI:** Deferred to V2 (V1 provides UTF-8 log files on disk).
 - **Browser extension (direct frame capture):** Deferred to V2+ (V1 is screen-observation only).
 - **WeChat 3.x OCR support (`WeChatOCR.exe`, `wx3` protos):** Deferred (`wcocr-rs` supports WeChat 4.x `wxocr.dll` only).
@@ -615,9 +552,9 @@ Per instructions, reasonable defaults were chosen for all underspecified details
 4. **Font Size Hierarchy (`Cỡ chữ phụ đề`):** Mockup 1 shows larger Chinese text over smaller Vietnamese text, while Mockup 3 shows one `Cỡ chữ phụ đề` slider. **Assumption:** The slider sets the Vietnamese base size (`12–40 px`, default `18 px`) and the Chinese line scales automatically at `1.35×` (default ~`24 px`).
 5. **Settings Control Placement Across 5 Tabs:** Mockup 3 renders several key controls together for visual reference alongside the 5-tab sidebar (`Chung`, `Dịch`, `Giọng đọc`, `Hiển thị`, `Phím tắt`). **Assumption:** Controls are organized logically across all 5 tabs as detailed in §3.6 so no tab is an empty stub.
 6. **Default Global Hotkeys:** Not specified in `brief.md`. **Assumption:** Defaults are `Ctrl+Alt+S` (Start/Stop), `Ctrl+Alt+R` (Select Region), `Ctrl+Alt+H` (Show/Hide Overlay), and `Ctrl+Alt+M` (Mute/Unmute TTS), all editable/disableable in Settings → `Phím tắt`.
-7. **Python Environment & Local Server Port:** **Assumption:** `cap2voice-app` looks for `server/.venv/Scripts/python.exe` first, then `python` on `PATH`, and binds to configurable `127.0.0.1:18765` (explicit error if port is occupied — no silent port hopping).
+7. ~~**Python Environment & Local Server Port**~~ — **Superseded by D1+A5 (2026-11-23):** no Python, no local port. Model/dictionary locations are `%APPDATA%\cap2voice\models\opus-mt-zh-vi` and `%APPDATA%\cap2voice\vietphrase\data` (env overrides `CAP2VOICE_HELSINKI_MODEL_DIR` / `CAP2VOICE_VP_DATA_DIR`).
 8. **WeChat OCR Image Input (`pic_path` vs `pic_data`):** Inspected `wcocr-rs/src/ocr.rs` passes `pic_path` (proven on WeChat 4.x) while `pic_data` in `wx4::ParseOcrReqMessage` is untested. **Assumption:** V1 uses a single reused temp file (`%TEMP%\cap2voice\frame.png`) as the proven path and optionally benchmarks `pic_data` in-memory during OCR implementation.
 9. **Subtitle Log Path & Format:** **Assumption:** Daily UTF-8 append logs at `%APPDATA%\cap2voice\logs\subtitles-YYYY-MM-DD.log` with format `[YYYY-MM-DD HH:MM:SS] <Chinese> : <Vietnamese>`, flushed per line, configurable directory in Settings → `Chung`.
-10. **Offline Vietphrase Translation:** **Assumption (updated 2026-11-21, supersedes the original Google Translate assumption):** `server/server.py` translates fully offline through `server.vietphrase` (a port of the GPL-3.0 `duongden/script-vietphrase-translator` userscript; dictionaries live in `server/vietphrase/data`, outside git). It replaced the Google Translate free endpoint on 2026-11-20 because Google returned HTTP `429` for ~2 days. There is no upstream network call and no rate limit for `/translate`; the server returns `503 translator_unavailable` only when the dictionaries are missing/unloadable.
+10. **Offline Vietphrase Translation:** **Assumption (updated 2026-11-23, D1+A5):** Vietphrase is a Rust port of the GPL-3.0 `duongden/script-vietphrase-translator` userscript, running in-process with dictionaries in `%APPDATA%\cap2voice\vietphrase\data` (outside git). It replaced the Google Translate free endpoint on 2026-11-20 because Google returned HTTP `429` for ~2 days, and the Python server that hosted it was deleted in D1+A5. There is no upstream network call and no rate limit; when the dictionaries are missing/unloadable the Vietphrase engine is simply unavailable (Helsinki still works).
 11. **Overlay Self-Capture Exclusion:** Dragging the floating overlay over the selected subtitle box would create an OCR feedback loop if captured. **Assumption:** V1 applies Windows `SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)` (Windows 10 2004+) to exclude the overlay from screen capture automatically, plus warns if the call is unsupported and regions overlap.
 12. **Start With Windows Registry Scope:** **Assumption:** `Khởi động cùng Windows` defaults to **unchecked** and, when enabled by the user, writes only to per-user `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\cap2voice` (requires no UAC admin elevation).

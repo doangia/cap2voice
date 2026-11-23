@@ -1,62 +1,16 @@
-//! HTTP client traits/implementations for the temporary local FastAPI server
-//! and managed Python server child-process lifecycle.
+//! Native translation/TTS engine traits and typed errors (D1+A5).
+//!
+//! There is no HTTP client and no Python server anymore: translation is
+//! in-process Rust (`translate::SwitchableTranslator`, Helsinki ONNX or
+//! Vietphrase) and TTS is a direct Edge-TTS WebSocket client
+//! (`tts::EdgeTtsEngine`).
 
-pub mod http_client;
-pub mod server_proc;
-
-pub use http_client::{
-    check_health, HttpTranslator, HttpTtsEngine, DEFAULT_CONNECT_TIMEOUT, DEFAULT_HEALTH_TIMEOUT,
-    DEFAULT_TRANSLATE_TIMEOUT, DEFAULT_TTS_TIMEOUT,
-};
-pub use server_proc::{
-    discover_python_executable, discover_python_executable_with_path, discover_server_dir,
-    ServerProcess, ServerProcessConfig, DEFAULT_HEALTH_POLL_INTERVAL, DEFAULT_HOST,
-    DEFAULT_SHUTDOWN_GRACE, DEFAULT_STARTUP_TIMEOUT,
-};
-
-use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
 use thiserror::Error;
 
 /// Boxed `Send` future alias used by async `Translator` and `TtsEngine` traits.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
-
-/// Response payload returned by `GET /health`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HealthStatus {
-    pub status: String,
-    pub version: String,
-    pub translator: String,
-    pub tts: String,
-}
-
-/// Request payload sent to `POST /translate`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TranslateRequest {
-    pub text: String,
-}
-
-/// Response payload returned by `POST /translate`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TranslateResponse {
-    pub text: String,
-}
-
-/// Request payload sent to `POST /tts`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TtsRequest {
-    pub text: String,
-    pub voice: String,
-    pub rate: String,
-}
-
-/// Structured error body returned by `server/server.py`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ApiErrorBody {
-    pub error: String,
-    pub detail: String,
-}
 
 /// Typed errors emitted by `Translator` implementations.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -67,14 +21,11 @@ pub enum TranslateError {
     #[error("yêu cầu dịch không hợp lệ: {detail}")]
     InvalidInput { detail: String },
 
-    #[error("Google Translate bị giới hạn tốc độ — tạm chờ: {detail}")]
-    RateLimited { detail: String },
-
-    #[error("lỗi dịch từ máy chủ (HTTP {status}): {detail}")]
+    #[error("lỗi engine dịch (HTTP {status}): {detail}")]
     Upstream { status: u16, detail: String },
 
-    #[error("mất kết nối server dịch/TTS local: {detail}")]
-    ServerUnavailable { detail: String },
+    #[error("không có engine dịch khả dụng: {detail}")]
+    EngineUnavailable { detail: String },
 
     #[error("hết thời gian chờ dịch sau {timeout_ms} ms")]
     Timeout { timeout_ms: u64 },
@@ -93,10 +44,21 @@ pub enum TtsError {
     InvalidInput { detail: String },
 
     #[error("lỗi tạo giọng đọc TTS (HTTP {status}): {detail}")]
-    Upstream { status: u16, detail: String },
+    Upstream {
+        status: u16,
+        detail: String,
+        /// Retries taken before this error was returned (empty when the
+        /// error came from the first attempt). Not shown in the short
+        /// message; the pipeline logs them to the subtitle log file.
+        retries: Vec<TtsRetryAttempt>,
+    },
 
-    #[error("mất kết nối server dịch/TTS local: {detail}")]
-    ServerUnavailable { detail: String },
+    #[error("mất kết nối mạng tới Edge-TTS: {detail}")]
+    Network {
+        detail: String,
+        /// Retries taken before this error was returned (see `Upstream`).
+        retries: Vec<TtsRetryAttempt>,
+    },
 
     #[error("hết thời gian chờ TTS sau {timeout_ms} ms")]
     Timeout { timeout_ms: u64 },
@@ -105,65 +67,78 @@ pub enum TtsError {
     InvalidResponse { detail: String },
 }
 
-/// Typed errors emitted by `GET /health` probes.
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
-pub enum HealthError {
-    #[error("server dịch/TTS chưa sẵn sàng: {detail}")]
-    ServerUnavailable { detail: String },
+impl TtsError {
+    /// Retry attempts recorded while producing this error (empty when the
+    /// error came from the first attempt or is not retryable).
+    pub fn retries(&self) -> &[TtsRetryAttempt] {
+        match self {
+            TtsError::Upstream { retries, .. } | TtsError::Network { retries, .. } => retries,
+            _ => &[],
+        }
+    }
 
-    #[error("hết thời gian kiểm tra /health sau {timeout_ms} ms")]
-    Timeout { timeout_ms: u64 },
-
-    #[error("endpoint /health trả về HTTP {status}: {detail}")]
-    UnexpectedStatus { status: u16, detail: String },
-
-    #[error("dữ liệu /health không hợp lệ: {detail}")]
-    InvalidResponse { detail: String },
+    /// Attach the retry attempts that led to this error. No-op for
+    /// variants that do not carry retries.
+    pub fn set_retries(&mut self, retries: Vec<TtsRetryAttempt>) {
+        match self {
+            TtsError::Upstream { retries: slot, .. } | TtsError::Network { retries: slot, .. } => {
+                *slot = retries;
+            }
+            _ => {}
+        }
+    }
 }
 
-/// Typed errors emitted by `ServerProcess` discovery, launch, and shutdown.
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
-pub enum ServerProcessError {
-    #[error("không tìm thấy thư mục server Python (chứa server.py) từ {searched}")]
-    ServerDirNotFound { searched: String },
+/// Maximum Edge-TTS synthesis retries on transient failures (HTTP 429 /
+/// 5xx / network errors). The retry loop sleeps with exponential backoff
+/// (500 ms, 1 s, 2 s) between attempts; the pipeline shows this count in
+/// the subtitle log (`thử lại 1/3`).
+pub const TTS_MAX_RETRIES: u32 = 3;
 
-    #[error("không tìm thấy Python để chạy server local ({searched}) — hãy tạo server/.venv và cài server/requirements.txt")]
-    PythonNotFound { searched: String },
+/// One recorded TTS retry attempt, for the subtitle log: which retry, what
+/// the service answered, and how long the client waited before it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TtsRetryAttempt {
+    /// 1-based retry number (1 = first retry after the initial attempt).
+    pub attempt: u32,
+    /// HTTP status when the failure carried one (429 / 5xx); `None` for
+    /// network errors with no response.
+    pub status: Option<u16>,
+    /// Short summary of the failure that triggered this retry.
+    pub detail: String,
+    /// Backoff waited before this retry, in milliseconds.
+    pub backoff_ms: u64,
+}
 
-    #[error("không thể khởi chạy {program}: {detail}")]
-    SpawnFailed { program: String, detail: String },
-
-    #[error("lỗi Windows Job Object tại {action} (Win32 code {code})")]
-    JobObjectFailed { action: &'static str, code: u32 },
-
-    #[error("server Python thoát sớm (mã {exit_code:?}): {stderr}")]
-    ExitedEarly {
-        exit_code: Option<i32>,
-        stderr: String,
-    },
-
-    #[error("server Python trên 127.0.0.1:{port} không sẵn sàng sau {timeout_ms} ms: {detail}")]
-    StartupTimeout {
-        port: u16,
-        timeout_ms: u64,
-        detail: String,
-    },
-
-    #[error("lỗi khởi tạo HTTP client cho server local: {0}")]
-    HttpClientInit(String),
+/// A completed TTS synthesis: the MP3 bytes plus the retries it took to
+/// get them (empty when the first attempt succeeded). The pipeline logs
+/// non-empty `retries` to the subtitle log file so a transient 429 stays
+/// visible even though the sentence still got its audio.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TtsSynthesis {
+    pub audio: Vec<u8>,
+    pub retries: Vec<TtsRetryAttempt>,
 }
 
 /// Asynchronous Chinese-to-Vietnamese translator boundary.
 pub trait Translator: Send + Sync {
     fn translate<'a>(&'a self, chinese: &'a str) -> BoxFuture<'a, Result<String, TranslateError>>;
+
+    /// Stable engine id for translation-cache keys (`"helsinki"` /
+    /// `"vietphrase"`). `None` when the translator has no engine concept
+    /// (test doubles); the pipeline then keys by `"unknown"`.
+    fn engine_id(&self) -> Option<&'static str> {
+        None
+    }
 }
 
-/// Asynchronous Vietnamese text-to-speech synthesis boundary (returns raw MP3 bytes).
+/// Asynchronous Vietnamese text-to-speech synthesis boundary (returns the
+/// MP3 bytes plus any retries it took; see `TtsSynthesis`).
 pub trait TtsEngine: Send + Sync {
     fn synthesize<'a>(
         &'a self,
         text: &'a str,
         voice: &'a str,
         rate: &'a str,
-    ) -> BoxFuture<'a, Result<Vec<u8>, TtsError>>;
+    ) -> BoxFuture<'a, Result<TtsSynthesis, TtsError>>;
 }

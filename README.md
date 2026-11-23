@@ -21,8 +21,9 @@ observes the screen. It is not a video player.
 ## Architecture
 
 - Rust desktop app (`eframe`/egui), screen capture (`xcap`), OCR (`wcocr-rs`)
-- Temporary Python API server (localhost) for translation (Google Translate)
-  and TTS (Edge-TTS, voice `vi-VN-NamMinhNeural`); later replaced by native Rust
+- Native in-process translation (selectable engine: Helsinki-NLP `opus-mt-zh-vi`
+  ONNX or offline Vietphrase) and TTS (native Edge-TTS WebSocket client,
+  voice `vi-VN-NamMinhNeural`); no Python, no local server
 - Settings window + system tray (close to tray, keep translating in background)
 
 See `brief.md` and `docs/spec.md` for details, and `AGENTS.md` for the agent
@@ -33,4 +34,4 @@ workflow (spec-first: spec → plan → build → test → review → ship).
 - The OCR engine is WeChat's (mmmojo), used through the Weixin install on
   the user's PC. It is personal use only and is NOT distributed with this
   repo — the app loads it from the local WeChat installation at runtime.
-- Translation and TTS need network (Google Translate free endpoint, Edge-TTS).
+- Translation runs fully offline (local ONNX model / dictionaries). Only TTS needs network (Edge-TTS).

@@ -2,15 +2,12 @@
 //! bounded capacity eviction, real-time volume, `stop_and_clear`, error surfacing,
 //! and real-PC speaker playback.
 
-use cap2voice_app::api::{
-    HttpTtsEngine, ServerProcess, ServerProcessConfig, TtsEngine, DEFAULT_CONNECT_TIMEOUT,
-    DEFAULT_TTS_TIMEOUT,
-};
+use cap2voice_app::api::TtsEngine;
 use cap2voice_app::audio::{
     validate_mp3_bytes, AudioBackend, AudioError, AudioPlayback, AudioPlayer, EnqueueOutcome,
     DEFAULT_MAX_PENDING_CLIPS, DEFAULT_VOLUME,
 };
-use std::path::Path;
+use cap2voice_app::tts::EdgeTtsEngine;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -535,36 +532,11 @@ fn audio_player_surfaces_device_open_and_decode_errors_without_panicking() {
     assert_eq!(player.last_error(), None);
 }
 
-fn unused_loopback_port() -> u16 {
-    let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:0") else {
-        panic!("failed binding ephemeral TCP port");
-    };
-    let Ok(addr) = listener.local_addr() else {
-        panic!("failed reading ephemeral port");
-    };
-    addr.port()
-}
-
 #[tokio::test]
 #[ignore = "plays real Vietnamese MP3 clips through Windows PC audio output"]
 async fn real_pc_plays_two_vietnamese_mp3_clips_sequentially_with_volume_and_stop_and_clear() {
-    let server_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("server");
-    let port = unused_loopback_port();
-    let server = match ServerProcess::start(ServerProcessConfig::for_port(port, server_dir)).await {
-        Ok(srv) => srv,
-        Err(err) => panic!("ServerProcess::start failed on real PC: {err}"),
-    };
-    let tts = match HttpTtsEngine::with_base_url(
-        server.base_url().to_string(),
-        DEFAULT_CONNECT_TIMEOUT,
-        DEFAULT_TTS_TIMEOUT,
-    ) {
-        Ok(client) => client,
-        Err(err) => panic!("HttpTtsEngine init failed: {err}"),
-    };
+    // Native Edge-TTS client (D1+A5): no Python server.
+    let tts = EdgeTtsEngine::new();
 
     let clip1 = match tts
         .synthesize(
@@ -574,7 +546,7 @@ async fn real_pc_plays_two_vietnamese_mp3_clips_sequentially_with_volume_and_sto
         )
         .await
     {
-        Ok(bytes) => bytes,
+        Ok(synthesis) => synthesis.audio,
         Err(err) => panic!("Edge-TTS clip1 synthesis failed: {err}"),
     };
     let clip2 = match tts
@@ -585,7 +557,7 @@ async fn real_pc_plays_two_vietnamese_mp3_clips_sequentially_with_volume_and_sto
         )
         .await
     {
-        Ok(bytes) => bytes,
+        Ok(synthesis) => synthesis.audio,
         Err(err) => panic!("Edge-TTS clip2 synthesis failed: {err}"),
     };
     let clip3 = match tts
@@ -596,7 +568,7 @@ async fn real_pc_plays_two_vietnamese_mp3_clips_sequentially_with_volume_and_sto
         )
         .await
     {
-        Ok(bytes) => bytes,
+        Ok(synthesis) => synthesis.audio,
         Err(err) => panic!("Edge-TTS clip3 synthesis failed: {err}"),
     };
 
@@ -662,5 +634,4 @@ async fn real_pc_plays_two_vietnamese_mp3_clips_sequentially_with_volume_and_sto
     );
 
     drop(player);
-    drop(server);
 }

@@ -1,9 +1,9 @@
 //! User-initiated commands: tray/hotkey dispatch, region selection,
 //! settings window, mute/voice toggles, and overlay show/hide.
 
-use super::bootstrap::{apply_wda_to_handle, configured_window_level, spawn_server_startup};
+use super::bootstrap::{apply_wda_to_handle, configured_window_level};
 use super::hotkeys::{HotkeyAction, HotkeyManager};
-use super::overlay::{overlay_overlaps_region, OverlayCommand, ServerUiStatus};
+use super::overlay::{overlay_overlaps_region, OverlayCommand};
 use super::pipeline::{
     apply_region_selection_outcome, build_live_pipeline_settings, commit_settings_to_state,
     TtsPreviewAudio,
@@ -14,10 +14,6 @@ use super::settings::{
 };
 use super::tray::TrayMenuAction;
 use crate::api::TtsEngine;
-use crate::api::{
-    check_health, HttpTtsEngine, DEFAULT_CONNECT_TIMEOUT, DEFAULT_HEALTH_TIMEOUT,
-    DEFAULT_TTS_TIMEOUT,
-};
 use crate::audio::AudioPlayer;
 use crate::config::{set_windows_autostart, ConfigError, WindowPosition};
 use eframe::egui;
@@ -25,8 +21,7 @@ use std::path::PathBuf;
 use std::sync::{mpsc, Arc};
 
 /// Edge-TTS voice for the Chinese click-to-replay (D2): a clear standard
-/// female Mandarin voice. Added to the server's `SUPPORTED_VOICES` so
-/// `POST /tts` accepts it.
+/// female Mandarin voice, synthesized by the native Edge-TTS client.
 pub(crate) const CHINESE_REPLAY_VOICE: &str = "zh-CN-XiaoxiaoNeural";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,22 +60,16 @@ impl super::Cap2VoiceApp {
     /// Replay the current Chinese line in Chinese (D2: click on the pinyin
     /// or Chinese line). Uses the A3 TTS cache first (the key includes the
     /// voice, so Chinese entries never collide with Vietnamese ones); on a
-    /// miss synthesizes via `POST /tts` and stores the result in the cache.
-    /// An explicit user action, so it plays even while muted (mute only
-    /// silences automatic Vietnamese reading). No-ops when no Chinese line
-    /// is shown or the server is not ready.
+    /// miss synthesizes via the native Edge-TTS client and stores the
+    /// result in the cache. An explicit user action, so it plays even
+    /// while muted (mute only silences automatic Vietnamese reading).
+    /// No-ops when no Chinese line is shown.
     pub(crate) fn handle_replay_chinese(&mut self, ctx: &egui::Context) {
         let chinese = self.state.pipeline.chinese_line.trim().to_string();
         if chinese.is_empty() {
             return;
         }
-        // Take the server URL as an owned string up front: holding a
-        // borrow of `self.server` would conflict with the `&mut self`
-        // calls below (`ensure_caches`, channel setup).
-        let Some(base_url) = self.server.as_ref().map(|s| s.base_url().to_string()) else {
-            self.state.ui_notice = Some("Server dịch/TTS chưa sẵn sàng".to_string());
-            return;
-        };
+        let tts_engine = Arc::clone(&self.tts_engine);
 
         let voice = CHINESE_REPLAY_VOICE;
         let rate = self.config.voice.speech_rate.clone();
@@ -114,22 +103,18 @@ impl super::Cap2VoiceApp {
         self.chinese_replay_rx = Some(rx);
         let ctx_wake = ctx.clone();
         self.runtime.spawn(async move {
-            let res = match HttpTtsEngine::with_base_url(
-                base_url,
-                DEFAULT_CONNECT_TIMEOUT,
-                DEFAULT_TTS_TIMEOUT,
-            ) {
-                Ok(client) => client
-                    .synthesize(&chinese, voice, &rate)
-                    .await
-                    .map(|mp3_bytes| {
-                        if let Some(cache) = &tts_cache {
-                            let _ = cache.put(&chinese, voice, &rate, mp3_bytes.clone());
-                        }
-                        TtsPreviewAudio { mp3_bytes, volume }
-                    }),
-                Err(err) => Err(err),
-            };
+            let res = tts_engine
+                .synthesize(&chinese, voice, &rate)
+                .await
+                .map(|synthesis| {
+                    if let Some(cache) = &tts_cache {
+                        let _ = cache.put(&chinese, voice, &rate, synthesis.audio.clone());
+                    }
+                    TtsPreviewAudio {
+                        mp3_bytes: synthesis.audio,
+                        volume,
+                    }
+                });
             let _ = tx.send(res);
             ctx_wake.request_repaint();
         });
@@ -256,7 +241,12 @@ impl super::Cap2VoiceApp {
     pub(crate) fn open_settings_window(&mut self, ctx: &egui::Context) {
         self.state.settings_panel_open = false;
         if self.settings_draft.is_none() {
-            self.settings_draft = Some(SettingsDraftState::from_config(&self.config));
+            let mut draft = SettingsDraftState::from_config(&self.config);
+            // Snapshot the live translator status for the Dịch tab
+            // (D1+A5): the engine selector edits the draft; the status
+            // line shows what the running translator reports right now.
+            draft.translator_status = self.translator.as_ref().map(|t| t.status());
+            self.settings_draft = Some(draft);
         }
         self.settings_focused = false;
         ctx.request_repaint();
@@ -277,7 +267,6 @@ impl super::Cap2VoiceApp {
                         self.state.ui_notice = Some(format!("Lỗi âm thanh: {err}"));
                     }
                 }
-                self.health_check_rx = None;
                 self.tts_preview_rx = None;
                 self.settings_focused = false;
                 ctx.request_repaint();
@@ -301,25 +290,7 @@ impl super::Cap2VoiceApp {
             SettingsCommand::SelectRegion => {
                 self.open_region_selector(ctx, RegionSelectionTarget::SettingsDraft);
             }
-            SettingsCommand::TestConnection { port } => {
-                if let Some(draft) = &mut self.settings_draft {
-                    draft.connection_status = AsyncFeedbackState::InProgress(format!(
-                        "Đang kiểm tra 127.0.0.1:{port}..."
-                    ));
-                }
-                let (tx, rx) = mpsc::sync_channel(1);
-                self.health_check_rx = Some(rx);
-                let ctx_wake = ctx.clone();
-                self.runtime.spawn(async move {
-                    let base_url = format!("http://127.0.0.1:{port}");
-                    let res = check_health(&base_url, DEFAULT_HEALTH_TIMEOUT).await;
-                    let _ = tx.send(res);
-                    ctx_wake.request_repaint();
-                });
-                ctx.request_repaint();
-            }
             SettingsCommand::PreviewVoice {
-                port,
                 voice,
                 rate,
                 volume,
@@ -342,22 +313,18 @@ impl super::Cap2VoiceApp {
                     draft.tts_preview_status =
                         AsyncFeedbackState::InProgress(format!("Đang tạo mẫu giọng {voice}..."));
                 }
+                let tts_engine = Arc::clone(&self.tts_engine);
                 let (tx, rx) = mpsc::sync_channel(1);
                 self.tts_preview_rx = Some(rx);
                 let ctx_wake = ctx.clone();
                 self.runtime.spawn(async move {
-                    let base_url = format!("http://127.0.0.1:{port}");
-                    let res = match HttpTtsEngine::with_base_url(
-                        base_url,
-                        DEFAULT_CONNECT_TIMEOUT,
-                        DEFAULT_TTS_TIMEOUT,
-                    ) {
-                        Ok(client) => client
-                            .synthesize(SETTINGS_PREVIEW_SAMPLE_TEXT, &voice, &rate)
-                            .await
-                            .map(|mp3_bytes| TtsPreviewAudio { mp3_bytes, volume }),
-                        Err(err) => Err(err),
-                    };
+                    let res = tts_engine
+                        .synthesize(SETTINGS_PREVIEW_SAMPLE_TEXT, &voice, &rate)
+                        .await
+                        .map(|synthesis| TtsPreviewAudio {
+                            mp3_bytes: synthesis.audio,
+                            volume,
+                        });
                     let _ = tx.send(res);
                     ctx_wake.request_repaint();
                 });
@@ -384,7 +351,6 @@ impl super::Cap2VoiceApp {
                     Ok(effects) => {
                         self.settings_draft = None;
                         self.settings_focused = false;
-                        self.health_check_rx = None;
                         self.tts_preview_rx = None;
 
                         if effects.wechat_paths_changed {
@@ -411,12 +377,13 @@ impl super::Cap2VoiceApp {
                                 self.state.ui_notice = Some(format!("Lỗi âm thanh: {err}"));
                             }
                         }
-                        if effects.port_changed {
-                            self.server = None;
-                            self.state.server_status = ServerUiStatus::Starting;
-                            let port = self.config.translation.server_port;
-                            self.server_rx =
-                                Some(spawn_server_startup(&self.runtime, port, ctx.clone()));
+                        if effects.engine_changed {
+                            // Runtime engine switch (no restart): the
+                            // pipeline holds the same `Arc`, so the next
+                            // translation already uses the new engine.
+                            if let Some(translator) = &self.translator {
+                                translator.set_engine(self.config.translation.engine);
+                            }
                         }
                         if prev_hotkeys != self.config.hotkeys {
                             self.reregister_hotkeys();

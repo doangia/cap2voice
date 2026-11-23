@@ -1,8 +1,9 @@
 //! Decorated 5-tab Settings window (`Cài đặt`) with isolated draft state,
-//! live validation, `Huỷ` / `Lưu thay đổi`, connection probe, and voice preview.
+//! live validation, `Huỷ` / `Lưu thay đổi`, engine selector, and voice preview.
 
 use crate::config::{AppConfig, CaptureRegion, HotkeyConfig};
 use crate::ocr::{resolve_wechat_paths_from_config, WeChatOcrPaths};
+use crate::translate::{TranslationEngine, TranslatorStatus};
 use crate::ui::fonts::parse_hex_color;
 use crate::ui::overlay::AVAILABLE_VOICES;
 use eframe::egui;
@@ -81,7 +82,7 @@ impl SettingsTab {
     fn subtitle(self) -> &'static str {
         match self {
             Self::General => "Tốc độ chụp, vùng phụ đề, WeChat OCR và hành vi cửa sổ",
-            Self::Translation => "Cổng server dịch cục bộ và độ nhạy phát hiện phụ đề",
+            Self::Translation => "Engine dịch và độ nhạy phát hiện phụ đề",
             Self::Voice => "Cấu hình giọng đọc Edge-TTS tiếng Việt và nghe thử",
             Self::Display => "Cỡ chữ, độ mờ và màu sắc phụ đề trên overlay",
             Self::Hotkeys => "Phím tắt toàn cục khi xem video ở cửa sổ khác",
@@ -89,7 +90,7 @@ impl SettingsTab {
     }
 }
 
-/// Async feedback banner for `Kiểm tra kết nối` and `Nghe thử`.
+/// Async feedback banner for `Nghe thử`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AsyncFeedbackState {
     Idle,
@@ -104,11 +105,7 @@ pub enum SettingsCommand {
     Cancel,
     Save(Box<AppConfig>),
     SelectRegion,
-    TestConnection {
-        port: u16,
-    },
     PreviewVoice {
-        port: u16,
         voice: String,
         rate: String,
         volume: f32,
@@ -127,10 +124,12 @@ pub struct SettingsDraftState {
     pub wxocr_path_input: String,
     pub weixin_dir_input: String,
     pub log_dir_input: String,
-    pub server_port_input: String,
     ocr_paths_status: Result<WeChatOcrPaths, String>,
     pub validation_error: Option<String>,
-    pub connection_status: AsyncFeedbackState,
+    /// Snapshot of the live translator status taken when the Settings
+    /// window opens (D1+A5); shown on the Dịch tab. `None` when no
+    /// translator was available at open time.
+    pub translator_status: Option<TranslatorStatus>,
     pub tts_preview_status: AsyncFeedbackState,
 }
 
@@ -219,10 +218,9 @@ impl SettingsDraftState {
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
-            server_port_input: config.translation.server_port.to_string(),
             ocr_paths_status,
             validation_error: None,
-            connection_status: AsyncFeedbackState::Idle,
+            translator_status: None,
             tts_preview_status: AsyncFeedbackState::Idle,
         }
     }
@@ -242,9 +240,6 @@ impl SettingsDraftState {
 
     /// Return `true` when any editable setting differs from the opened baseline.
     pub fn is_dirty(&self) -> bool {
-        if self.server_port_input.trim() != self.original.translation.server_port.to_string() {
-            return true;
-        }
         self.build_synced_candidate() != self.original
     }
 
@@ -268,28 +263,9 @@ impl SettingsDraftState {
             resolve_wechat_paths_from_config(&self.draft.general).map_err(|err| err.to_string());
     }
 
-    fn parse_draft_port(&self) -> Result<u16, String> {
-        let trimmed = self.server_port_input.trim();
-        let port = trimmed.parse::<u16>().map_err(|_| {
-            format!("Cổng server cục bộ phải là số nguyên từ 1024 đến 65535 (nhận '{trimmed}')")
-        })?;
-        if port < 1024 {
-            return Err(format!("Cổng server cục bộ phải >= 1024 (nhận {port})"));
-        }
-        Ok(port)
-    }
-
     /// Parse string inputs, validate all fields + hotkeys, and return committed `AppConfig`.
     pub fn try_commit(&mut self) -> Result<AppConfig, String> {
         let mut candidate = self.build_synced_candidate();
-
-        match self.parse_draft_port() {
-            Ok(port) => candidate.translation.server_port = port,
-            Err(err) => {
-                self.validation_error = Some(err.clone());
-                return Err(err);
-            }
-        }
 
         match normalize_hex_input("tiếng Trung", &candidate.display.chinese_color_hex) {
             Ok(hex) => candidate.display.chinese_color_hex = hex,
@@ -322,7 +298,6 @@ impl SettingsDraftState {
 
         self.validation_error = None;
         self.draft = candidate.clone();
-        self.server_port_input = candidate.translation.server_port.to_string();
         Ok(candidate)
     }
 
@@ -500,6 +475,59 @@ fn render_general_tab(
     );
 }
 
+/// One-line live translator status for the Dịch tab, plus its text color.
+/// `None` means no translator was available when Settings opened.
+fn translator_status_text(status: &Option<TranslatorStatus>) -> (String, egui::Color32) {
+    use crate::translate::HelsinkiState;
+    let green = egui::Color32::from_rgb(74, 222, 128);
+    let yellow = egui::Color32::from_rgb(250, 204, 21);
+    let red = egui::Color32::from_rgb(248, 113, 113);
+    match status {
+        None => (
+            "Không có engine dịch khả dụng — kiểm tra model/từ điển".to_string(),
+            red,
+        ),
+        Some(status) => {
+            let helsinki = match &status.helsinki {
+                HelsinkiState::NotLoaded => "Helsinki: chưa tải".to_string(),
+                HelsinkiState::Loading => "Helsinki: đang tải model…".to_string(),
+                HelsinkiState::Ready => "Helsinki: sẵn sàng".to_string(),
+                HelsinkiState::Failed(detail) => format!("Helsinki: lỗi ({detail})"),
+            };
+            let vietphrase = if status.vietphrase_available {
+                "Vietphrase: sẵn sàng"
+            } else {
+                "Vietphrase: không khả dụng"
+            };
+            let fallbacks = if status.helsinki_fallbacks > 0 {
+                format!(
+                    " · đã dùng Vietphrase thay {} câu",
+                    status.helsinki_fallbacks
+                )
+            } else {
+                String::new()
+            };
+            let color = match (&status.engine, &status.helsinki) {
+                (TranslationEngine::Helsinki, HelsinkiState::Failed(_))
+                    if !status.vietphrase_available =>
+                {
+                    red
+                }
+                (TranslationEngine::Helsinki, HelsinkiState::Loading)
+                | (TranslationEngine::Helsinki, HelsinkiState::NotLoaded) => yellow,
+                _ => green,
+            };
+            (
+                format!(
+                    "Đang dùng: {} · {helsinki} · {vietphrase}{fallbacks} (lúc mở Cài đặt)",
+                    status.engine.label()
+                ),
+                color,
+            )
+        }
+    }
+}
+
 fn render_translation_tab(
     ui: &mut egui::Ui,
     state: &mut SettingsDraftState,
@@ -510,28 +538,27 @@ fn render_translation_tab(
         .spacing([18.0, 12.0])
         .show(ui, |ui| {
             ui.label("Bộ dịch");
-            ui.label(
-                egui::RichText::new("Server cục bộ 127.0.0.1 (Vietphrase offline)")
-                    .color(muted_text_color()),
-            );
+            egui::ComboBox::from_id_salt("settings_translation_engine")
+                .selected_text(state.draft.translation.engine.label())
+                .width(230.0)
+                .show_ui(ui, |ui| {
+                    for engine in TranslationEngine::ALL {
+                        ui.selectable_value(
+                            &mut state.draft.translation.engine,
+                            engine,
+                            engine.label(),
+                        );
+                    }
+                });
             ui.end_row();
 
-            ui.label("Cổng server local");
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut state.server_port_input).desired_width(88.0),
-                );
-                if ui.button("Kiểm tra kết nối").clicked() {
-                    match state.parse_draft_port() {
-                        Ok(port) => {
-                            *emitted = Some(SettingsCommand::TestConnection { port });
-                        }
-                        Err(err) => {
-                            state.connection_status = AsyncFeedbackState::Error(err);
-                        }
-                    }
-                }
-            });
+            ui.label("Trạng thái engine");
+            let (status_text, status_color) = translator_status_text(&state.translator_status);
+            ui.label(
+                egui::RichText::new(status_text)
+                    .size(12.5)
+                    .color(status_color),
+            );
             ui.end_row();
 
             ui.label("Ngưỡng trùng lặp phụ đề");
@@ -575,9 +602,6 @@ fn render_translation_tab(
             });
             ui.end_row();
         });
-
-    ui.add_space(8.0);
-    render_async_feedback(ui, &state.connection_status);
 }
 
 fn render_voice_tab(
@@ -653,19 +677,11 @@ fn render_voice_tab(
     ui.add_space(10.0);
     ui.horizontal(|ui| {
         if ui.button("Nghe thử").clicked() {
-            match state.parse_draft_port() {
-                Ok(port) => {
-                    *emitted = Some(SettingsCommand::PreviewVoice {
-                        port,
-                        voice: state.draft.voice.voice.clone(),
-                        rate: state.draft.voice.speech_rate.clone(),
-                        volume: state.draft.voice.volume,
-                    });
-                }
-                Err(err) => {
-                    state.tts_preview_status = AsyncFeedbackState::Error(err);
-                }
-            }
+            *emitted = Some(SettingsCommand::PreviewVoice {
+                voice: state.draft.voice.voice.clone(),
+                rate: state.draft.voice.speech_rate.clone(),
+                volume: state.draft.voice.volume,
+            });
         }
         render_async_feedback(ui, &state.tts_preview_status);
     });
@@ -981,6 +997,7 @@ mod tests {
         SettingsTab,
     };
     use crate::config::{AppConfig, CaptureRegion, HotkeyConfig};
+    use crate::translate::TranslationEngine;
     use eframe::egui;
     use std::path::PathBuf;
 
@@ -1003,7 +1020,7 @@ mod tests {
         draft_state.draft.voice.volume = 0.25;
         draft_state.draft.display.font_size_px = 32.0;
         draft_state.draft.general.capture_fps = 15;
-        draft_state.server_port_input = "19000".to_string();
+        draft_state.draft.translation.engine = TranslationEngine::Vietphrase;
         assert!(draft_state.is_dirty());
 
         let discarded = draft_state.discard();
@@ -1025,7 +1042,7 @@ mod tests {
         draft_state.draft.general.start_with_windows = true;
         draft_state.draft.general.start_minimized_to_tray = true;
 
-        draft_state.server_port_input = "19876".to_string();
+        draft_state.draft.translation.engine = TranslationEngine::Vietphrase;
         draft_state.draft.translation.dedupe_threshold = 0.88;
         draft_state.draft.translation.pixel_diff_threshold = 0.05;
         draft_state.draft.translation.blank_reset_frames = 8;
@@ -1065,7 +1082,7 @@ mod tests {
         assert!(!committed.general.close_to_tray);
         assert!(committed.general.start_with_windows);
         assert!(committed.general.start_minimized_to_tray);
-        assert_eq!(committed.translation.server_port, 19876);
+        assert_eq!(committed.translation.engine, TranslationEngine::Vietphrase);
         assert!((committed.translation.dedupe_threshold - 0.88).abs() < 1e-6);
         assert!((committed.translation.pixel_diff_threshold - 0.05).abs() < 1e-6);
         assert_eq!(committed.translation.blank_reset_frames, 8);
@@ -1084,14 +1101,8 @@ mod tests {
     }
 
     #[test]
-    fn settings_draft_rejects_invalid_port_hex_colors_and_duplicate_or_empty_hotkeys() {
+    fn settings_draft_rejects_invalid_hex_colors_and_duplicate_or_empty_hotkeys() {
         let cfg = AppConfig::default();
-
-        // Invalid port
-        let mut state = SettingsDraftState::from_config(&cfg);
-        state.server_port_input = "80".to_string();
-        assert!(state.try_commit().is_err());
-        assert!(state.validation_error.is_some());
 
         // Malformed hex color
         let mut state = SettingsDraftState::from_config(&cfg);

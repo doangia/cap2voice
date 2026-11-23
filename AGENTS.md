@@ -34,9 +34,6 @@ cap2voice/
 ├── crates/
 │   ├── cap2voice-app/    # egui app: UI, capture, pipeline, tray
 │   └── wcocr-rs/         # WeChat OCR as a library crate (refactor from C ABI first)
-├── server/               # TEMPORARY Python API server (localhost)
-│   ├── server.py         # POST /translate, POST /tts, GET /health
-│   └── requirements.txt
 ├── tasks/                # plan + todo (created by planning skill)
 ├── CONSTRAINTS.md        # quality bar (created by constraints skill)
 └── AGENTS.md             # this file
@@ -46,13 +43,9 @@ cap2voice/
 - Capture: `xcap` 0.9.10. There is no `windows-capture` fallback: `xcap` is the only capture backend, and the `FrameCapturer` trait exists so tests can substitute a fake, not to swap in another real backend.
 - OCR: `wcocr-rs` (internal crate). Current code exports a C ABI
   (`wechat_ocr` / `stop_ocr`); the first refactor is to use it as a direct Rust crate.
-- HTTP: `reqwest` 0.13 (Rust app → Python server). Audio: `rodio` 0.23.
-- Python server (temporary, later replaced by native Rust): FastAPI,
-  `POST /translate` (Vietphrase offline, zh→vi), `POST /tts` (Edge-TTS → mp3,
-  default voice `vi-VN-NamMinhNeural`). The Rust app starts/stops the server
-  itself; the user never runs it by hand.
-- No crate `edge-tts` exists: native Rust TTS later means calling the Edge-TTS
-  websocket protocol directly.
+- Translation (D1+A5, native in-process): selectable engine — Helsinki-NLP `opus-mt-zh-vi` ONNX (`ort`, lazy-loaded) or offline Vietphrase (Rust port); model in `%APPDATA%\cap2voice\models\opus-mt-zh-vi`, dictionaries in `%APPDATA%\cap2voice\vietphrase\data`. No Python at runtime.
+- TTS (D1, native in-process): direct Edge-TTS WebSocket client (`tokio-tungstenite`), default voice `vi-VN-NamMinhNeural`.
+- Audio: `rodio` 0.23.
 
 ## Workflow — mandatory, spec-first
 
@@ -97,12 +90,12 @@ Every task runs the lifecycle. Never write code before the spec and plan gates p
 - **WeChat OCR engine is personal-use only.** It runs through the Weixin
   install on the PC (`C:\Program Files\Tencent\Weixin\4.0.2.28`, OCR plugin
   8022). Never distribute the engine or its binaries.
-- **Network failures are reported, never silent.** Edge-TTS needs network; Vietphrase translation is offline and does not. If the network is down, the app must
+- **Network failures are reported, never silent.** Edge-TTS needs network; Helsinki and Vietphrase translation run locally and do not. If the network is down, the app must
   say so clearly instead of silently not translating.
-- **Do not build out-of-MVP scope in the first round:** local translation
+~~- **Do not build out-of-MVP scope in the first round:** local translation
   model (`Helsinki-NLP/opus-mt-zh-vi`), native Rust TTS, pinyin on the Chinese
   line, click-to-replay Chinese audio, translation history table, browser
-  extension. Those are recorded in `brief.md` §8 for later.
+  extension. Those are recorded in `brief.md` §8 for later.~~ — Helsinki model, native TTS, pinyin, and click-to-replay are DONE (Phase 2, D1/D2/A5). Still deferred: translation history table, browser extension.
 
 ## Build, test, verify
 
@@ -110,8 +103,6 @@ Every task runs the lifecycle. Never write code before the spec and plan gates p
 cargo test                          # Rust workspace tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
-# Python server (if tests exist)
-python -m pytest server/
 ```
 
 - Every ticket states "done means" and how to verify it on the real PC.

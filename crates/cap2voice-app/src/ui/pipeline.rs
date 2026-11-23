@@ -2,16 +2,12 @@
 //! subtitle pipeline, committing settings drafts, and applying region
 //! selection outcomes.
 
-use super::bootstrap::format_server_startup_error;
 use super::hotkeys::HotkeyAction;
 use super::overlay::{OverlayState, ServerUiStatus};
 use super::region::RegionSelectorOutcome;
 use super::settings::AsyncFeedbackState;
 use super::tray::TrayMenuAction;
-use crate::api::{
-    HttpTranslator, HttpTtsEngine, DEFAULT_CONNECT_TIMEOUT, DEFAULT_TRANSLATE_TIMEOUT,
-    DEFAULT_TTS_TIMEOUT,
-};
+use crate::api::{Translator, TtsEngine};
 use crate::audio::AudioPlayer;
 use crate::config::{save_config_to, AppConfig, ConfigError, WindowPosition};
 use crate::ocr::{resolve_wechat_paths_from_config, WeChatOcrAdapter};
@@ -19,6 +15,7 @@ use crate::pipeline::{
     PipelineDeps, PipelineRunner, PipelineSettings, PipelineSnapshot, PipelineStatus,
     SubtitleLogger, TranslationCache, TtsCache,
 };
+use crate::translate::{HelsinkiState, TranslationEngine};
 use eframe::egui;
 use std::path::Path;
 use std::sync::{mpsc, Arc};
@@ -26,7 +23,7 @@ use tokio::sync::watch;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SettingsCommitEffects {
-    pub port_changed: bool,
+    pub engine_changed: bool,
     pub wechat_paths_changed: bool,
     pub always_on_top_changed: bool,
 }
@@ -67,7 +64,7 @@ where
     }
 
     let effects = SettingsCommitEffects {
-        port_changed: current_config.translation.server_port != new_config.translation.server_port,
+        engine_changed: current_config.translation.engine != new_config.translation.engine,
         wechat_paths_changed: current_config.general.wxocr_dll_path
             != new_config.general.wxocr_dll_path
             || current_config.general.weixin_dir_path != new_config.general.weixin_dir_path,
@@ -140,25 +137,59 @@ impl super::Cap2VoiceApp {
             self.dispatch_hotkey_action(ctx, action);
         }
 
-        if let Some(rx) = &self.server_rx {
+        // Receive the background translator build (D1+A5): dictionary
+        // load takes seconds, so it never blocks app startup. If the
+        // user already switched the engine in Settings while the loader
+        // was running, align the arrived translator with the live config.
+        if let Some(rx) = &self.translator_rx {
             match rx.try_recv() {
-                Ok(Ok(srv)) => {
-                    self.server = Some(srv);
-                    self.state.server_status = ServerUiStatus::Ready;
-                    self.server_rx = None;
-                }
-                Ok(Err(err)) => {
-                    self.state.server_status =
-                        ServerUiStatus::Failed(format_server_startup_error(&err));
-                    self.server_rx = None;
+                Ok((translator, warnings)) => {
+                    self.state.startup_warnings.extend(warnings);
+                    if translator.is_none() {
+                        self.translator_error = Some(
+                            "Không có engine dịch khả dụng — kiểm tra model/từ điển".to_string(),
+                        );
+                    } else if let Some(translator) = &translator {
+                        translator.set_engine(self.config.translation.engine);
+                    }
+                    self.translator = translator;
+                    self.translator_rx = None;
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    self.state.server_status = ServerUiStatus::Failed(
-                        "Luồng khởi động server dịch/TTS đã dừng bất ngờ".to_string(),
-                    );
-                    self.server_rx = None;
+                    self.translator_error =
+                        Some("Luồng tải engine dịch đã dừng bất ngờ".to_string());
+                    self.translator_rx = None;
                 }
+            }
+        }
+
+        // Track the native translator status on the overlay (D1+A5):
+        // the Helsinki model loads in the background, so the header shows
+        // "Đang tải model dịch…" until it is ready.
+        match &self.translator {
+            None => {
+                self.state.server_status = match &self.translator_error {
+                    Some(err) => ServerUiStatus::Failed(err.clone()),
+                    // Loader still running: Starting, not Failed.
+                    None => ServerUiStatus::Starting,
+                };
+            }
+            Some(translator) => {
+                let status = translator.status();
+                self.state.server_status = match (&status.engine, &status.helsinki) {
+                    (TranslationEngine::Helsinki, HelsinkiState::Loading) => {
+                        ServerUiStatus::Starting
+                    }
+                    (TranslationEngine::Helsinki, HelsinkiState::Failed(detail))
+                        if !status.vietphrase_available =>
+                    {
+                        ServerUiStatus::Failed(format!(
+                            "Model Helsinki lỗi và không có Vietphrase: {detail}"
+                        ))
+                    }
+                    _ => ServerUiStatus::Ready,
+                };
             }
         }
 
@@ -176,36 +207,6 @@ impl super::Cap2VoiceApp {
             self.state.apply_pipeline_snapshot(snap);
             if stopped_now {
                 self.pipeline_rx = None;
-            }
-        }
-
-        if let Some(rx) = &self.health_check_rx {
-            match rx.try_recv() {
-                Ok(Ok(health)) => {
-                    if let Some(draft) = &mut self.settings_draft {
-                        draft.connection_status = AsyncFeedbackState::Success(format!(
-                            "Kết nối OK (v{} · {} · {})",
-                            health.version, health.translator, health.tts
-                        ));
-                    }
-                    self.health_check_rx = None;
-                }
-                Ok(Err(err)) => {
-                    if let Some(draft) = &mut self.settings_draft {
-                        draft.connection_status =
-                            AsyncFeedbackState::Error(format!("Lỗi kết nối: {err}"));
-                    }
-                    self.health_check_rx = None;
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    if let Some(draft) = &mut self.settings_draft {
-                        draft.connection_status = AsyncFeedbackState::Error(
-                            "Luồng kiểm tra kết nối đã dừng bất ngờ".to_string(),
-                        );
-                    }
-                    self.health_check_rx = None;
-                }
             }
         }
 
@@ -363,10 +364,16 @@ impl super::Cap2VoiceApp {
         {
             return;
         }
-        let Some(server) = &self.server else {
-            self.state.ui_notice = Some("Server dịch/TTS chưa sẵn sàng".to_string());
+        let Some(translator) = self.translator.clone() else {
+            let msg = if self.translator_error.is_some() {
+                "Không có engine dịch khả dụng — kiểm tra model/từ điển"
+            } else {
+                "Engine dịch đang tải, thử lại sau giây lát"
+            };
+            self.state.ui_notice = Some(msg.to_string());
             return;
         };
+        let tts_engine = Arc::clone(&self.tts_engine);
 
         let settings = match build_live_pipeline_settings(&self.config, &self.state) {
             Ok(s) => s,
@@ -406,29 +413,12 @@ impl super::Cap2VoiceApp {
             return;
         };
 
-        let base_url = server.base_url().to_string();
-        let translator = match HttpTranslator::with_base_url(
-            base_url.clone(),
-            DEFAULT_CONNECT_TIMEOUT,
-            DEFAULT_TRANSLATE_TIMEOUT,
-        ) {
-            Ok(client) => Arc::new(client),
-            Err(err) => {
-                self.state.ui_notice = Some(err.to_string());
-                return;
-            }
-        };
-        let tts = match HttpTtsEngine::with_base_url(
-            base_url,
-            DEFAULT_CONNECT_TIMEOUT,
-            DEFAULT_TTS_TIMEOUT,
-        ) {
-            Ok(client) => Arc::new(client),
-            Err(err) => {
-                self.state.ui_notice = Some(err.to_string());
-                return;
-            }
-        };
+        // The shared native engines (built once at startup): the
+        // translator is the `Arc<SwitchableTranslator>` behind `dyn
+        // Translator`, so a Settings engine switch applies to the running
+        // pipeline too; the TTS engine is the native Edge-TTS client.
+        let translator: Arc<dyn Translator> = translator;
+        let tts: Arc<dyn TtsEngine> = tts_engine;
 
         let logger = if self.config.general.enable_subtitle_log {
             match self.config.effective_log_dir() {

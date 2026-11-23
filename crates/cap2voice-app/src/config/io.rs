@@ -198,7 +198,7 @@ mod tests {
         first.general.close_to_tray = false;
         first.general.start_with_windows = true;
         first.general.start_minimized_to_tray = true;
-        first.translation.server_port = 19000;
+        first.translation.engine = crate::translate::TranslationEngine::Vietphrase;
         first.translation.dedupe_threshold = 0.90;
         first.translation.pixel_diff_threshold = 0.05;
         first.translation.blank_reset_frames = 8;
