@@ -1,5 +1,11 @@
-//! Fullscreen transparent dimmed region-selector viewport matching Mockup 2
-//! (`region-select`) with red dashed cut-out border and DPI physical mapping.
+//! Fully transparent fullscreen region-selector viewport matching Mockup 2
+//! (`region-select`) with red dashed selection border and DPI physical mapping.
+//!
+//! The window shows the desktop/video underneath untouched — only the
+//! dragged selection rectangle (red dashed border), the coordinate badge,
+//! and the top instruction pill are painted — so the user can align the
+//! selection exactly over the burned-in subtitle text.
+//!
 
 use crate::capture::{
     resolve_monitor_crop, validate_region_dimensions, CaptureError, MonitorInfo, MIN_REGION_HEIGHT,
@@ -8,7 +14,7 @@ use crate::capture::{
 use crate::config::{CaptureRegion, WindowPosition};
 use eframe::egui;
 
-/// Top-center prompt pill title shown over the dimmed region selector.
+/// Top-center prompt pill title shown over the region selector.
 pub const REGION_PROMPT_TITLE: &str = "Kéo chuột để chọn vùng phụ đề";
 
 /// Secondary cancellation instruction rendered beneath/alongside the prompt pill.
@@ -16,11 +22,6 @@ pub const REGION_PROMPT_HINT: &str = "Nhấn Esc hoặc chuột phải để hu�
 
 /// Red dashed selection rectangle color (`#EF4444`, `docs/spec.md` §3.1).
 pub const SELECTION_BORDER_COLOR: egui::Color32 = egui::Color32::from_rgb(239, 68, 68);
-
-/// Semi-transparent dark dimming veil color painted outside the clear selection cut-out.
-pub fn dim_overlay_color() -> egui::Color32 {
-    egui::Color32::from_rgba_unmultiplied(8, 10, 14, 150)
-}
 
 /// Viewport ID used by `egui::Context::show_viewport_immediate` for region selection.
 pub fn region_viewport_id() -> egui::ViewportId {
@@ -311,39 +312,6 @@ pub fn logical_drag_to_physical_region(
     Ok(region)
 }
 
-/// Partition `screen` into non-overlapping dimmed rectangles leaving `cutout` interior clear.
-pub fn dimmed_backdrop_rects(screen: egui::Rect, cutout: Option<egui::Rect>) -> Vec<egui::Rect> {
-    let Some(raw) = cutout else {
-        return vec![screen];
-    };
-    let c = raw.intersect(screen);
-    if c.width() <= 0.0 || c.height() <= 0.0 {
-        return vec![screen];
-    }
-
-    let candidates = [
-        // Top band spanning full width above selection
-        egui::Rect::from_min_max(screen.min, egui::pos2(screen.max.x, c.min.y)),
-        // Bottom band spanning full width below selection
-        egui::Rect::from_min_max(egui::pos2(screen.min.x, c.max.y), screen.max),
-        // Left flank between top and bottom bands
-        egui::Rect::from_min_max(
-            egui::pos2(screen.min.x, c.min.y),
-            egui::pos2(c.min.x, c.max.y),
-        ),
-        // Right flank between top and bottom bands
-        egui::Rect::from_min_max(
-            egui::pos2(c.max.x, c.min.y),
-            egui::pos2(screen.max.x, c.max.y),
-        ),
-    ];
-
-    candidates
-        .into_iter()
-        .filter(|r| r.width() > 0.0 && r.height() > 0.0)
-        .collect()
-}
-
 /// Position the live `<W> × <H> px · <X>, <Y>` badge near the selection without clipping off-screen.
 pub fn clamp_badge_position(
     selection: egui::Rect,
@@ -541,7 +509,7 @@ fn paint_coordinate_badge(
     );
 }
 
-/// Render the fullscreen dimmed region-selection viewport and process pointer/keyboard input.
+/// Render the fullscreen transparent region-selection viewport and process pointer/keyboard input.
 pub fn render_region_selector_ui(
     ui: &mut egui::Ui,
     state: &mut RegionSelectorState,
@@ -614,10 +582,11 @@ pub fn render_region_selector_ui(
         .map(|rect| rect.intersect(screen))
         .filter(|rect| rect.width() > 0.0 && rect.height() > 0.0);
 
-    for strip in dimmed_backdrop_rects(screen, cutout) {
-        painter.rect_filled(strip, egui::CornerRadius::ZERO, dim_overlay_color());
-    }
-
+    // Fully transparent: no dimming veil — the desktop/video underneath
+    // stays visible so the user can align the selection exactly. Only
+    // the selection border, the coordinate badge, and the prompt pill
+    // are painted.
+    //
     if let Some(sel_rect) = cutout {
         paint_dashed_selection_border(painter, sel_rect);
         if let Some(preview) = state.physical_preview() {
@@ -632,11 +601,10 @@ pub fn render_region_selector_ui(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_region_viewport_builder, clamp_badge_position, dim_overlay_color,
-        dimmed_backdrop_rects, logical_drag_to_physical_preview, logical_drag_to_physical_region,
-        render_region_selector_ui, select_active_monitor_index, PhysicalSelectionPreview,
-        RegionSelectorEvent, RegionSelectorOutcome, RegionSelectorState, REGION_PROMPT_TITLE,
-        SELECTION_BORDER_COLOR,
+        build_region_viewport_builder, clamp_badge_position, logical_drag_to_physical_preview,
+        logical_drag_to_physical_region, render_region_selector_ui, select_active_monitor_index,
+        PhysicalSelectionPreview, RegionSelectorEvent, RegionSelectorOutcome, RegionSelectorState,
+        REGION_PROMPT_TITLE, SELECTION_BORDER_COLOR,
     };
     use crate::capture::{CaptureError, MonitorInfo};
     use crate::config::{CaptureRegion, WindowPosition};
@@ -899,30 +867,6 @@ mod tests {
     }
 
     #[test]
-    fn dimmed_backdrop_rects_leave_selection_interior_completely_clear() {
-        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1920.0, 1080.0));
-        assert_eq!(dimmed_backdrop_rects(screen, None), vec![screen]);
-
-        let cutout = egui::Rect::from_min_max(egui::pos2(300.0, 820.0), egui::pos2(1500.0, 920.0));
-        let strips = dimmed_backdrop_rects(screen, Some(cutout));
-        assert_eq!(strips.len(), 4);
-
-        let mut total_area = 0.0f32;
-        for strip in &strips {
-            assert!(
-                !strip.intersects(cutout.shrink(0.5)),
-                "dimmed strip {strip:?} must not overlap cutout {cutout:?}"
-            );
-            total_area += strip.area();
-        }
-        let expected_area = screen.area() - cutout.area();
-        assert!(
-            (total_area - expected_area).abs() < 0.5,
-            "strip area {total_area} must equal screen - cutout ({expected_area})"
-        );
-    }
-
-    #[test]
     fn select_active_monitor_and_cycle_monitor_handle_multi_monitor_layouts() {
         let monitors = vec![
             make_monitor(r"\\.\DISPLAY2", -1920, 0, 1920, 1080, 1.0, false),
@@ -998,7 +942,7 @@ mod tests {
     }
 
     #[test]
-    fn render_region_selector_ui_draws_dimmed_cutout_red_dashed_box_and_handles_esc_cancel() {
+    fn render_region_selector_ui_draws_transparent_red_dashed_box_and_handles_esc_cancel() {
         let mon = make_monitor(r"\\.\DISPLAY1", 0, 0, 1920, 1080, 1.0, true);
         let mut state = match RegionSelectorState::new(vec![mon], 0) {
             Ok(s) => s,
@@ -1039,12 +983,15 @@ mod tests {
             )),
             "expected red #EF4444 dashed border LineSegment shapes during drag"
         );
+        // Fully transparent: the old dim veil color (rgba 8,10,14,150)
+        // must never be painted — the desktop/video underneath stays visible.
         assert!(
-            all_shapes.iter().any(|s| matches!(
+            !all_shapes.iter().any(|s| matches!(
                 s,
-                egui::Shape::Rect(r) if r.fill == dim_overlay_color()
+                egui::Shape::Rect(r) if r.fill
+                    == egui::Color32::from_rgba_unmultiplied(8, 10, 14, 150)
             )),
-            "expected dimmed backdrop Rect shapes around selection cut-out"
+            "no dimmed backdrop Rect shapes may be painted"
         );
         let _ = CaptureError::MonitorUnavailable {
             monitor_id: REGION_PROMPT_TITLE.to_string(),

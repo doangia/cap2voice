@@ -4,6 +4,7 @@
 use crate::config::{AppConfig, CaptureRegion, WindowPosition};
 use crate::pipeline::{PipelineErrorKind, PipelineSnapshot, PipelineStatus};
 use crate::ui::fonts::{opacity_to_alpha, parse_hex_color};
+use crate::ui::icons::{IconButton, UiIcon};
 use eframe::egui;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -12,6 +13,20 @@ use thiserror::Error;
 /// Height grew from 178 to 204 in D2 to fit the pinyin line above the
 /// Chinese line (pinyin ~18 px + spacing).
 pub const DEFAULT_OVERLAY_SIZE: [f32; 2] = [620.0, 204.0];
+
+/// Minimum overlay window size (also the viewport `min_inner_size`).
+pub const OVERLAY_MIN_SIZE: [f32; 2] = [460.0, 140.0];
+
+/// Maximum overlay window size for the resize grip.
+pub const OVERLAY_MAX_SIZE: [f32; 2] = [1200.0, 600.0];
+
+/// Clamp a resize-grip target size to the allowed overlay bounds.
+pub fn clamp_overlay_resize(size: [f32; 2]) -> [f32; 2] {
+    [
+        size[0].clamp(OVERLAY_MIN_SIZE[0], OVERLAY_MAX_SIZE[0]),
+        size[1].clamp(OVERLAY_MIN_SIZE[1], OVERLAY_MAX_SIZE[1]),
+    ]
+}
 
 /// Chinese subtitle line scale factor relative to `base_font_size_px` (`docs/spec.md` §3.5).
 pub const CHINESE_FONT_SCALE: f32 = 1.35;
@@ -302,14 +317,36 @@ pub fn apply_exclude_from_capture_hwnd(hwnd: isize) -> Result<(), DisplayAffinit
     }
 }
 
-fn action_button(text: &str) -> egui::Button<'_> {
-    egui::Button::new(egui::RichText::new(text).size(13.0))
-        .corner_radius(egui::CornerRadius::same(8))
-        .fill(egui::Color32::from_rgba_unmultiplied(40, 44, 52, 220))
-        .stroke(egui::Stroke::new(
-            1.0,
-            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 28),
-        ))
+/// Apply `SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)` to a
+/// window found by exact title (used for the in-place subtitle viewport,
+/// whose raw handle is not exposed to the `eframe` app code).
+pub fn apply_exclude_from_capture_by_title(title: &str) -> Result<(), DisplayAffinityError> {
+    if title.is_empty() {
+        return Err(DisplayAffinityError::MissingHwnd);
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::GetLastError;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            FindWindowW, SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE,
+        };
+        let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+        let hwnd = unsafe { FindWindowW(std::ptr::null(), wide.as_ptr()) };
+        if hwnd.is_null() {
+            return Err(DisplayAffinityError::MissingHwnd);
+        }
+        let ok = unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) };
+        if ok == 0 {
+            let code = unsafe { GetLastError() };
+            return Err(DisplayAffinityError::Win32 { code });
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = title;
+        Err(DisplayAffinityError::UnsupportedPlatform)
+    }
 }
 
 fn render_inline_info_panels(ui: &mut egui::Ui, state: &mut OverlayState, config: &AppConfig) {
@@ -339,7 +376,11 @@ fn render_inline_info_panels(ui: &mut egui::Ui, state: &mut OverlayState, config
                             .size(12.0)
                             .color(egui::Color32::from_rgb(226, 232, 240)),
                     );
-                    if ui.small_button("Đóng").clicked() {
+                    if ui
+                        .add(IconButton::small(UiIcon::Close))
+                        .on_hover_text("Đóng")
+                        .clicked()
+                    {
                         state.region_panel_open = false;
                     }
                 });
@@ -371,7 +412,11 @@ fn render_inline_info_panels(ui: &mut egui::Ui, state: &mut OverlayState, config
                             .size(12.0)
                             .color(egui::Color32::from_rgb(203, 213, 225)),
                     );
-                    if ui.small_button("Đóng").clicked() {
+                    if ui
+                        .add(IconButton::small(UiIcon::Close))
+                        .on_hover_text("Đóng")
+                        .clicked()
+                    {
                         state.settings_panel_open = false;
                     }
                 });
@@ -425,13 +470,17 @@ pub fn render_overlay_ui(
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
-                        .add(action_button("×"))
-                        .on_hover_text("Đóng cửa sổ")
+                        .add(IconButton::new(UiIcon::Close))
+                        .on_hover_text("Đóng")
                         .clicked()
                     {
                         commands.push(OverlayCommand::CloseWindow);
                     }
-                    if ui.add(action_button("Cài đặt")).clicked() {
+                    if ui
+                        .add(IconButton::new(UiIcon::Settings))
+                        .on_hover_text("Cài đặt")
+                        .clicked()
+                    {
                         commands.push(OverlayCommand::ToggleSettingsPanel);
                     }
                     let gap = ui.available_size();
@@ -578,32 +627,42 @@ pub fn render_overlay_ui(
             );
             ui.add_space(8.0);
 
-            // Bottom action bar: Chọn vùng | Bắt đầu | Dừng | Mute | Voice dropdown.
+            // Bottom action bar (icon buttons + tooltips): region | start | stop | mute | voice dropdown.
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
 
-                if ui.add(action_button("Chọn vùng")).clicked() {
+                if ui
+                    .add(IconButton::new(UiIcon::Region))
+                    .on_hover_text("Chọn vùng")
+                    .clicked()
+                {
                     commands.push(OverlayCommand::ToggleRegionPanel);
                 }
                 if ui
-                    .add_enabled(state.can_start(), action_button("Bắt đầu"))
+                    .add_enabled(state.can_start(), IconButton::new(UiIcon::Play))
+                    .on_hover_text("Bắt đầu")
                     .clicked()
                 {
                     commands.push(OverlayCommand::StartPipeline);
                 }
                 if ui
-                    .add_enabled(state.can_stop(), action_button("Dừng"))
+                    .add_enabled(state.can_stop(), IconButton::new(UiIcon::Stop))
+                    .on_hover_text("Dừng")
                     .clicked()
                 {
                     commands.push(OverlayCommand::StopPipeline);
                 }
 
-                let mute_label = if state.muted {
-                    "Bật tiếng"
+                let (mute_icon, mute_tip) = if state.muted {
+                    (UiIcon::SpeakerMuted, "Bật tiếng")
                 } else {
-                    "Tắt tiếng"
+                    (UiIcon::Speaker, "Tắt tiếng")
                 };
-                if ui.add(action_button(mute_label)).clicked() {
+                if ui
+                    .add(IconButton::new(mute_icon))
+                    .on_hover_text(mute_tip)
+                    .clicked()
+                {
                     commands.push(OverlayCommand::ToggleMute);
                 }
 
@@ -630,6 +689,39 @@ pub fn render_overlay_ui(
                     commands.push(OverlayCommand::SelectVoice(pending_voice));
                 }
             });
+
+            // Bottom-right resize grip: the borderless window has no
+            // native resize border to grab, so dragging this grip
+            // resizes the window (clamped to the overlay bounds).
+            ui.add_space(4.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                let (grip_rect, grip_resp) =
+                    ui.allocate_exact_size(egui::vec2(20.0, 14.0), egui::Sense::drag());
+                let grip_stroke = egui::Stroke::new(
+                    1.5,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70),
+                );
+                for i in 0..3 {
+                    let off = i as f32 * 5.0;
+                    ui.painter().line_segment(
+                        [
+                            egui::pos2(grip_rect.right() - off - 8.0, grip_rect.bottom() - 2.0),
+                            egui::pos2(grip_rect.right() - 2.0, grip_rect.bottom() - off - 8.0),
+                        ],
+                        grip_stroke,
+                    );
+                }
+                let grip_resp = grip_resp.on_hover_text("Kéo để thay đổi kích thước cửa sổ");
+                if grip_resp.dragged() {
+                    let delta = ui.input(|i| i.pointer.delta());
+                    if let Some(outer) = ui.input(|i| i.viewport().outer_rect) {
+                        let cur = outer.size();
+                        let next = clamp_overlay_resize([cur.x + delta.x, cur.y + delta.y]);
+                        ui.ctx()
+                            .send_viewport_cmd(egui::ViewportCommand::InnerSize(next.into()));
+                    }
+                }
+            });
         });
 
     if start_drag {
@@ -642,8 +734,8 @@ pub fn render_overlay_ui(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_exclude_from_capture_hwnd, overlay_overlaps_region, DisplayAffinityError,
-        OverlayState, PositionTracker, ServerUiStatus,
+        apply_exclude_from_capture_hwnd, clamp_overlay_resize, overlay_overlaps_region,
+        DisplayAffinityError, OverlayState, PositionTracker, ServerUiStatus,
     };
     use crate::config::{AppConfig, CaptureRegion, WindowPosition};
     use crate::pipeline::{
@@ -863,6 +955,16 @@ mod tests {
             metrics: PipelineMetrics::default(),
         });
         assert_eq!(state.pinyin_line, "");
+    }
+
+    #[test]
+    fn clamp_overlay_resize_keeps_size_within_min_max_bounds() {
+        assert_eq!(clamp_overlay_resize([620.0, 204.0]), [620.0, 204.0]);
+        assert_eq!(clamp_overlay_resize([100.0, 50.0]), [460.0, 140.0]);
+        assert_eq!(clamp_overlay_resize([5000.0, 2000.0]), [1200.0, 600.0]);
+        assert_eq!(clamp_overlay_resize([460.0, 140.0]), [460.0, 140.0]);
+        assert_eq!(clamp_overlay_resize([1200.0, 600.0]), [1200.0, 600.0]);
+        assert_eq!(clamp_overlay_resize([300.0, 300.0]), [460.0, 300.0]);
     }
 
     #[test]

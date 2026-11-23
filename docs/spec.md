@@ -90,8 +90,8 @@ Reference mockup: `docs/mockups/media-generation-region-select-*.webp`.
 
 - **Region Selector UX:**
   - Triggered from the overlay (`Chọn vùng`), Settings (`Chọn lại vùng`), or hotkey.
-  - Displays a fullscreen translucent dimmed overlay covering the active display (or virtual desktop across monitors) with a top-center pill prompt: `"Kéo chuột để chọn vùng phụ đề"` and secondary hint `"Nhấn Esc để huỷ"`.
-  - Dragging with the left mouse button draws a dashed red rectangle (`#EF4444`) whose interior remains clear/undimmed so the user can align directly over the burned-in subtitle text.
+  - Displays a fullscreen fully transparent window covering the active display (or virtual desktop across monitors) with a top-center pill prompt: `"Kéo chuột để chọn vùng phụ đề"` and secondary hint `"Nhấn Esc để huỷ"`. Nothing is dimmed: the desktop/video underneath stays fully visible so the user can align the selection exactly over the burned-in subtitle text.
+  - Dragging with the left mouse button draws a dashed red rectangle (`#EF4444`); only the rectangle border, the live coordinate badge, and the top prompt pill are painted — everything else in the window is fully transparent.
   - A live dark badge near the selection corner displays physical pixel size and origin coordinates (e.g., `1280 × 60 px · 420, 1020`).
   - Releasing the mouse saves the region if width ≥ `20 px` and height ≥ `16 px`; smaller accidental clicks are rejected with a brief hint and do not overwrite the existing region.
   - Pressing `Esc` or right-clicking cancels selection and restores the previous saved region.
@@ -103,7 +103,7 @@ Reference mockup: `docs/mockups/media-generation-region-select-*.webp`.
   - When capture starts (`Bắt đầu`), the first captured frame always bypasses the pixel-diff gate so an already-visible subtitle is recognized immediately.
 
 **Acceptance Criteria:**
-- `AC-CAP-1`: Clicking `Chọn vùng` dims the screen, shows `"Kéo chuột để chọn vùng phụ đề"`, draws a red dashed rectangle with clear inner cut-out while dragging, and updates the live `<W> × <H> px · <X>, <Y>` badge.
+- `AC-CAP-1`: Clicking `Chọn vùng` opens a fully transparent fullscreen window (no dimming — the video/desktop underneath stays visible), shows `"Kéo chuột để chọn vùng phụ đề"`, draws a red dashed rectangle while dragging, and updates the live `<W> × <H> px · <X>, <Y>` badge.
 - `AC-CAP-2`: Releasing a drag ≥ `20 × 16 px` persists the physical coordinates to config and displays them in Settings (`Vùng phụ đề`); pressing `Esc` cancels without modifying the previously saved region.
 - `AC-CAP-3`: On a Windows display at `125%` or `150%` DPI scaling, a captured PNG of the selected region matches the visual pixels inside the drawn red box within ±2 px.
 - `AC-CAP-4`: On a paused video frame (static pixels), pixel-diff skips ≥ 99% of frames after the initial frame (zero redundant OCR calls while static).
@@ -203,6 +203,7 @@ Reference mockup: `docs/mockups/media-generation-overlay-main-*.webp`.
 
 - **Window Properties:**
   - Borderless (`with_decorations(false)`), always-on-top (`with_always_on_top()`), transparent window chrome with rounded dark semi-transparent panel (configurable opacity, default `0.85`).
+  - Resizable via the grip at the bottom-right corner (minimum `460 × 140` px, maximum `1200 × 600` px); the layout reflows (subtitle lines wrap, controls stay visible) instead of clipping when the window is resized.
   - Draggable anywhere on empty panel background to reposition freely; last `(x, y)` window position persisted in `config.toml`.
   - **Capture self-exclusion:** Apply Windows `SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)` on Windows 10 2004+ so even if the user drags the overlay over the capture region, `xcap` captures the underlying video rather than the overlay. Also warn if the API call fails and bounding boxes overlap.
 - **Typography & Font Chain:**
@@ -210,22 +211,31 @@ Reference mockup: `docs/mockups/media-generation-overlay-main-*.webp`.
   - Top line: Chinese original text in white (`#FFFFFF`), size = `base_font_size × 1.35` (default ~24 px).
   - Bottom line: Vietnamese translation in green (`#4ADE80`, configurable), size = `base_font_size` (default `18 px`).
   - Both lines wrap cleanly inside the panel width without clipping.
-- **Controls (matching Mockup 1 & `brief.md` §6):**
-  - Compact top header strip (or hoverable corner controls): app status indicator dot + status text (`Đang chờ` / `Đang dịch` / error message), Settings gear button (`Cài đặt`), and Close button (`X` — hides to tray when close-to-tray is enabled).
+- **Controls (matching Mockup 1 & `brief.md` §6):** icon buttons with Vietnamese hover tooltips (vector glyphs, no text labels; the Settings sidebar tabs keep text labels because they are navigation, not actions):
+  - Compact top header strip (or hoverable corner controls): app status indicator dot + status text (`Đang chờ` / `Đang dịch` / error message), Settings gear icon button (tooltip `Cài đặt`), and Close icon button (tooltip `Đóng` — hides to tray when close-to-tray is enabled).
   - Bottom action bar:
-    - `Chọn vùng` button
-    - `Bắt đầu` button (disabled while running; if clicked with no saved region, prompts user to select a region first or opens region selector)
-    - `Dừng` button (disabled while idle)
-    - Speaker mute/unmute icon button
+    - `Chọn vùng` icon button (region icon, tooltip `Chọn vùng`)
+    - `Bắt đầu` icon button (play icon, tooltip `Bắt đầu`; disabled while running; if clicked with no saved region, prompts user to select a region first or opens region selector)
+    - `Dừng` icon button (stop icon, tooltip `Dừng`; disabled while idle)
+    - Speaker mute/unmute icon button (tooltip `Tắt tiếng` / `Bật tiếng`)
     - Voice selector dropdown (`vi-VN-NamMinhNeural` / `vi-VN-HoaiMyNeural`)
+- **In-place subtitle window (optional mode, default OFF):**
+  - Settings → `Hiển thị`: `Hiển thị phụ đề tại vị trí gốc trên video` checkbox (default OFF) + `Độ mờ nền phụ đề tại chỗ` slider (`0%`–`100%`, default `70%`), saved in `config.toml` as `display.inplace_subtitle` / `display.inplace_bg_opacity`.
+  - When ON, an ADDITIONAL separate borderless, fully transparent, click-through window appears exactly over the capture region (position + size = region), showing only the translated subtitle text on a background rectangle of the chosen opacity that covers the original subtitle underneath. The main floating overlay stays visible and usable at all times.
+  - Renders the Vietnamese line (plus the Chinese line above it when `show_chinese_line` is on, plus pinyin when enabled); font size scales down to fit the region height (never larger than `font_size_px`).
+  - Follows the region when the user re-selects it; appears/disappears immediately when toggled (no restart).
+  - The text window is excluded from capture (`WDA_EXCLUDEFROMCAPTURE`) so it never hides the original subtitle from OCR; if WDA fails, a Vietnamese warning is shown in the overlay.
+  - When OFF, the text window is hidden and everything behaves as before.
 
 **Acceptance Criteria:**
 - `AC-UI-1`: Overlay floats borderless and always-on-top over both a local media player (e.g. VLC/MPV) and a maximized browser video (e.g. Chrome/Edge on Bilibili/YouTube).
 - `AC-UI-2`: Chinese line renders in white above Vietnamese line in green; verified visually via real-PC screenshot with mixed Chinese + Vietnamese diacritics (e.g. `"夜深了，雨还在下。"` / `"Đêm đã khuya, mưa vẫn còn rơi."`) showing zero missing-glyph tofu boxes.
 - `AC-UI-3`: Dragging the overlay moves it smoothly and persists its coordinates across app restarts.
-- `AC-UI-4`: All 5 control-bar elements (`Chọn vùng`, `Bắt đầu`, `Dừng`, speaker mute button, voice dropdown) plus `Cài đặt` and `X` work as specified and reflect live running/muted/voice state.
+- `AC-UI-4`: All 5 control-bar elements (`Chọn vùng`, `Bắt đầu`, `Dừng` icon buttons, speaker mute icon button, voice dropdown) plus the `Cài đặt` gear and `Đóng` icon buttons work as specified and reflect live running/muted/voice state; every icon button shows a Vietnamese tooltip on hover.
 - `AC-UI-5`: Network, engine, or OCR errors render visibly inside the overlay status banner in Vietnamese and clear automatically once a subsequent request succeeds.
 - `AC-UI-6`: Placing the overlay partially over the captured subtitle region does not cause an OCR feedback loop (verified via `WDA_EXCLUDEFROMCAPTURE` on Windows 10/11).
+- `AC-UI-7` (in-place mode): With the mode ON, a separate transparent window sits exactly over the capture region (window rect == region rect) showing the translated line on the chosen-opacity background while the main overlay stays visible and usable; toggling OFF hides the text window immediately; re-selecting the region moves the text window to the new region.
+- `AC-UI-8` (resizable overlay): Dragging the bottom-right grip changes the overlay window width/height within `460 × 140` – `1200 × 600` px and the layout reflows without clipping buttons or subtitle lines.
 
 ---
 
@@ -238,8 +248,8 @@ Reference mockup: `docs/mockups/media-generation-settings-tray-*.webp`.
   - Left navigation sidebar with 5 sections (exact labels from `AGENTS.md` and Mockup 3):
     1. `Chung` (General):
        - `Tốc độ chụp` dropdown (`5 khung/giây`, `10 khung/giây` default, `15 khung/giây`)
-       - `Vùng phụ đề` summary (`<x>, <y> · <w> × <h> px` or `"Chưa chọn vùng"`) + `Chọn lại vùng` button
-       - WeChat OCR paths (`wxocr.dll` & Weixin directory — auto-detected status + editable path inputs)
+       - `Vùng phụ đề` summary (`<x>, <y> · <w> × <h> px` or `"Chưa chọn vùng"`) + `Chọn lại vùng` icon button (tooltip `Chọn lại vùng`)
+       - WeChat OCR paths (`wxocr.dll` & Weixin directory — auto-detected status + editable path inputs) + `Kiểm tra WeChat OCR` icon button (tooltip `Kiểm tra WeChat OCR`)
        - Subtitle log directory + enable logging toggle (default ON)
        - Checkbox: `Ẩn xuống khay hệ thống khi đóng cửa sổ` (default checked)
        - Checkbox: `Khởi động cùng Windows` (default unchecked)
@@ -253,11 +263,12 @@ Reference mockup: `docs/mockups/media-generation-settings-tray-*.webp`.
        - `Âm lượng` slider (`0%`–`100%`, default `75%`)
        - Speech rate selector (`-20%`, `-10%`, `0% (Mặc định)`, `+10%`, `+20%`)
        - Toggle: `Tự động đọc phụ đề` (default ON)
-       - `Nghe thử` button (plays a short Vietnamese sample sentence via native Edge-TTS)
+       - `Nghe thử` icon button (tooltip `Nghe thử`, plays a short Vietnamese sample sentence via native Edge-TTS)
     4. `Hiển thị` (Display):
        - `Cỡ chữ phụ đề` slider (`12 px`–`40 px`, default `18 px`)
        - Overlay background opacity slider (`30%`–`100%`, default `85%`)
        - Toggles: show Chinese line (default ON), show Vietnamese line (default ON), always-on-top (default ON)
+       - In-place subtitle mode: `Hiển thị phụ đề tại vị trí gốc trên video` checkbox (default OFF) + `Độ mờ nền phụ đề tại chỗ` slider (`0%`–`100%`, default `70%`); see §3.5
        - Text color pickers/presets (defaults: Chinese `#FFFFFF`, Vietnamese `#4ADE80`)
     5. `Phím tắt` (Hotkeys):
        - Configurable global shortcuts with defaults:
@@ -265,8 +276,8 @@ Reference mockup: `docs/mockups/media-generation-settings-tray-*.webp`.
          - Select region: `Ctrl+Alt+R`
          - Show / Hide overlay: `Ctrl+Alt+H`
          - Mute / Unmute TTS: `Ctrl+Alt+M`
-       - `Khôi phục mặc định` button to reset hotkeys.
-  - Footer buttons: `Huỷ` (discards unsaved draft edits and closes Settings) and `Lưu thay đổi` (validates, saves atomically to `%APPDATA%\cap2voice\config.toml`, applies live to running app).
+       - `Khôi phục mặc định` icon button (tooltip `Khôi phục mặc định`) to reset hotkeys.
+  - Footer buttons: `Huỷ` icon button (tooltip `Huỷ`, discards unsaved draft edits and closes Settings) and `Lưu thay đổi` icon button (tooltip `Lưu thay đổi`, validates, saves atomically to `%APPDATA%\cap2voice\config.toml`, applies live to running app).
 - **Persistence & Safety:**
   - Config stored at `%APPDATA%\cap2voice\config.toml` via atomic temp-file + rename write.
   - On corrupt/invalid TOML at startup: report the parse error visibly in UI, preserve the broken file by copying to `config.toml.bak`, and load explicit documented defaults only after alerting the user — never silently wipe user config.

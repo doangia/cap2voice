@@ -5,6 +5,8 @@ pub mod commands;
 pub mod fonts;
 pub mod hotkeys;
 pub mod icon;
+pub mod icons;
+pub mod inplace;
 pub mod overlay;
 pub mod pipeline;
 pub mod region;
@@ -14,7 +16,7 @@ pub mod tray;
 use crate::api::TtsError;
 use crate::audio::AudioPlayback;
 use crate::capture::{FrameCapturer, XcapCapturer};
-use crate::config::{AppConfig, WindowPosition};
+use crate::config::{AppConfig, CaptureRegion, WindowPosition};
 use crate::ocr::OcrEngine;
 use crate::pipeline::{PipelineHandle, PipelineSnapshot, TranslationCache, TtsCache};
 use crate::translate::SwitchableTranslator;
@@ -27,8 +29,13 @@ pub(crate) use commands::RegionSelectionTarget;
 use eframe::egui;
 use global_hotkey::GlobalHotKeyEvent;
 use hotkeys::HotkeyManager;
+use inplace::{
+    build_inplace_viewport_builder, inplace_viewport_id, region_logical_rect_with_monitors,
+    render_inplace_subtitle_ui, INPLACE_WINDOW_TITLE,
+};
 use overlay::{
-    render_overlay_ui, OverlayState, PositionTracker, ServerUiStatus, POSITION_SAVE_DEBOUNCE,
+    apply_exclude_from_capture_by_title, render_overlay_ui, OverlayState, PositionTracker,
+    ServerUiStatus, POSITION_SAVE_DEBOUNCE,
 };
 pub(crate) use pipeline::TtsPreviewAudio;
 #[cfg(test)]
@@ -69,6 +76,18 @@ pub struct Cap2VoiceApp {
     region_selector: Option<RegionSelectorState>,
     region_selector_focused: bool,
     region_selection_target: RegionSelectionTarget,
+    /// Capture region the cached in-place viewport rect was computed
+    /// from; a region change (re-select) recomputes the rect so the
+    /// text window follows the new region.
+    inplace_rect_source: Option<CaptureRegion>,
+    /// Cached logical (position, size) of the in-place subtitle
+    /// viewport, equal to the capture region in logical coordinates.
+    inplace_viewport_rect: Option<(egui::Pos2, egui::Vec2)>,
+    /// Whether `WDA_EXCLUDEFROMCAPTURE` was already attempted on the
+    /// in-place subtitle window (once per app run).
+    inplace_wda_attempted: bool,
+    /// WDA failure detail for the in-place window (shown as a notice).
+    inplace_wda_error: Option<String>,
     settings_draft: Option<SettingsDraftState>,
     settings_focused: bool,
     tts_preview_rx: Option<mpsc::Receiver<Result<TtsPreviewAudio, TtsError>>>,
@@ -276,6 +295,10 @@ impl Cap2VoiceApp {
             region_selector: None,
             region_selector_focused: false,
             region_selection_target: RegionSelectionTarget::LiveConfig,
+            inplace_rect_source: None,
+            inplace_viewport_rect: None,
+            inplace_wda_attempted: false,
+            inplace_wda_error: None,
             settings_draft: None,
             settings_focused: false,
             tts_preview_rx: None,
@@ -300,6 +323,27 @@ impl Cap2VoiceApp {
             overlay_visible: !start_minimized_to_tray,
             last_tray_running_state: None,
         }
+    }
+
+    /// Logical (position, size) of the in-place subtitle viewport for
+    /// the current capture region, recomputed when the region changes
+    /// (re-select) so the text window follows it. Returns `None` when
+    /// no region is set. The `bool` is `true` when the rect was just
+    /// recomputed (the caller then moves/resizes the live viewport).
+    fn refresh_inplace_rect(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> Option<((egui::Pos2, egui::Vec2), bool)> {
+        let region = self.config.general.region.clone()?;
+        if self.inplace_rect_source.as_ref() == Some(&region) {
+            return self.inplace_viewport_rect.map(|rect| (rect, false));
+        }
+        let fallback = ctx.pixels_per_point();
+        let monitors = self.capturer.list_monitors().unwrap_or_default();
+        let rect = region_logical_rect_with_monitors(&region, &monitors, fallback);
+        self.inplace_rect_source = Some(region);
+        self.inplace_viewport_rect = Some(rect);
+        Some((rect, true))
     }
 }
 
@@ -342,6 +386,10 @@ impl eframe::App for Cap2VoiceApp {
             .and_then(RegionSelectorState::active_monitor)
             .cloned()
         {
+            // The in-place subtitle window is not shown while selecting
+            // a region (immediate viewport closes); re-apply WDA next
+            // time it opens, since that is a new HWND.
+            self.inplace_wda_attempted = false;
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE)
                 .show(ui, |_| {});
@@ -394,6 +442,72 @@ impl eframe::App for Cap2VoiceApp {
                 if let Some(cmd) = settings_cmd {
                     self.handle_settings_command(&ctx, cmd);
                 }
+            }
+
+            // In-place subtitle window (ADDITIONAL, alongside the
+            // floating overlay, which stays visible and usable): a
+            // separate transparent window exactly over the capture
+            // region, showing only the translated subtitle text on its
+            // adjustable-opacity background. Hidden while the region
+            // selector is open (we are in the `else` branch here) and
+            // whenever the mode is off.
+            let mut inplace_shown = false;
+            if self.config.display.inplace_subtitle {
+                if let Some(((pos, size), rect_changed)) = self.refresh_inplace_rect(&ctx) {
+                    inplace_shown = true;
+                    ctx.show_viewport_immediate(
+                        inplace_viewport_id(),
+                        build_inplace_viewport_builder(pos, size),
+                        |viewport_ui, _class| {
+                            if !self.inplace_wda_attempted {
+                                self.inplace_wda_attempted = true;
+                                match apply_exclude_from_capture_by_title(INPLACE_WINDOW_TITLE) {
+                                    Ok(()) => {
+                                        self.inplace_wda_error = None;
+                                    }
+                                    Err(err) => {
+                                        self.inplace_wda_error = Some(err.to_string());
+                                        // Without WDA the background
+                                        // rectangle sits on the capture
+                                        // region and hides the original
+                                        // subtitle from OCR, stalling
+                                        // the pipeline on the old line.
+                                        if self.state.ui_notice.is_none() {
+                                            self.state.ui_notice = Some(format!(
+                                                "Cảnh báo: không loại được cửa sổ phụ đề tại chỗ khỏi capture ({err}); phụ đề gốc có thể bị che khỏi OCR."
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            if rect_changed {
+                                viewport_ui
+                                    .ctx()
+                                    .send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+                                viewport_ui
+                                    .ctx()
+                                    .send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                            }
+                            egui::CentralPanel::default()
+                                .frame(egui::Frame::NONE)
+                                .show(viewport_ui, |inner_ui| {
+                                    render_inplace_subtitle_ui(
+                                        inner_ui,
+                                        &self.state.pipeline.chinese_line,
+                                        &self.state.pinyin_line,
+                                        &self.state.pipeline.vietnamese_line,
+                                        &self.config,
+                                    );
+                                });
+                        },
+                    );
+                }
+            }
+            if !inplace_shown {
+                // The window is closed when not shown (immediate
+                // viewport); re-apply WDA next time it opens, since
+                // the reopened window is a new HWND.
+                self.inplace_wda_attempted = false;
             }
 
             let commands = egui::CentralPanel::default()

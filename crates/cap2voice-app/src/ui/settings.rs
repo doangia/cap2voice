@@ -5,6 +5,7 @@ use crate::config::{AppConfig, CaptureRegion, HotkeyConfig};
 use crate::ocr::{resolve_wechat_paths_from_config, WeChatOcrPaths};
 use crate::translate::{TranslationEngine, TranslatorStatus};
 use crate::ui::fonts::parse_hex_color;
+use crate::ui::icons::{IconButton, UiIcon};
 use crate::ui::overlay::AVAILABLE_VOICES;
 use eframe::egui;
 use std::path::PathBuf;
@@ -396,7 +397,11 @@ fn render_general_tab(
                         .size(12.5)
                         .color(muted_text_color()),
                 );
-                if ui.button("Chọn lại vùng").clicked() {
+                if ui
+                    .add(IconButton::small(UiIcon::Region))
+                    .on_hover_text("Chọn lại vùng")
+                    .clicked()
+                {
                     *emitted = Some(SettingsCommand::SelectRegion);
                 }
             });
@@ -421,7 +426,11 @@ fn render_general_tab(
 
     ui.add_space(6.0);
     ui.horizontal(|ui| {
-        if ui.small_button("Kiểm tra WeChat OCR").clicked() {
+        if ui
+            .add(IconButton::small(UiIcon::Check))
+            .on_hover_text("Kiểm tra WeChat OCR")
+            .clicked()
+        {
             state.refresh_ocr_status();
         }
         match &state.ocr_paths_status {
@@ -592,7 +601,11 @@ fn render_translation_tab(
 
             ui.label("Bộ nhớ đệm dịch + giọng đọc");
             ui.horizontal(|ui| {
-                if ui.button("Xóa bộ nhớ đệm").clicked() {
+                if ui
+                    .add(IconButton::small(UiIcon::Trash))
+                    .on_hover_text("Xóa bộ nhớ đệm")
+                    .clicked()
+                {
                     *emitted = Some(SettingsCommand::ClearCache);
                 }
                 ui.label(
@@ -676,7 +689,11 @@ fn render_voice_tab(
 
     ui.add_space(10.0);
     ui.horizontal(|ui| {
-        if ui.button("Nghe thử").clicked() {
+        if ui
+            .add(IconButton::new(UiIcon::Play))
+            .on_hover_text("Nghe thử")
+            .clicked()
+        {
             *emitted = Some(SettingsCommand::PreviewVoice {
                 voice: state.draft.voice.voice.clone(),
                 rate: state.draft.voice.speech_rate.clone(),
@@ -700,7 +717,28 @@ fn render_color_row(
             .rect_filled(swatch_rect, egui::CornerRadius::same(4), preview_color);
         ui.add(egui::TextEdit::singleline(hex_value).desired_width(82.0));
         for (preset_hex, label) in presets {
-            if ui.small_button(*label).clicked() {
+            let is_active = hex_value.eq_ignore_ascii_case(preset_hex);
+            let color = parse_hex_color(preset_hex).unwrap_or(fallback);
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+            ui.painter()
+                .rect_filled(rect, egui::CornerRadius::same(4), color);
+            ui.painter().rect_stroke(
+                rect,
+                egui::CornerRadius::same(4),
+                egui::Stroke::new(
+                    if is_active { 2.0 } else { 1.0 },
+                    if is_active {
+                        egui::Color32::WHITE
+                    } else {
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70)
+                    },
+                ),
+                egui::StrokeKind::Inside,
+            );
+            if resp
+                .on_hover_text(format!("{label}: {preset_hex}"))
+                .clicked()
+            {
                 *hex_value = (*preset_hex).to_string();
             }
         }
@@ -770,6 +808,29 @@ fn render_display_tab(ui: &mut egui::Ui, state: &mut SettingsDraftState) {
         &mut state.draft.display.always_on_top,
         "Luôn hiển thị overlay trên cùng",
     );
+
+    ui.add_space(10.0);
+    ui.checkbox(
+        &mut state.draft.display.inplace_subtitle,
+        "Hiển thị phụ đề tại vị trí gốc trên video",
+    );
+    ui.add_enabled_ui(state.draft.display.inplace_subtitle, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Độ mờ nền phụ đề tại chỗ");
+            let mut opacity_pct = (state.draft.display.inplace_bg_opacity * 100.0).round();
+            if ui
+                .add(
+                    egui::Slider::new(&mut opacity_pct, 0.0..=100.0)
+                        .fixed_decimals(0)
+                        .suffix("%"),
+                )
+                .on_hover_text("Độ mờ của nền che phụ đề gốc (0% = trong suốt)")
+                .changed()
+            {
+                state.draft.display.inplace_bg_opacity = (opacity_pct / 100.0).clamp(0.0, 1.0);
+            }
+        });
+    });
 
     ui.add_space(10.0);
     let alpha = (state.draft.display.overlay_opacity.clamp(0.30, 1.0) * 255.0).round() as u8;
@@ -846,7 +907,11 @@ fn render_hotkeys_tab(ui: &mut egui::Ui, state: &mut SettingsDraftState) {
         });
 
     ui.add_space(12.0);
-    if ui.button("Khôi phục mặc định").clicked() {
+    if ui
+        .add(IconButton::new(UiIcon::Reset))
+        .on_hover_text("Khôi phục mặc định")
+        .clicked()
+    {
         state.reset_hotkeys_to_default();
     }
 }
@@ -931,25 +996,21 @@ pub fn render_settings_ui(
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let save_btn = egui::Button::new(
-                        egui::RichText::new("Lưu thay đổi")
-                            .size(13.5)
-                            .color(egui::Color32::WHITE),
-                    )
-                    .fill(accent_blue_color())
-                    .corner_radius(egui::CornerRadius::same(7))
-                    .min_size(egui::vec2(108.0, 30.0));
-                    if ui.add(save_btn).clicked() {
+                    if ui
+                        .add(IconButton::new(UiIcon::Check).filled(accent_blue_color()))
+                        .on_hover_text("Lưu thay đổi")
+                        .clicked()
+                    {
                         if let Ok(committed) = state.try_commit() {
                             emitted = Some(SettingsCommand::Save(Box::new(committed)));
                         }
                     }
 
-                    let cancel_btn = egui::Button::new(egui::RichText::new("Huỷ").size(13.5))
-                        .fill(egui::Color32::from_rgb(45, 50, 60))
-                        .corner_radius(egui::CornerRadius::same(7))
-                        .min_size(egui::vec2(72.0, 30.0));
-                    if ui.add(cancel_btn).clicked() {
+                    if ui
+                        .add(IconButton::new(UiIcon::Close))
+                        .on_hover_text("Huỷ")
+                        .clicked()
+                    {
                         emitted = Some(SettingsCommand::Cancel);
                     }
                 });

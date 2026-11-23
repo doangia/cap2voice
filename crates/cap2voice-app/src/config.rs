@@ -119,6 +119,13 @@ pub struct DisplayConfig {
     pub chinese_color_hex: String,
     pub vietnamese_color_hex: String,
     pub overlay_position: Option<WindowPosition>,
+    /// Show the translated subtitle in a separate transparent window
+    /// placed exactly over the capture region, in addition to the
+    /// floating overlay (in-place mode, default OFF).
+    pub inplace_subtitle: bool,
+    /// Background opacity of the in-place subtitle window (`0.0` =
+    /// fully transparent, `1.0` = opaque; default `0.70`).
+    pub inplace_bg_opacity: f32,
 }
 
 impl Default for DisplayConfig {
@@ -133,6 +140,8 @@ impl Default for DisplayConfig {
             chinese_color_hex: "#FFFFFF".to_string(),
             vietnamese_color_hex: "#4ADE80".to_string(),
             overlay_position: None,
+            inplace_subtitle: false,
+            inplace_bg_opacity: 0.70,
         }
     }
 }
@@ -287,6 +296,12 @@ impl AppConfig {
         }
         validate_f32_range("font_size_px", self.display.font_size_px, 12.0, 40.0)?;
         validate_f32_range("overlay_opacity", self.display.overlay_opacity, 0.30, 1.00)?;
+        validate_f32_range(
+            "inplace_bg_opacity",
+            self.display.inplace_bg_opacity,
+            0.0,
+            1.0,
+        )?;
         if !is_valid_hex_color(&self.display.chinese_color_hex) {
             return Err(ConfigError::Validation(format!(
                 "chinese_color_hex must be #RRGGBB (got '{}')",
@@ -351,6 +366,8 @@ mod tests {
         assert!(cfg.display.show_vietnamese_line);
         assert!(cfg.display.show_pinyin_line);
         assert!(cfg.display.always_on_top);
+        assert!(!cfg.display.inplace_subtitle);
+        assert!((cfg.display.inplace_bg_opacity - 0.70).abs() < f32::EPSILON);
         assert_eq!(cfg.display.chinese_color_hex, "#FFFFFF");
         assert_eq!(cfg.display.vietnamese_color_hex, "#4ADE80");
 
@@ -409,6 +426,10 @@ mod tests {
         let mut c = AppConfig::default();
         c.display.overlay_opacity = 0.1;
         cases.push(("opacity below 0.3", c));
+
+        let mut c = AppConfig::default();
+        c.display.inplace_bg_opacity = 1.5;
+        cases.push(("in-place background opacity above 1.0", c));
 
         let mut c = AppConfig::default();
         c.display.chinese_color_hex = "white".to_string();
