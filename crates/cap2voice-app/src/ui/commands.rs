@@ -273,6 +273,12 @@ impl super::Cap2VoiceApp {
     ) {
         self.region_selector = None;
         self.region_selector_focused = false;
+        // Drop the frozen snapshot background (option B) so the ~8 MB
+        // GPU texture is freed, and reset the selector WDA flag so the
+        // next opening applies WDA to its new HWND.
+        self.region_snapshot_texture = None;
+        self.region_snapshot_monitor_id = None;
+        self.region_selector_wda_attempted = false;
         ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(configured_window_level(
             &self.config,

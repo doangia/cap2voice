@@ -6,6 +6,22 @@
 //! and the top instruction pill are painted — so the user can align the
 //! selection exactly over the burned-in subtitle text.
 //!
+//! Transparency, option B (2026-11-24, `docs/spec.md` §3.1): the window
+//! itself is NOT transparent on this PC — eframe/glow fails to create a
+//! transparent window ("Cannot create transparent window: the GL config
+//! does not support it"; the WGL pixel format has no alpha on the AMD
+//! Radeon, and winit 0.30 uses DWM blur-behind, not `WS_EX_LAYERED`).
+//! An earlier color-key attempt made the window transparent but broke
+//! drag-select (click-through) and was reverted. So instead of relying
+//! on the compositor, the selector paints a FROZEN fullscreen snapshot
+//! of the active monitor (captured with the existing `xcap` backend at
+//! selector open, re-taken when the user switches monitors with Tab) as
+//! its background texture. The snapshot is frozen at open time — not a
+//! live feed — which is the intended design: the user aligns the drag
+//! over the video frame as it was when the selector opened. The selector
+//! window is also excluded from screen capture
+//! (`WDA_EXCLUDEFROMCAPTURE`) so it never appears in the app's own
+//! captures.
 
 use crate::capture::{
     resolve_monitor_crop, validate_region_dimensions, CaptureError, MonitorInfo, MIN_REGION_HEIGHT,
@@ -16,6 +32,11 @@ use eframe::egui;
 
 /// Top-center prompt pill title shown over the region selector.
 pub const REGION_PROMPT_TITLE: &str = "Kéo chuột để chọn vùng phụ đề";
+
+/// Title of the region-selector viewport window (used by
+/// `build_region_viewport_builder` and by the `WDA_EXCLUDEFROMCAPTURE`
+/// lookup, which finds the window by title).
+pub const REGION_VIEWPORT_TITLE: &str = "cap2voice - Chọn vùng phụ đề";
 
 /// Secondary cancellation instruction rendered beneath/alongside the prompt pill.
 pub const REGION_PROMPT_HINT: &str = "Nhấn Esc hoặc chuột phải để huỷ";
@@ -312,6 +333,19 @@ pub fn logical_drag_to_physical_region(
     Ok(region)
 }
 
+/// Fullscreen physical `CaptureRegion` covering `monitor` (option-B
+/// snapshot source: the selector background is a frozen capture of the
+/// whole active monitor, taken when the selector opens).
+pub fn fullscreen_region_for_monitor(monitor: &MonitorInfo) -> CaptureRegion {
+    CaptureRegion {
+        monitor_id: monitor.id.clone(),
+        x: monitor.x,
+        y: monitor.y,
+        width: monitor.width,
+        height: monitor.height,
+    }
+}
+
 /// Position the live `<W> × <H> px · <X>, <Y>` badge near the selection without clipping off-screen.
 pub fn clamp_badge_position(
     selection: egui::Rect,
@@ -344,7 +378,7 @@ pub fn build_region_viewport_builder(monitor: &MonitorInfo) -> egui::ViewportBui
     let size = egui::vec2(monitor.width as f32 / scale, monitor.height as f32 / scale);
 
     egui::ViewportBuilder::default()
-        .with_title("cap2voice - Chọn vùng phụ đề")
+        .with_title(REGION_VIEWPORT_TITLE)
         .with_decorations(false)
         .with_transparent(true)
         .with_resizable(false)
@@ -510,9 +544,15 @@ fn paint_coordinate_badge(
 }
 
 /// Render the fullscreen transparent region-selection viewport and process pointer/keyboard input.
+///
+/// `background` is the frozen fullscreen snapshot of the active monitor
+/// (option B, taken when the selector opened), painted over the whole
+/// viewport so the desktop/video underneath appears fully visible. `None`
+/// keeps the previous behavior (opaque black window, no background).
 pub fn render_region_selector_ui(
     ui: &mut egui::Ui,
     state: &mut RegionSelectorState,
+    background: Option<&egui::TextureHandle>,
 ) -> RegionSelectorOutcome {
     let screen = ui.max_rect();
     ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
@@ -577,6 +617,23 @@ pub fn render_region_selector_ui(
     }
 
     let painter = ui.painter();
+
+    // Option-B background: the window itself is opaque black on this PC
+    // (no alpha in the WGL pixel format), so the frozen fullscreen
+    // snapshot of the active monitor is painted as the background — the
+    // desktop/video underneath appears fully visible. The snapshot is in
+    // physical pixels and the viewport is logical points (physical /
+    // scale), so stretching the texture over the whole viewport rect
+    // keeps the same logical-to-physical mapping as the drag math.
+    if let Some(texture) = background {
+        painter.image(
+            texture.id(),
+            screen,
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+    }
+
     let cutout = state
         .selection_rect_logical()
         .map(|rect| rect.intersect(screen))
@@ -585,7 +642,7 @@ pub fn render_region_selector_ui(
     // Fully transparent: no dimming veil — the desktop/video underneath
     // stays visible so the user can align the selection exactly. Only
     // the selection border, the coordinate badge, and the prompt pill
-    // are painted.
+    // are painted on top of the snapshot background.
     //
     if let Some(sel_rect) = cutout {
         paint_dashed_selection_border(painter, sel_rect);
@@ -601,10 +658,11 @@ pub fn render_region_selector_ui(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_region_viewport_builder, clamp_badge_position, logical_drag_to_physical_preview,
-        logical_drag_to_physical_region, render_region_selector_ui, select_active_monitor_index,
-        PhysicalSelectionPreview, RegionSelectorEvent, RegionSelectorOutcome, RegionSelectorState,
-        REGION_PROMPT_TITLE, SELECTION_BORDER_COLOR,
+        build_region_viewport_builder, clamp_badge_position, fullscreen_region_for_monitor,
+        logical_drag_to_physical_preview, logical_drag_to_physical_region,
+        render_region_selector_ui, select_active_monitor_index, PhysicalSelectionPreview,
+        RegionSelectorEvent, RegionSelectorOutcome, RegionSelectorState, REGION_PROMPT_TITLE,
+        SELECTION_BORDER_COLOR,
     };
     use crate::capture::{CaptureError, MonitorInfo};
     use crate::config::{CaptureRegion, WindowPosition};
@@ -942,6 +1000,122 @@ mod tests {
     }
 
     #[test]
+    fn fullscreen_region_for_monitor_covers_monitor_bounds() {
+        let mon = make_monitor(r"\\.\DISPLAY1", 0, 0, 1920, 1080, 1.0, true);
+        assert_eq!(
+            fullscreen_region_for_monitor(&mon),
+            CaptureRegion {
+                monitor_id: r"\\.\DISPLAY1".to_string(),
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            }
+        );
+        let secondary = make_monitor(r"\\.\DISPLAY2", -1920, 100, 1920, 1080, 1.5, false);
+        assert_eq!(
+            fullscreen_region_for_monitor(&secondary),
+            CaptureRegion {
+                monitor_id: r"\\.\DISPLAY2".to_string(),
+                x: -1920,
+                y: 100,
+                width: 1920,
+                height: 1080,
+            }
+        );
+    }
+
+    /// Whether the textured `mesh` quad covers `rect` (within rounding).
+    fn mesh_covers_rect(mesh: &egui::Mesh, rect: egui::Rect) -> bool {
+        if mesh.vertices.is_empty() {
+            return false;
+        }
+        let mut min = egui::Pos2::new(f32::INFINITY, f32::INFINITY);
+        let mut max = egui::Pos2::new(f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for v in &mesh.vertices {
+            min.x = min.x.min(v.pos.x);
+            min.y = min.y.min(v.pos.y);
+            max.x = max.x.max(v.pos.x);
+            max.y = max.y.max(v.pos.y);
+        }
+        (min.x - rect.left()).abs() < 0.01
+            && (min.y - rect.top()).abs() < 0.01
+            && (max.x - rect.right()).abs() < 0.01
+            && (max.y - rect.bottom()).abs() < 0.01
+    }
+
+    #[test]
+    fn render_region_selector_ui_paints_snapshot_background_fullscreen() {
+        let mon = make_monitor(r"\\.\DISPLAY1", 0, 0, 1920, 1080, 1.0, true);
+        let mut state = match RegionSelectorState::new(vec![mon], 0) {
+            Ok(s) => s,
+            Err(err) => panic!("expected state init to succeed: {err}"),
+        };
+        let ctx = egui::Context::default();
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
+        let texture = ctx.load_texture(
+            "test_snapshot",
+            egui::ColorImage::new([4, 4], vec![egui::Color32::RED; 16]),
+            egui::TextureOptions::NEAREST,
+        );
+
+        let full_output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |ui| {
+                let outcome = render_region_selector_ui(ui, &mut state, Some(&texture));
+                assert_eq!(outcome, RegionSelectorOutcome::Pending);
+            },
+        );
+        let mut all_shapes = Vec::new();
+        for clipped in &full_output.shapes {
+            collect_shapes_recursive(&clipped.shape, &mut all_shapes);
+        }
+        // egui 0.35 has no `Shape::Image`: `Painter::image` emits a
+        // textured `Shape::Mesh` quad, so assert on the mesh.
+        assert!(
+            all_shapes.iter().any(|s| matches!(
+                s,
+                egui::Shape::Mesh(mesh) if mesh.texture_id == texture.id()
+                    && mesh_covers_rect(mesh, screen_rect)
+            )),
+            "expected a fullscreen snapshot mesh covering the viewport"
+        );
+
+        // No background: no Image shape at all.
+        let mut state_no_bg = match RegionSelectorState::new(
+            vec![make_monitor(r"\\.\DISPLAY1", 0, 0, 1920, 1080, 1.0, true)],
+            0,
+        ) {
+            Ok(s) => s,
+            Err(err) => panic!("expected state init to succeed: {err}"),
+        };
+        let no_bg_output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |ui| {
+                let outcome = render_region_selector_ui(ui, &mut state_no_bg, None);
+                assert_eq!(outcome, RegionSelectorOutcome::Pending);
+            },
+        );
+        let mut no_bg_shapes = Vec::new();
+        for clipped in &no_bg_output.shapes {
+            collect_shapes_recursive(&clipped.shape, &mut no_bg_shapes);
+        }
+        assert!(
+            !no_bg_shapes.iter().any(|s| matches!(
+                s,
+                egui::Shape::Mesh(mesh) if mesh.texture_id == texture.id()
+            )),
+            "no snapshot mesh may be painted without a snapshot background"
+        );
+    }
+
+    #[test]
     fn render_region_selector_ui_draws_transparent_red_dashed_box_and_handles_esc_cancel() {
         let mon = make_monitor(r"\\.\DISPLAY1", 0, 0, 1920, 1080, 1.0, true);
         let mut state = match RegionSelectorState::new(vec![mon], 0) {
@@ -968,7 +1142,7 @@ mod tests {
             ..Default::default()
         };
         let full_output = ctx.run_ui(drag_input, |ui| {
-            let outcome = render_region_selector_ui(ui, &mut state);
+            let outcome = render_region_selector_ui(ui, &mut state, None);
             assert_eq!(outcome, RegionSelectorOutcome::Pending);
         });
 
@@ -1011,7 +1185,7 @@ mod tests {
         };
         let mut cancel_outcome = RegionSelectorOutcome::Pending;
         let _ = ctx.run_ui(esc_input, |ui| {
-            cancel_outcome = render_region_selector_ui(ui, &mut state);
+            cancel_outcome = render_region_selector_ui(ui, &mut state, None);
         });
         assert_eq!(cancel_outcome, RegionSelectorOutcome::Cancelled);
 
@@ -1037,7 +1211,7 @@ mod tests {
         };
         let mut rmb_outcome = RegionSelectorOutcome::Pending;
         let _ = ctx.run_ui(rmb_input, |ui| {
-            rmb_outcome = render_region_selector_ui(ui, &mut state);
+            rmb_outcome = render_region_selector_ui(ui, &mut state, None);
         });
         assert_eq!(rmb_outcome, RegionSelectorOutcome::Cancelled);
         assert_eq!(state.selection_rect_logical(), None);

@@ -15,7 +15,7 @@ pub mod tray;
 
 use crate::api::TtsError;
 use crate::audio::AudioPlayback;
-use crate::capture::{FrameCapturer, XcapCapturer};
+use crate::capture::{FrameCapturer, MonitorInfo, XcapCapturer};
 use crate::config::{AppConfig, CaptureRegion, WindowPosition};
 use crate::ocr::OcrEngine;
 use crate::pipeline::{PipelineHandle, PipelineSnapshot, TranslationCache, TtsCache};
@@ -43,8 +43,8 @@ pub(crate) use pipeline::{
     apply_region_selection_outcome, commit_settings_to_state, SettingsCommitEffects,
 };
 use region::{
-    build_region_viewport_builder, region_viewport_id, render_region_selector_ui,
-    RegionSelectorOutcome, RegionSelectorState,
+    build_region_viewport_builder, fullscreen_region_for_monitor, region_viewport_id,
+    render_region_selector_ui, RegionSelectorOutcome, RegionSelectorState, REGION_VIEWPORT_TITLE,
 };
 use settings::{
     build_settings_viewport_builder, render_settings_ui, settings_viewport_id, SettingsDraftState,
@@ -76,6 +76,18 @@ pub struct Cap2VoiceApp {
     region_selector: Option<RegionSelectorState>,
     region_selector_focused: bool,
     region_selection_target: RegionSelectionTarget,
+    /// Frozen fullscreen snapshot of the active monitor, painted as the
+    /// region-selector background (option B, `docs/spec.md` §3.1). The
+    /// window itself is opaque black on this PC, so the snapshot is what
+    /// makes the desktop/video underneath appear visible. `None` when no
+    /// snapshot was captured (capture failed) or the selector is closed.
+    region_snapshot_texture: Option<egui::TextureHandle>,
+    /// Monitor the current `region_snapshot_texture` belongs to; a Tab
+    /// monitor switch re-captures the snapshot for the new monitor.
+    region_snapshot_monitor_id: Option<String>,
+    /// Whether `WDA_EXCLUDEFROMCAPTURE` was already attempted on the
+    /// region-selector window (once per selector opening).
+    region_selector_wda_attempted: bool,
     /// Capture region the cached in-place viewport rect was computed
     /// from; a region change (re-select) recomputes the rect so the
     /// text window follows the new region.
@@ -324,6 +336,9 @@ impl Cap2VoiceApp {
             region_selector: None,
             region_selector_focused: false,
             region_selection_target: RegionSelectionTarget::LiveConfig,
+            region_snapshot_texture: None,
+            region_snapshot_monitor_id: None,
+            region_selector_wda_attempted: false,
             inplace_rect_source: None,
             inplace_viewport_rect: None,
             inplace_wda_attempted: false,
@@ -377,6 +392,46 @@ impl Cap2VoiceApp {
         self.inplace_rect_source = Some(region);
         self.inplace_viewport_rect = Some(rect);
         Some((rect, true))
+    }
+
+    /// Capture a frozen fullscreen snapshot of `monitor` and load it as
+    /// the region-selector background texture (option B, `docs/spec.md`
+    /// §3.1). The snapshot is re-taken only when the active monitor
+    /// changes (Tab cycling); while the selector stays on one monitor the
+    /// texture is reused. A failed capture leaves the selector with no
+    /// background (previous opaque-black behavior) and records a notice
+    /// shown after selection ends.
+    fn ensure_region_snapshot(&mut self, ctx: &egui::Context, monitor: &MonitorInfo) {
+        if self.region_snapshot_monitor_id.as_deref() == Some(monitor.id.as_str())
+            && self.region_snapshot_texture.is_some()
+        {
+            return;
+        }
+        self.region_snapshot_texture = None;
+        self.region_snapshot_monitor_id = None;
+        let region = fullscreen_region_for_monitor(monitor);
+        match self.capturer.capture_region(&region) {
+            Ok(frame) => {
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    [frame.width as usize, frame.height as usize],
+                    &frame.rgba,
+                );
+                let texture = ctx.load_texture(
+                    "region_selector_snapshot",
+                    image,
+                    egui::TextureOptions::LINEAR,
+                );
+                self.region_snapshot_texture = Some(texture);
+                self.region_snapshot_monitor_id = Some(monitor.id.clone());
+            }
+            Err(err) => {
+                if self.state.ui_notice.is_none() {
+                    self.state.ui_notice = Some(format!(
+                        "Không chụp được ảnh nền cho cửa sổ chọn vùng: {err}"
+                    ));
+                }
+            }
+        }
     }
 
     /// Grow/shrink the overlay window height so multi-line subtitles fit
@@ -458,11 +513,28 @@ impl eframe::App for Cap2VoiceApp {
                 .frame(egui::Frame::NONE)
                 .show(ui, |_| {});
 
+            // Option-B background: freeze the active monitor as it is
+            // right now (re-taken on Tab monitor switch).
+            self.ensure_region_snapshot(&ctx, &monitor);
+
             let builder = build_region_viewport_builder(&monitor);
+            let snapshot = self.region_snapshot_texture.as_ref();
             let outcome = ctx.show_viewport_immediate(
                 region_viewport_id(),
                 builder,
                 |viewport_ui, _class| {
+                    if !self.region_selector_wda_attempted {
+                        self.region_selector_wda_attempted = true;
+                        if let Err(err) =
+                            apply_exclude_from_capture_by_title(REGION_VIEWPORT_TITLE)
+                        {
+                            if self.state.ui_notice.is_none() {
+                                self.state.ui_notice = Some(format!(
+                                    "Cảnh báo: không loại được cửa sổ chọn vùng khỏi capture ({err}); cửa sổ chọn vùng có thể xuất hiện trong ảnh chụp."
+                                ));
+                            }
+                        }
+                    }
                     if !self.region_selector_focused {
                         self.region_selector_focused = true;
                         viewport_ui
@@ -473,7 +545,7 @@ impl eframe::App for Cap2VoiceApp {
                         .frame(egui::Frame::NONE)
                         .show(viewport_ui, |inner_ui| {
                             if let Some(selector) = &mut self.region_selector {
-                                render_region_selector_ui(inner_ui, selector)
+                                render_region_selector_ui(inner_ui, selector, snapshot)
                             } else {
                                 RegionSelectorOutcome::Pending
                             }
