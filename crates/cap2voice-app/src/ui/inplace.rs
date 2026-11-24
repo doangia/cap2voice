@@ -69,30 +69,33 @@ pub fn build_inplace_viewport_builder(pos: egui::Pos2, size: egui::Vec2) -> egui
 }
 
 /// Scale factor (`<= 1.0`) so the subtitle lines fit the region height at
-/// most `font_size_px`. Lines: pinyin (if shown) + Chinese (if shown) +
-/// Vietnamese (if shown), plus small gaps and padding.
+/// most `font_size_px`. `chinese_lines` / `pinyin_lines` /
+/// `vietnamese_lines` are the numbers of lines actually shown (0 hides
+/// that part); a 2-line frame counts 2 Chinese + 2 Vietnamese lines, so
+/// the font shrinks to fit them all instead of overflowing the region
+/// (2-line bug fix). The pinyin line is a single space-joined line even
+/// for multi-line Chinese, so it is 0 or 1.
 pub fn inplace_font_scale(
     region_height_logical: f32,
     font_size_px: f32,
-    show_chinese: bool,
-    show_pinyin: bool,
-    has_pinyin: bool,
-    show_vietnamese: bool,
+    chinese_lines: u32,
+    pinyin_lines: u32,
+    vietnamese_lines: u32,
 ) -> f32 {
     let base = font_size_px.clamp(12.0, 40.0);
     let mut needed = 0.0f32;
     let mut lines = 0u32;
-    if show_chinese {
-        if show_pinyin && has_pinyin {
-            needed += base * CHINESE_FONT_SCALE * PINYIN_FONT_SCALE;
-            lines += 1;
-        }
-        needed += base * CHINESE_FONT_SCALE;
-        lines += 1;
+    if pinyin_lines > 0 {
+        needed += base * CHINESE_FONT_SCALE * PINYIN_FONT_SCALE * pinyin_lines as f32;
+        lines += pinyin_lines;
     }
-    if show_vietnamese {
-        needed += base;
-        lines += 1;
+    if chinese_lines > 0 {
+        needed += base * CHINESE_FONT_SCALE * chinese_lines as f32;
+        lines += chinese_lines;
+    }
+    if vietnamese_lines > 0 {
+        needed += base * vietnamese_lines as f32;
+        lines += vietnamese_lines;
     }
     if lines == 0 {
         return 1.0;
@@ -130,13 +133,23 @@ pub fn render_inplace_subtitle_ui(
         egui::Color32::from_rgba_unmultiplied(20, 22, 26, alpha),
     );
 
+    let zh_lines = if show_zh {
+        chinese_line.matches('\n').count() as u32 + 1
+    } else {
+        0
+    };
+    let py_lines = if show_py { 1 } else { 0 };
+    let vi_lines = if show_vi {
+        vietnamese_line.matches('\n').count() as u32 + 1
+    } else {
+        0
+    };
     let scale = inplace_font_scale(
         full.height(),
         config.display.font_size_px,
-        show_zh,
-        config.display.show_pinyin_line,
-        show_py,
-        show_vi,
+        zh_lines,
+        py_lines,
+        vi_lines,
     );
     let vi_size = config.display.font_size_px.clamp(12.0, 40.0) * scale;
     let zh_size = vi_size * CHINESE_FONT_SCALE;
@@ -303,16 +316,21 @@ mod tests {
     #[test]
     fn inplace_font_scale_never_enlarges_and_shrinks_for_short_regions() {
         // Tall region: full size.
-        assert!((inplace_font_scale(140.0, 18.0, true, true, true, true) - 1.0).abs() < 1e-6);
+        assert!((inplace_font_scale(140.0, 18.0, 1, 1, 1) - 1.0).abs() < 1e-6);
         // Short region (60 px): 3 lines at 18 px need ~62 px -> scale < 1.
-        let s = inplace_font_scale(60.0, 18.0, true, true, true, true);
+        let s = inplace_font_scale(60.0, 18.0, 1, 1, 1);
         assert!((0.2..1.0).contains(&s), "scale for 60px region: {s}");
         // Very short region clamps at 0.2 rather than vanishing.
-        assert!((inplace_font_scale(10.0, 18.0, true, true, true, true) - 0.2).abs() < 1e-6);
+        assert!((inplace_font_scale(10.0, 18.0, 1, 1, 1) - 0.2).abs() < 1e-6);
         // One line only needs less height, so it stays full size longer.
-        assert!((inplace_font_scale(60.0, 18.0, false, false, false, true) - 1.0).abs() < 1e-6);
+        assert!((inplace_font_scale(60.0, 18.0, 0, 0, 1) - 1.0).abs() < 1e-6);
         // No lines: neutral scale.
-        assert!((inplace_font_scale(60.0, 18.0, false, false, false, false) - 1.0).abs() < 1e-6);
+        assert!((inplace_font_scale(60.0, 18.0, 0, 0, 0) - 1.0).abs() < 1e-6);
+        // Two-line frame needs more height than one line at the same size:
+        // at 100 px a single line stays full size but 2+2 lines shrink.
+        assert!((inplace_font_scale(100.0, 18.0, 1, 1, 1) - 1.0).abs() < 1e-6);
+        let s2 = inplace_font_scale(100.0, 18.0, 2, 1, 2);
+        assert!((0.2..1.0).contains(&s2), "scale for two-line frame: {s2}");
     }
 
     #[test]

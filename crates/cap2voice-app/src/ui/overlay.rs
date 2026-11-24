@@ -20,6 +20,33 @@ pub const OVERLAY_MIN_SIZE: [f32; 2] = [460.0, 140.0];
 /// Maximum overlay window size for the resize grip.
 pub const OVERLAY_MAX_SIZE: [f32; 2] = [1200.0, 600.0];
 
+/// Window height that fits the displayed subtitle lines (2-line bug fix).
+/// The default 204 px window fits one Chinese + one Vietnamese line; each
+/// extra line needs its font height (with a small margin so the text never
+/// clips). Single-line content returns the default height. Only lines that
+/// are actually shown count (a hidden language adds no height).
+pub fn overlay_desired_height(
+    config: &AppConfig,
+    chinese_line: &str,
+    vietnamese_line: &str,
+) -> f32 {
+    let vi_size = config.display.font_size_px.clamp(12.0, 40.0);
+    let zh_size = vi_size * CHINESE_FONT_SCALE;
+    let extra_zh = if config.display.show_chinese_line {
+        chinese_line.matches('\n').count() as f32
+    } else {
+        0.0
+    };
+    let extra_vi = if config.display.show_vietnamese_line {
+        vietnamese_line.matches('\n').count() as f32
+    } else {
+        0.0
+    };
+    // egui line height is ~1.3x the font size for the CJK chain.
+    let extra = extra_zh * zh_size * 1.3 + extra_vi * vi_size * 1.3;
+    (DEFAULT_OVERLAY_SIZE[1] + extra).clamp(OVERLAY_MIN_SIZE[1], OVERLAY_MAX_SIZE[1])
+}
+
 /// Clamp a resize-grip target size to the allowed overlay bounds.
 pub fn clamp_overlay_resize(size: [f32; 2]) -> [f32; 2] {
     [
@@ -734,8 +761,9 @@ pub fn render_overlay_ui(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_exclude_from_capture_hwnd, clamp_overlay_resize, overlay_overlaps_region,
-        DisplayAffinityError, OverlayState, PositionTracker, ServerUiStatus,
+        apply_exclude_from_capture_hwnd, clamp_overlay_resize, overlay_desired_height,
+        overlay_overlaps_region, DisplayAffinityError, OverlayState, PositionTracker,
+        ServerUiStatus,
     };
     use crate::config::{AppConfig, CaptureRegion, WindowPosition};
     use crate::pipeline::{
@@ -965,6 +993,30 @@ mod tests {
         assert_eq!(clamp_overlay_resize([460.0, 140.0]), [460.0, 140.0]);
         assert_eq!(clamp_overlay_resize([1200.0, 600.0]), [1200.0, 600.0]);
         assert_eq!(clamp_overlay_resize([300.0, 300.0]), [460.0, 300.0]);
+    }
+
+    #[test]
+    fn overlay_desired_height_grows_for_two_line_subtitles() {
+        let cfg = AppConfig::default();
+        // Single line: default height.
+        assert_eq!(
+            overlay_desired_height(&cfg, "你好，我是小明。", "Xin chào, tôi là Tiểu Minh."),
+            204.0
+        );
+        // Two lines each: taller (Chinese 24.3px + Vietnamese 18px, x1.3).
+        let two_line = overlay_desired_height(&cfg, "你好。\n再见。", "Chào.\nTạm biệt.");
+        assert!(
+            (two_line - 259.0).abs() < 1.0,
+            "expected ~259px for two-line content, got {two_line}"
+        );
+        // Hidden lines add no height.
+        let mut hidden_cfg = AppConfig::default();
+        hidden_cfg.display.show_vietnamese_line = false;
+        let zh_only = overlay_desired_height(&hidden_cfg, "你好。\n再见。", "Chào.\nTạm biệt.");
+        assert!(
+            (zh_only - 235.6).abs() < 1.0,
+            "expected ~235.6px with Vietnamese hidden, got {zh_only}"
+        );
     }
 
     #[test]

@@ -281,6 +281,10 @@ struct SharedPipelineState {
     snapshot: PipelineSnapshot,
     snapshot_tx: watch::Sender<PipelineSnapshot>,
     stopped: bool,
+    /// In-progress multi-line display group (2-line bug fix): the frame
+    /// whose lines the overlay is currently showing, if it had more than
+    /// one line. `None` for single-line frames.
+    display_group: Option<DisplayGroup>,
 }
 
 impl SharedPipelineState {
@@ -302,6 +306,17 @@ impl SharedPipelineState {
         {
             self.snapshot.error_banner = None;
             self.publish();
+        }
+    }
+
+    /// Record a resolved Vietnamese translation for a line of the current
+    /// multi-line display group (2-line bug fix). Delegates to the group;
+    /// `NotGrouped` when there is no group or the text is not one of its
+    /// lines (single-line frames and superseded frames).
+    fn note_group_translation(&mut self, chinese: &str, vietnamese: String) -> GroupContribution {
+        match self.display_group.as_mut() {
+            Some(group) => group.note(chinese, vietnamese),
+            None => GroupContribution::NotGrouped,
         }
     }
 }
@@ -347,6 +362,7 @@ impl PipelineRunner {
             snapshot: initial_snapshot,
             snapshot_tx,
             stopped: false,
+            display_group: None,
         }));
 
         let worker_shared = Arc::clone(&shared);
@@ -787,6 +803,82 @@ fn emit_sentence_events(
     true
 }
 
+/// What recording a line's translation into the current display group
+/// means for the overlay (2-line subtitle bug fix).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GroupContribution {
+    /// The line is not part of the current display group: use the
+    /// ordinary single-line display rules.
+    NotGrouped,
+    /// The line belongs to the group but siblings are still pending:
+    /// do not show this line's translation alone (the overlay would
+    /// otherwise flash a single line before the group completes).
+    GroupedPending,
+    /// Every line of the group now has a translation: the joined
+    /// translations in top-to-bottom line order.
+    GroupedComplete(String),
+}
+
+/// One display unit for a multi-line subtitle frame (2-line bug fix).
+///
+/// A frame with N visual lines is shown on the overlay as N Chinese lines
+/// plus (once resolved) N Vietnamese lines, while log/TTS still treat each
+/// line as a separate utterance (A2 / gh #1). Without this, the N lines
+/// are emitted back-to-back into a single-line display: each emission
+/// overwrites `snapshot.chinese_line`, the first lines' translations are
+/// suppressed as stale, and the overlay only ever shows the last line —
+/// which is exactly what Danh saw (only "再见。" for a "你好。 / 再见。"
+/// frame) even though both lines were logged.
+///
+/// Keyed by the Chinese line text, not seq: a line is emitted once as
+/// Preliminary and again as Completed when it is flushed later, so the
+/// seq is not stable across the two emissions, but the text is.
+#[derive(Debug, Clone, Default)]
+struct DisplayGroup {
+    /// The frame's lines in top-to-bottom order, each with its resolved
+    /// Vietnamese translation (`None` until that line's translation lands).
+    lines: Vec<(String, Option<String>)>,
+}
+
+impl DisplayGroup {
+    fn new(lines: Vec<String>) -> Self {
+        Self {
+            lines: lines.into_iter().map(|line| (line, None)).collect(),
+        }
+    }
+
+    /// Record a resolved Vietnamese translation for one of the group's
+    /// lines (matched by Chinese text; the first unresolved entry wins,
+    /// so identical twin lines fill in order).
+    fn note(&mut self, chinese: &str, vietnamese: String) -> GroupContribution {
+        let mut found = false;
+        for (line, vi) in self.lines.iter_mut() {
+            if line == chinese && vi.is_none() {
+                *vi = Some(vietnamese);
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return GroupContribution::NotGrouped;
+        }
+        if self.lines.iter().all(|(_, vi)| vi.is_some()) {
+            let mut joined = String::new();
+            for (_, vi) in &self.lines {
+                if !joined.is_empty() {
+                    joined.push('\n');
+                }
+                if let Some(v) = vi {
+                    joined.push_str(v);
+                }
+            }
+            GroupContribution::GroupedComplete(joined)
+        } else {
+            GroupContribution::GroupedPending
+        }
+    }
+}
+
 /// Split a held frame text (lines joined with "\n") into visual lines,
 /// feed each to the `SentenceBuffer`, and emit the resulting events. A new
 /// line in the same frame is a separate utterance, so the buffer completes
@@ -800,11 +892,16 @@ fn emit_held_lines(
     semaphore: &Arc<Semaphore>,
     inflight: &mut JoinSet<()>,
 ) -> bool {
+    // A new held frame supersedes the previous display: drop any
+    // in-progress multi-line group so a late translation from the old
+    // frame can never overwrite the new frame's display.
+    {
+        let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
+        state.display_group = None;
+    }
+    let lines: Vec<&str> = joined.split('\n').filter(|line| !line.is_empty()).collect();
     let mut first_line = true;
-    for line in joined.split('\n') {
-        if line.is_empty() {
-            continue;
-        }
+    for line in &lines {
         let events = if first_line {
             sentence_buffer.push(line.to_string(), Instant::now())
         } else {
@@ -814,6 +911,20 @@ fn emit_held_lines(
         if !emit_sentence_events(events, shared, deps, semaphore, inflight) {
             return false;
         }
+    }
+    // Multi-line frame: the overlay shows every line, not just the last.
+    // Each per-line emission above set `chinese_line` to that line in turn
+    // (no repaint happens between them, so the UI never sees the
+    // intermediate values); override with the joined lines now, and
+    // register the group so the per-line translations land in line order.
+    if lines.len() > 1 {
+        let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
+        state.display_group = Some(DisplayGroup::new(
+            lines.iter().map(|line| line.to_string()).collect(),
+        ));
+        state.snapshot.chinese_line = lines.join("\n");
+        state.snapshot.vietnamese_line.clear();
+        state.publish();
     }
     true
 }
@@ -1142,8 +1253,25 @@ async fn process_emitted_subtitle(
 
         match translate_res {
             Ok(vi) => {
-                if !display_stale {
-                    state.snapshot.vietnamese_line = vi.clone();
+                // Multi-line display group (2-line bug fix): contribute
+                // this line's translation; when every line of the frame
+                // has one, show the joined translations in line order.
+                // A grouped line still contributes even when its seq is
+                // stale (it is older only because the frame's later lines
+                // were emitted after it); the group, not the seq, decides
+                // the display. A grouped line whose siblings are pending
+                // shows nothing yet, so the overlay never flashes a
+                // single line of a multi-line frame.
+                match state.note_group_translation(&chinese, vi.clone()) {
+                    GroupContribution::GroupedComplete(joined) => {
+                        state.snapshot.vietnamese_line = joined;
+                    }
+                    GroupContribution::GroupedPending => {}
+                    GroupContribution::NotGrouped => {
+                        if !display_stale {
+                            state.snapshot.vietnamese_line = vi.clone();
+                        }
+                    }
                 }
                 state.snapshot.metrics.translations_succeeded += 1;
                 state.snapshot.error_banner = None;
@@ -1272,10 +1400,10 @@ async fn process_emitted_subtitle(
 #[cfg(test)]
 mod tests {
     use super::{
-        map_translate_error_banner, Duration, Instant, PipelineError, PipelineErrorBanner,
-        PipelineErrorKind, PipelineSettings, SentenceBuffer, SentenceEvent, SubtitleHold,
-        DEFAULT_HOLD_DELAY, DEFAULT_SENTENCE_BLANK_FRAMES, ERR_BANNER_ENGINE_UNAVAILABLE,
-        ERR_BANNER_TRANSLATE_NETWORK, MAX_SENTENCE_BUFFER_AGE,
+        map_translate_error_banner, DisplayGroup, Duration, GroupContribution, Instant,
+        PipelineError, PipelineErrorBanner, PipelineErrorKind, PipelineSettings, SentenceBuffer,
+        SentenceEvent, SubtitleHold, DEFAULT_HOLD_DELAY, DEFAULT_SENTENCE_BLANK_FRAMES,
+        ERR_BANNER_ENGINE_UNAVAILABLE, ERR_BANNER_TRANSLATE_NETWORK, MAX_SENTENCE_BUFFER_AGE,
     };
     use crate::api::TranslateError;
     use crate::config::{AppConfig, CaptureRegion};
@@ -1591,6 +1719,58 @@ mod tests {
                 kind: PipelineErrorKind::TranslateEngineUnavailable,
                 message: ERR_BANNER_ENGINE_UNAVAILABLE.to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn display_group_joins_two_line_translations_in_line_order() {
+        // The 2-line bug: "你好。" resolves AFTER "再见。" (its
+        // translation is slower), yet the display must show the lines
+        // top-to-bottom, not in resolve order.
+        let mut group = DisplayGroup::new(vec!["你好。".to_string(), "再见。".to_string()]);
+        assert_eq!(
+            group.note("再见。", "Tạm biệt.".to_string()),
+            GroupContribution::GroupedPending
+        );
+        assert_eq!(
+            group.note("你好。", "Chào.".to_string()),
+            GroupContribution::GroupedComplete("Chào.\nTạm biệt.".to_string())
+        );
+    }
+
+    #[test]
+    fn display_group_ignores_lines_outside_the_group() {
+        let mut group = DisplayGroup::new(vec!["你好。".to_string(), "再见。".to_string()]);
+        assert_eq!(
+            group.note("小明。", "Tiểu Minh.".to_string()),
+            GroupContribution::NotGrouped
+        );
+        // A re-resolved line (Preliminary then Completed for the same
+        // text) does not fill the entry twice.
+        assert_eq!(
+            group.note("你好。", "Chào.".to_string()),
+            GroupContribution::GroupedPending
+        );
+        assert_eq!(
+            group.note("你好。", "Chào.".to_string()),
+            GroupContribution::NotGrouped
+        );
+        assert_eq!(
+            group.note("再见。", "Tạm biệt.".to_string()),
+            GroupContribution::GroupedComplete("Chào.\nTạm biệt.".to_string())
+        );
+    }
+
+    #[test]
+    fn display_group_fills_identical_twin_lines_in_order() {
+        let mut group = DisplayGroup::new(vec!["你好。".to_string(), "你好。".to_string()]);
+        assert_eq!(
+            group.note("你好。", "Chào.".to_string()),
+            GroupContribution::GroupedPending
+        );
+        assert_eq!(
+            group.note("你好。", "Chào.".to_string()),
+            GroupContribution::GroupedComplete("Chào.\nChào.".to_string())
         );
     }
 }

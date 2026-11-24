@@ -956,8 +956,11 @@ async fn pipeline_two_lines_in_one_frame_stay_separate_utterances() {
     .await;
 
     assert_eq!(snap.status, PipelineStatus::Running);
-    assert_eq!(snap.chinese_line, "我很好。");
-    assert_eq!(snap.vietnamese_line, "VI(我很好。)");
+    // 2-line bug fix: the overlay shows BOTH lines of the frame (joined
+    // with "\n", top-to-bottom), not just the last one. Log/TTS still
+    // treat each line as a separate utterance (asserted below).
+    assert_eq!(snap.chinese_line, "你好吗？\n我很好。");
+    assert_eq!(snap.vietnamese_line, "VI(你好吗？)\nVI(我很好。)");
     assert_eq!(snap.metrics.subtitles_emitted, 2);
     assert_eq!(
         translator.calls(),

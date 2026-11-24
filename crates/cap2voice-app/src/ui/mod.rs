@@ -34,8 +34,8 @@ use inplace::{
     render_inplace_subtitle_ui, INPLACE_WINDOW_TITLE,
 };
 use overlay::{
-    apply_exclude_from_capture_by_title, render_overlay_ui, OverlayState, PositionTracker,
-    ServerUiStatus, POSITION_SAVE_DEBOUNCE,
+    apply_exclude_from_capture_by_title, clamp_overlay_resize, overlay_desired_height,
+    render_overlay_ui, OverlayState, PositionTracker, ServerUiStatus, POSITION_SAVE_DEBOUNCE,
 };
 pub(crate) use pipeline::TtsPreviewAudio;
 #[cfg(test)]
@@ -86,6 +86,11 @@ pub struct Cap2VoiceApp {
     /// Whether `WDA_EXCLUDEFROMCAPTURE` was already attempted on the
     /// in-place subtitle window (once per app run).
     inplace_wda_attempted: bool,
+    /// Height (logical px) this app last set automatically for multi-line
+    /// subtitles (2-line bug fix); `None` when the height is the user's
+    /// own (manual resize or default). Used to shrink back after a
+    /// multi-line frame without undoing a manual resize.
+    overlay_auto_height: Option<f32>,
     /// WDA failure detail for the in-place window (shown as a notice).
     inplace_wda_error: Option<String>,
     settings_draft: Option<SettingsDraftState>,
@@ -298,6 +303,7 @@ impl Cap2VoiceApp {
             inplace_rect_source: None,
             inplace_viewport_rect: None,
             inplace_wda_attempted: false,
+            overlay_auto_height: None,
             inplace_wda_error: None,
             settings_draft: None,
             settings_focused: false,
@@ -344,6 +350,37 @@ impl Cap2VoiceApp {
         self.inplace_rect_source = Some(region);
         self.inplace_viewport_rect = Some(rect);
         Some((rect, true))
+    }
+
+    /// Grow/shrink the overlay window height so multi-line subtitles fit
+    /// (2-line bug fix). The default 204 px window fits one Chinese + one
+    /// Vietnamese line; a 2-line frame needs ~55 px more. Policy: grow
+    /// when the content needs more height than the window has; shrink
+    /// back only when the window is still at a height this method set
+    /// (never undo a manual resize, except to keep content visible).
+    fn apply_multiline_height(&mut self, ctx: &egui::Context) {
+        let desired = overlay_desired_height(
+            &self.config,
+            &self.state.pipeline.chinese_line,
+            &self.state.pipeline.vietnamese_line,
+        );
+        let Some(size) = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size())) else {
+            return;
+        };
+        let current = size.y;
+        let at_auto_height = self
+            .overlay_auto_height
+            .is_some_and(|h| (current - h).abs() < 1.0);
+        let should_resize =
+            current + 0.5 < desired || (at_auto_height && (current - desired).abs() > 0.5);
+        if should_resize {
+            let next = clamp_overlay_resize([size.x, desired]);
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(next.into()));
+            self.overlay_auto_height = Some(next[1]);
+        } else if !at_auto_height && current + 0.5 >= desired {
+            // The user resized away from the auto height: stop tracking it.
+            self.overlay_auto_height = None;
+        }
     }
 }
 
@@ -517,6 +554,8 @@ impl eframe::App for Cap2VoiceApp {
                 })
                 .inner;
             self.dispatch_commands(&ctx, commands);
+            // Multi-line subtitles need a taller window (2-line bug fix).
+            self.apply_multiline_height(&ctx);
         }
 
         if matches!(self.state.server_status, ServerUiStatus::Starting)
