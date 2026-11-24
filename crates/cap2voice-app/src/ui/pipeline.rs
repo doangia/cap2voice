@@ -26,10 +26,13 @@ pub(crate) struct SettingsCommitEffects {
     pub engine_changed: bool,
     pub wechat_paths_changed: bool,
     pub always_on_top_changed: bool,
+    pub tts_engine_changed: bool,
+    pub piper_voice_changed: bool,
 }
 
 pub(crate) struct TtsPreviewAudio {
-    pub(crate) mp3_bytes: Vec<u8>,
+    pub(crate) audio_bytes: Vec<u8>,
+    pub(crate) format: crate::audio::AudioFormat,
     pub(crate) volume: f32,
 }
 
@@ -70,10 +73,12 @@ where
             || current_config.general.weixin_dir_path != new_config.general.weixin_dir_path,
         always_on_top_changed: current_config.display.always_on_top
             != new_config.display.always_on_top,
+        tts_engine_changed: current_config.voice.engine != new_config.voice.engine,
+        piper_voice_changed: new_config.voice.engine == crate::tts::TtsEngineKind::Piper
+            && current_config.voice.voice != new_config.voice.voice,
     };
 
     *current_config = new_config;
-    ui_state.selected_voice = current_config.voice.voice.clone();
     ui_state.ui_notice = None;
     Ok(effects)
 }
@@ -84,7 +89,9 @@ pub(crate) fn build_live_pipeline_settings(
 ) -> Result<PipelineSettings, crate::pipeline::PipelineError> {
     let mut settings = PipelineSettings::from_app_config(config)?;
     settings.muted = state.muted;
-    settings.voice = state.selected_voice.clone();
+    // The voice comes from the config — the overlay has no voice selector
+    // (voice selection lives ONLY in Settings since 2026-11-24).
+    settings.voice = config.voice.voice.clone();
     Ok(settings)
 }
 
@@ -228,7 +235,11 @@ impl super::Cap2VoiceApp {
 
         if let Some(outcome) = preview_result {
             match outcome {
-                Ok(Ok(TtsPreviewAudio { mp3_bytes, volume })) => {
+                Ok(Ok(TtsPreviewAudio {
+                    audio_bytes,
+                    format,
+                    volume,
+                })) => {
                     if self.audio.is_none() {
                         match AudioPlayer::new(volume) {
                             Ok(player) => {
@@ -245,7 +256,7 @@ impl super::Cap2VoiceApp {
                     if let Some(audio) = &self.audio {
                         let play_res = audio
                             .set_volume(volume)
-                            .and_then(|()| audio.enqueue_mp3(mp3_bytes));
+                            .and_then(|()| audio.enqueue_audio(audio_bytes, format));
                         if let Some(draft) = &mut self.settings_draft {
                             draft.tts_preview_status = match play_res {
                                 Ok(_) => AsyncFeedbackState::Success(
@@ -290,7 +301,11 @@ impl super::Cap2VoiceApp {
 
         if let Some(outcome) = replay_result {
             match outcome {
-                Ok(Ok(TtsPreviewAudio { mp3_bytes, volume })) => {
+                Ok(Ok(TtsPreviewAudio {
+                    audio_bytes,
+                    format,
+                    volume,
+                })) => {
                     if self.audio.is_none() {
                         match AudioPlayer::new(volume) {
                             Ok(player) => {
@@ -304,7 +319,7 @@ impl super::Cap2VoiceApp {
                     if let Some(audio) = &self.audio {
                         let play_res = audio
                             .set_volume(volume)
-                            .and_then(|()| audio.enqueue_mp3(mp3_bytes));
+                            .and_then(|()| audio.enqueue_audio(audio_bytes, format));
                         if let Err(err) = play_res {
                             self.state.ui_notice = Some(format!("Lỗi phát âm thanh: {err}"));
                         }
@@ -316,6 +331,91 @@ impl super::Cap2VoiceApp {
                 Err(msg) => {
                     self.state.ui_notice = Some(msg);
                 }
+            }
+        }
+
+        let vietnamese_replay_result = if let Some(rx) = &self.vietnamese_replay_rx {
+            match rx.try_recv() {
+                Ok(res) => {
+                    self.vietnamese_replay_rx = None;
+                    Some(Ok(res))
+                }
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.vietnamese_replay_rx = None;
+                    Some(Err("Luồng nghe lại tiếng Việt đã dừng bất ngờ".to_string()))
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Some(outcome) = vietnamese_replay_result {
+            match outcome {
+                Ok(Ok(TtsPreviewAudio {
+                    audio_bytes,
+                    format,
+                    volume,
+                })) => {
+                    if self.audio.is_none() {
+                        match AudioPlayer::new(volume) {
+                            Ok(player) => {
+                                self.audio = Some(Arc::new(player));
+                            }
+                            Err(err) => {
+                                self.state.ui_notice = Some(format!("Lỗi âm thanh: {err}"));
+                            }
+                        }
+                    }
+                    if let Some(audio) = &self.audio {
+                        let play_res = audio
+                            .set_volume(volume)
+                            .and_then(|()| audio.enqueue_audio(audio_bytes, format));
+                        if let Err(err) = play_res {
+                            self.state.ui_notice = Some(format!("Lỗi phát âm thanh: {err}"));
+                        }
+                    }
+                }
+                Ok(Err(err)) => {
+                    self.state.ui_notice = Some(format!("Không nghe lại được tiếng Việt: {err}"));
+                }
+                Err(msg) => {
+                    self.state.ui_notice = Some(msg);
+                }
+            }
+        }
+
+        // Piper voice download progress (Settings → Giọng đọc): the
+        // download runs on a background thread; each event updates the
+        // draft's progress state so the Settings UI shows progress.
+        // The channel disconnects when the download thread ends (after
+        // sending Done/Error), so a disconnect also clears the receiver.
+        if let Some(rx) = &self.piper_download_rx {
+            let mut finished = false;
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => {
+                        finished = matches!(
+                            event,
+                            crate::tts::PiperDownloadEvent::Done { .. }
+                                | crate::tts::PiperDownloadEvent::Error(_)
+                        );
+                        if let Some(draft) = &mut self.settings_draft {
+                            draft.apply_piper_download_event(event);
+                        }
+                        if finished {
+                            break;
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        finished = true;
+                        break;
+                    }
+                }
+            }
+            if finished {
+                self.piper_download_rx = None;
             }
         }
     }

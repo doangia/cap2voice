@@ -5,25 +5,24 @@
 //! consults them:
 //!
 //! * [`TranslationCache`] — key: normalized Chinese text; value: Vietnamese.
-//! * [`TtsCache`] — key: (Vietnamese, voice, rate); value: MP3 bytes.
+//! * [`TtsCache`] — key: (Vietnamese, voice, rate); value: audio bytes in
+//!   the engine's format (MP3 for Edge-TTS, WAV for Piper).
 //!
 //! Both are in-memory LRU (bounded) plus disk persistence under
 //! `%APPDATA%\cap2voice\cache\` (see `config::default_cache_dir`), so
 //! repeats work across restarts. Eviction removes the oldest entry first;
-//! for audio it deletes the MP3 file as well as the index entry. Keys are
+//! for audio it deletes the audio file as well as the index entry. Keys are
 //! exact matches only — no fuzzy cache matching (the dedupe step already
 //! handles near-duplicates).
 //!
 //! Disk layout (inside the cache dir):
 //! * `translations.json` — `{normalized_chinese: vietnamese}`.
 //! * `tts.json` — `{cache_key: audio_filename}` (index only; bytes live in files).
-//! * `audio/<fnv1a-hex>.mp3` — one MP3 per cached TTS entry.
-//!
-//! Disk writes are small (a JSON index of at most 500 entries, one MP3 per
-//! TTS insert) and happen synchronously under the cache lock; the pipeline
-//! inserts at most ~1 entry per subtitle, so this never blocks the async
-//! runtime for a meaningful time.
+//! * `audio/<fnv1a-hex>.mp3` / `audio/<fnv1a-hex>.wav` — one audio file per
+//!   cached TTS entry, in the engine's format (the extension carries the
+//!   format; the voice in the key already separates Edge from Piper entries).
 
+use crate::audio::AudioFormat;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
@@ -367,12 +366,27 @@ struct TtsIndex {
     entries: HashMap<String, String>,
 }
 
-/// TTS audio cache: (Vietnamese, voice, rate) → MP3 bytes, in-memory LRU
-/// (bounded by [`MAX_TTS_BYTES`]) plus MP3 files under `audio/` and a
+/// One cached TTS clip: the raw audio bytes plus their encoding. The
+/// format is part of the value (not the key) because the voice in the key
+/// already separates engines; the filename extension on disk carries it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedAudio {
+    pub bytes: Vec<u8>,
+    pub format: AudioFormat,
+}
+
+impl CachedAudio {
+    pub fn new(bytes: Vec<u8>, format: AudioFormat) -> Self {
+        Self { bytes, format }
+    }
+}
+
+/// TTS audio cache: (Vietnamese, voice, rate) → audio bytes, in-memory LRU
+/// (bounded by [`MAX_TTS_BYTES`]) plus audio files under `audio/` and a
 /// `tts.json` index. Eviction deletes the audio file.
 pub struct TtsCache {
     dir: PathBuf,
-    inner: Mutex<Lru<String, Vec<u8>>>,
+    inner: Mutex<Lru<String, CachedAudio>>,
 }
 
 impl TtsCache {
@@ -392,9 +406,22 @@ impl TtsCache {
             if let Ok(index) = serde_json::from_slice::<TtsIndex>(&bytes) {
                 for (key, filename) in index.entries {
                     let file_path = audio_dir.join(&filename);
-                    if let Ok(mp3) = fs::read(&file_path) {
-                        let size = mp3.len() as u64;
-                        let _ = lru.insert(key, mp3, size, usize::MAX, MAX_TTS_BYTES);
+                    if let Ok(audio) = fs::read(&file_path) {
+                        // The filename extension carries the format
+                        // (`.wav` for Piper, `.mp3` for Edge-TTS).
+                        let format = if filename.ends_with(".wav") {
+                            AudioFormat::Wav
+                        } else {
+                            AudioFormat::Mp3
+                        };
+                        let size = audio.len() as u64;
+                        let _ = lru.insert(
+                            key,
+                            CachedAudio::new(audio, format),
+                            size,
+                            usize::MAX,
+                            MAX_TTS_BYTES,
+                        );
                     }
                 }
             }
@@ -412,44 +439,49 @@ impl TtsCache {
         format!("{voice}|{rate}|{}", normalize_cache_key(vietnamese))
     }
 
-    /// Look up cached MP3 bytes for a (Vietnamese, voice, rate) request.
-    pub fn get(&self, vietnamese: &str, voice: &str, rate: &str) -> Option<Vec<u8>> {
+    /// Audio filename for a cache key in `format`.
+    fn audio_filename(key: &str, format: AudioFormat) -> String {
+        format!("{}.{}", fnv1a_hex(key), format.extension())
+    }
+
+    /// Look up cached audio for a (Vietnamese, voice, rate) request.
+    pub fn get(&self, vietnamese: &str, voice: &str, rate: &str) -> Option<CachedAudio> {
         let key = Self::cache_key(vietnamese, voice, rate);
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.get(&key).cloned()
     }
 
-    /// Store MP3 bytes for a request. Empty audio is ignored. Persists the
+    /// Store audio for a request. Empty audio is ignored. Persists the
     /// audio file and the index to disk; evicted entries lose their file.
     pub fn put(
         &self,
         vietnamese: &str,
         voice: &str,
         rate: &str,
-        mp3: Vec<u8>,
+        audio: CachedAudio,
     ) -> Result<(), CacheError> {
-        if mp3.is_empty() {
+        if audio.bytes.is_empty() {
             return Ok(());
         }
         let key = Self::cache_key(vietnamese, voice, rate);
         if normalize_cache_key(vietnamese).is_empty() {
             return Ok(());
         }
-        let filename = format!("{}.mp3", fnv1a_hex(&key));
+        let filename = Self::audio_filename(&key, audio.format);
         let file_path = self.dir.join(TTS_AUDIO_DIR).join(&filename);
-        let size = mp3.len() as u64;
+        let size = audio.bytes.len() as u64;
         let evicted = {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            inner.insert(key, mp3.clone(), size, usize::MAX, MAX_TTS_BYTES)
+            inner.insert(key, audio.clone(), size, usize::MAX, MAX_TTS_BYTES)
         };
-        for (old_key, _) in &evicted {
+        for (old_key, old_audio) in &evicted {
             let old_file = self
                 .dir
                 .join(TTS_AUDIO_DIR)
-                .join(format!("{}.mp3", fnv1a_hex(old_key)));
+                .join(Self::audio_filename(old_key, old_audio.format));
             let _ = fs::remove_file(old_file);
         }
-        fs::write(&file_path, &mp3).map_err(|e| CacheError::WriteFailed {
+        fs::write(&file_path, &audio.bytes).map_err(|e| CacheError::WriteFailed {
             path: file_path,
             detail: e.to_string(),
         })?;
@@ -506,7 +538,7 @@ impl TtsCache {
             inner
                 .entries()
                 .into_iter()
-                .map(|(key, _)| (key.clone(), format!("{}.mp3", fnv1a_hex(&key))))
+                .map(|(key, audio)| (key.clone(), Self::audio_filename(&key, audio.format)))
                 .collect()
         };
         let index = TtsIndex { entries };
@@ -695,11 +727,16 @@ mod tests {
         assert!(cache.is_empty());
         let mp3 = vec![0x49, 0x44, 0x33, 1, 2, 3];
         cache
-            .put("Vâng.", "vi-VN-NamMinhNeural", "+0%", mp3.clone())
+            .put(
+                "Vâng.",
+                "vi-VN-NamMinhNeural",
+                "+0%",
+                CachedAudio::new(mp3.clone(), AudioFormat::Mp3),
+            )
             .expect("put");
         assert_eq!(
             cache.get("Vâng.", "vi-VN-NamMinhNeural", "+0%"),
-            Some(mp3.clone())
+            Some(CachedAudio::new(mp3.clone(), AudioFormat::Mp3))
         );
         // A different voice is a different key.
         assert_eq!(cache.get("Vâng.", "vi-VN-HoaiMyNeural", "+0%"), None);
@@ -708,7 +745,53 @@ mod tests {
         assert_eq!(reloaded.len(), 1);
         assert_eq!(
             reloaded.get("Vâng.", "vi-VN-NamMinhNeural", "+0%"),
-            Some(mp3)
+            Some(CachedAudio::new(mp3, AudioFormat::Mp3))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tts_cache_round_trips_wav_with_wav_extension_on_disk() {
+        let dir = std::env::temp_dir().join(format!(
+            "cap2voice_cache_test_tts_wav_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let cache = TtsCache::load(&dir).expect("load empty cache");
+        let wav = vec![b'R', b'I', b'F', b'F', 1, 2, 3, 4];
+        cache
+            .put(
+                "Xin chào.",
+                "ngochuyen",
+                "+0%",
+                CachedAudio::new(wav.clone(), AudioFormat::Wav),
+            )
+            .expect("put wav");
+        assert_eq!(
+            cache.get("Xin chào.", "ngochuyen", "+0%"),
+            Some(CachedAudio::new(wav.clone(), AudioFormat::Wav))
+        );
+        // The file on disk carries the .wav extension (the format is
+        // recoverable from the filename after a restart).
+        let audio_dir = dir.join(TTS_AUDIO_DIR);
+        let names: Vec<String> = std::fs::read_dir(&audio_dir)
+            .expect("read audio dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 1);
+        assert!(
+            names[0].ends_with(".wav"),
+            "expected a .wav file, got {:?}",
+            names
+        );
+        let reloaded = TtsCache::load(&dir).expect("reload cache");
+        assert_eq!(
+            reloaded.get("Xin chào.", "ngochuyen", "+0%"),
+            Some(CachedAudio::new(wav, AudioFormat::Wav))
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -729,16 +812,26 @@ mod tests {
         // inserting entries just under the cap then one more.
         let big = vec![0u8; (MAX_TTS_BYTES / 2 + 1) as usize];
         cache
-            .put("Câu một.", "vi-VN-NamMinhNeural", "+0%", big.clone())
+            .put(
+                "Câu một.",
+                "vi-VN-NamMinhNeural",
+                "+0%",
+                CachedAudio::new(big.clone(), AudioFormat::Mp3),
+            )
             .expect("put first");
         cache
-            .put("Câu hai.", "vi-VN-NamMinhNeural", "+0%", big.clone())
+            .put(
+                "Câu hai.",
+                "vi-VN-NamMinhNeural",
+                "+0%",
+                CachedAudio::new(big.clone(), AudioFormat::Mp3),
+            )
             .expect("put second");
         // The first entry must be evicted (oldest) and its file deleted.
         assert_eq!(cache.get("Câu một.", "vi-VN-NamMinhNeural", "+0%"), None);
         assert_eq!(
             cache.get("Câu hai.", "vi-VN-NamMinhNeural", "+0%"),
-            Some(big)
+            Some(CachedAudio::new(big, AudioFormat::Mp3))
         );
         let audio_dir = dir.join(TTS_AUDIO_DIR);
         let remaining: Vec<_> = std::fs::read_dir(&audio_dir)
@@ -761,7 +854,12 @@ mod tests {
         ));
         let cache = TtsCache::load(&dir).expect("load empty cache");
         cache
-            .put("Vâng.", "vi-VN-NamMinhNeural", "+0%", vec![1, 2, 3])
+            .put(
+                "Vâng.",
+                "vi-VN-NamMinhNeural",
+                "+0%",
+                CachedAudio::new(vec![1, 2, 3], AudioFormat::Mp3),
+            )
             .expect("put");
         assert!(dir.join(TTS_INDEX_FILE).exists());
         cache.clear().expect("clear");

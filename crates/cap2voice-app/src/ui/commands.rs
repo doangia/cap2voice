@@ -16,6 +16,8 @@ use super::tray::TrayMenuAction;
 use crate::api::TtsEngine;
 use crate::audio::AudioPlayer;
 use crate::config::{set_windows_autostart, ConfigError, WindowPosition};
+use crate::pipeline::CachedAudio;
+use crate::tts::{download_voice, find_piper_voice, PiperDownloadEvent, TtsEngineKind};
 use eframe::egui;
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc};
@@ -46,30 +48,22 @@ impl super::Cap2VoiceApp {
         }
     }
 
-    pub(crate) fn handle_select_voice(&mut self, voice: String) {
-        self.state.selected_voice = voice.clone();
-        self.config.voice.voice = voice.clone();
-        self.persist_config();
-        if let Some(handle) = &self.pipeline_handle {
-            if let Err(err) = handle.set_voice(voice) {
-                self.state.ui_notice = Some(err.to_string());
-            }
-        }
-    }
-
     /// Replay the current Chinese line in Chinese (D2: click on the pinyin
-    /// or Chinese line). Uses the A3 TTS cache first (the key includes the
-    /// voice, so Chinese entries never collide with Vietnamese ones); on a
-    /// miss synthesizes via the native Edge-TTS client and stores the
-    /// result in the cache. An explicit user action, so it plays even
-    /// while muted (mute only silences automatic Vietnamese reading).
-    /// No-ops when no Chinese line is shown.
+    /// or Chinese line). Always uses Edge-TTS (`zh-CN-XiaoxiaoNeural`) —
+    /// Piper only ships Vietnamese voices. Uses the A3 TTS cache first (the
+    /// key includes the voice, so Chinese entries never collide with
+    /// Vietnamese ones); on a miss synthesizes via the native Edge-TTS
+    /// client and stores the result in the cache. An explicit user action,
+    /// so it plays even while muted (mute only silences automatic
+    /// Vietnamese reading). No-ops when no Chinese line is shown.
     pub(crate) fn handle_replay_chinese(&mut self, ctx: &egui::Context) {
         let chinese = self.state.pipeline.chinese_line.trim().to_string();
         if chinese.is_empty() {
             return;
         }
-        let tts_engine = Arc::clone(&self.tts_engine);
+        // Chinese replay always goes through the inner Edge-TTS client,
+        // even when Piper is the active Vietnamese engine.
+        let tts_engine = self.tts_engine.edge_engine();
 
         let voice = CHINESE_REPLAY_VOICE;
         let rate = self.config.voice.speech_rate.clone();
@@ -81,8 +75,8 @@ impl super::Cap2VoiceApp {
             Err(_) => None,
         };
         if let Some(cache) = &tts_cache {
-            if let Some(mp3) = cache.get(&chinese, voice, &rate) {
-                self.play_replay_audio(mp3, volume);
+            if let Some(audio) = cache.get(&chinese, voice, &rate) {
+                self.play_replay_audio(audio, volume);
                 return;
             }
         }
@@ -108,10 +102,16 @@ impl super::Cap2VoiceApp {
                 .await
                 .map(|synthesis| {
                     if let Some(cache) = &tts_cache {
-                        let _ = cache.put(&chinese, voice, &rate, synthesis.audio.clone());
+                        let _ = cache.put(
+                            &chinese,
+                            voice,
+                            &rate,
+                            CachedAudio::new(synthesis.audio.clone(), synthesis.format),
+                        );
                     }
                     TtsPreviewAudio {
-                        mp3_bytes: synthesis.audio,
+                        audio_bytes: synthesis.audio,
+                        format: synthesis.format,
                         volume,
                     }
                 });
@@ -121,9 +121,38 @@ impl super::Cap2VoiceApp {
         ctx.request_repaint();
     }
 
-    /// Ensure the audio player exists and enqueue already-synthesized MP3
-    /// bytes for immediate playback (cache-hit path of click-to-replay).
-    fn play_replay_audio(&mut self, mp3_bytes: Vec<u8>, volume: f32) {
+    /// Replay the current Vietnamese line in Vietnamese (click on the
+    /// Vietnamese line). Mirrors `handle_replay_chinese`, except it uses
+    /// the CURRENT TTS engine (`self.tts_engine`, the switchable) and the
+    /// configured voice — so with Piper active the replay speaks with the
+    /// Piper voice. Uses the A3 TTS cache first (the key includes the
+    /// voice, so Piper entries never collide with Edge-TTS ones); on a
+    /// miss synthesizes via the current engine and stores the result in
+    /// the cache. An explicit user action, so it plays even while muted.
+    /// No-ops when no Vietnamese line is shown.
+    pub(crate) fn handle_replay_vietnamese(&mut self, ctx: &egui::Context) {
+        let vietnamese = self.state.pipeline.vietnamese_line.trim().to_string();
+        if vietnamese.is_empty() {
+            return;
+        }
+        let tts_engine = Arc::clone(&self.tts_engine);
+
+        let voice = self.config.voice.voice.clone();
+        let rate = self.config.voice.speech_rate.clone();
+        let volume = self.config.voice.volume;
+
+        // Fast path: cached audio for this exact (line, voice, rate).
+        let tts_cache = match self.ensure_caches() {
+            Ok((_, cache)) => Some(cache),
+            Err(_) => None,
+        };
+        if let Some(cache) = &tts_cache {
+            if let Some(audio) = cache.get(&vietnamese, &voice, &rate) {
+                self.play_replay_audio(audio, volume);
+                return;
+            }
+        }
+
         if self.audio.is_none() {
             match AudioPlayer::new(volume) {
                 Ok(player) => {
@@ -135,10 +164,53 @@ impl super::Cap2VoiceApp {
                 }
             }
         }
-        if let Some(audio) = &self.audio {
-            let play_res = audio
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.vietnamese_replay_rx = Some(rx);
+        let ctx_wake = ctx.clone();
+        self.runtime.spawn(async move {
+            let res = tts_engine
+                .synthesize(&vietnamese, &voice, &rate)
+                .await
+                .map(|synthesis| {
+                    if let Some(cache) = &tts_cache {
+                        let _ = cache.put(
+                            &vietnamese,
+                            &voice,
+                            &rate,
+                            CachedAudio::new(synthesis.audio.clone(), synthesis.format),
+                        );
+                    }
+                    TtsPreviewAudio {
+                        audio_bytes: synthesis.audio,
+                        format: synthesis.format,
+                        volume,
+                    }
+                });
+            let _ = tx.send(res);
+            ctx_wake.request_repaint();
+        });
+        ctx.request_repaint();
+    }
+
+    /// Ensure the audio player exists and enqueue already-synthesized audio
+    /// bytes for immediate playback (cache-hit path of click-to-replay).
+    fn play_replay_audio(&mut self, audio: CachedAudio, volume: f32) {
+        if self.audio.is_none() {
+            match AudioPlayer::new(volume) {
+                Ok(player) => {
+                    self.audio = Some(Arc::new(player));
+                }
+                Err(err) => {
+                    self.state.ui_notice = Some(format!("Lỗi âm thanh: {err}"));
+                    return;
+                }
+            }
+        }
+        if let Some(audio_player) = &self.audio {
+            let play_res = audio_player
                 .set_volume(volume)
-                .and_then(|()| audio.enqueue_mp3(mp3_bytes));
+                .and_then(|()| audio_player.enqueue_audio(audio.bytes, audio.format));
             if let Err(err) = play_res {
                 self.state.ui_notice = Some(format!("Lỗi phát âm thanh: {err}"));
             }
@@ -291,6 +363,7 @@ impl super::Cap2VoiceApp {
                 self.open_region_selector(ctx, RegionSelectionTarget::SettingsDraft);
             }
             SettingsCommand::PreviewVoice {
+                engine,
                 voice,
                 rate,
                 volume,
@@ -313,21 +386,43 @@ impl super::Cap2VoiceApp {
                     draft.tts_preview_status =
                         AsyncFeedbackState::InProgress(format!("Đang tạo mẫu giọng {voice}..."));
                 }
+                // Preview uses the DRAFT engine/voice (before saving). For
+                // Piper, make sure the model load is running so the
+                // preview can use it once ready.
+                if engine == TtsEngineKind::Piper {
+                    self.tts_engine.ensure_piper_loading();
+                }
                 let tts_engine = Arc::clone(&self.tts_engine);
                 let (tx, rx) = mpsc::sync_channel(1);
                 self.tts_preview_rx = Some(rx);
                 let ctx_wake = ctx.clone();
                 self.runtime.spawn(async move {
                     let res = tts_engine
-                        .synthesize(SETTINGS_PREVIEW_SAMPLE_TEXT, &voice, &rate)
+                        .synthesize_as(engine, SETTINGS_PREVIEW_SAMPLE_TEXT, &voice, &rate)
                         .await
                         .map(|synthesis| TtsPreviewAudio {
-                            mp3_bytes: synthesis.audio,
+                            audio_bytes: synthesis.audio,
+                            format: synthesis.format,
                             volume,
                         });
                     let _ = tx.send(res);
                     ctx_wake.request_repaint();
                 });
+                ctx.request_repaint();
+            }
+            SettingsCommand::DownloadPiperVoice { voice_id } => {
+                match find_piper_voice(&voice_id) {
+                    Some(voice) => {
+                        self.piper_download_rx = Some(download_voice(voice, &self.voices_dir));
+                    }
+                    None => {
+                        if let Some(draft) = &mut self.settings_draft {
+                            draft.apply_piper_download_event(PiperDownloadEvent::Error(format!(
+                                "giọng Piper '{voice_id}' không có trong danh sách"
+                            )));
+                        }
+                    }
+                }
                 ctx.request_repaint();
             }
             SettingsCommand::Save(new_config) => {
@@ -384,6 +479,18 @@ impl super::Cap2VoiceApp {
                             if let Some(translator) = &self.translator {
                                 translator.set_engine(self.config.translation.engine);
                             }
+                        }
+                        if effects.tts_engine_changed {
+                            // Runtime TTS engine switch (no restart): the
+                            // pipeline holds the same `Arc<SwitchableTtsEngine>`,
+                            // so the next synthesis already uses the new
+                            // engine. Switching to Piper triggers the
+                            // background model load when needed.
+                            self.tts_engine.set_engine(self.config.voice.engine);
+                        }
+                        if effects.piper_voice_changed {
+                            self.tts_engine
+                                .set_piper_voice(self.config.voice.voice.clone());
                         }
                         if prev_hotkeys != self.config.hotkeys {
                             self.reregister_hotkeys();
@@ -480,12 +587,12 @@ impl super::Cap2VoiceApp {
                 OverlayCommand::StartPipeline => self.handle_start_pipeline(ctx),
                 OverlayCommand::StopPipeline => self.handle_stop_pipeline(ctx),
                 OverlayCommand::ToggleMute => self.handle_toggle_mute(),
-                OverlayCommand::SelectVoice(voice) => self.handle_select_voice(voice),
                 OverlayCommand::ToggleRegionPanel => {
                     self.open_region_selector(ctx, RegionSelectionTarget::LiveConfig);
                 }
                 OverlayCommand::ToggleSettingsPanel => self.open_settings_window(ctx),
                 OverlayCommand::ReplayChinese => self.handle_replay_chinese(ctx),
+                OverlayCommand::ReplayVietnamese => self.handle_replay_vietnamese(ctx),
                 OverlayCommand::CloseWindow => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }

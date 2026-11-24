@@ -47,26 +47,68 @@ pub fn validate_volume(volume: f32) -> Result<f32, AudioError> {
     Ok(volume)
 }
 
-/// Decode raw MP3 bytes into a `rodio::Decoder`.
-pub fn decode_mp3_bytes(mp3_bytes: Vec<u8>) -> Result<rodio::Decoder<Cursor<Vec<u8>>>, AudioError> {
-    if mp3_bytes.is_empty() {
+/// Encoding of a TTS audio payload. Edge-TTS returns MP3; Piper returns
+/// WAV (PCM16, 22050 Hz mono). The format travels with the bytes
+/// (`TtsSynthesis::format`, the TTS cache, the playback queue) so each
+/// layer decodes them with the right hint instead of assuming MP3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioFormat {
+    Mp3,
+    Wav,
+}
+
+impl AudioFormat {
+    /// File extension used for cached audio files (`mp3` / `wav`).
+    pub fn extension(self) -> &'static str {
+        match self {
+            AudioFormat::Mp3 => "mp3",
+            AudioFormat::Wav => "wav",
+        }
+    }
+
+    /// `rodio` decoder hint for this encoding.
+    pub fn decoder_hint(self) -> &'static str {
+        match self {
+            AudioFormat::Mp3 => "mp3",
+            AudioFormat::Wav => "wav",
+        }
+    }
+}
+
+/// Decode raw audio bytes in `format` into a `rodio::Decoder`.
+pub fn decode_audio_bytes(
+    audio_bytes: Vec<u8>,
+    format: AudioFormat,
+) -> Result<rodio::Decoder<Cursor<Vec<u8>>>, AudioError> {
+    if audio_bytes.is_empty() {
         return Err(AudioError::EmptyAudio);
     }
-    let byte_len = mp3_bytes.len() as u64;
+    let byte_len = audio_bytes.len() as u64;
     rodio::Decoder::builder()
-        .with_data(Cursor::new(mp3_bytes))
+        .with_data(Cursor::new(audio_bytes))
         .with_byte_len(byte_len)
         .with_seekable(true)
-        .with_hint("mp3")
+        .with_hint(format.decoder_hint())
         .build()
         .map_err(|err| AudioError::DecodeFailed {
             detail: err.to_string(),
         })
 }
 
+/// Decode raw MP3 bytes into a `rodio::Decoder`.
+pub fn decode_mp3_bytes(mp3_bytes: Vec<u8>) -> Result<rodio::Decoder<Cursor<Vec<u8>>>, AudioError> {
+    decode_audio_bytes(mp3_bytes, AudioFormat::Mp3)
+}
+
+/// Validate that raw bytes represent a non-empty, decodable audio stream
+/// in `format`.
+pub fn validate_audio_bytes(audio_bytes: &[u8], format: AudioFormat) -> Result<(), AudioError> {
+    decode_audio_bytes(audio_bytes.to_vec(), format).map(|_| ())
+}
+
 /// Validate that raw bytes represent a non-empty, decodable MP3 stream.
 pub fn validate_mp3_bytes(mp3_bytes: &[u8]) -> Result<(), AudioError> {
-    decode_mp3_bytes(mp3_bytes.to_vec()).map(|_| ())
+    validate_audio_bytes(mp3_bytes, AudioFormat::Mp3)
 }
 
 /// Pure-logic bounded FIFO queue that retains at most `max_pending` unplayed items,
@@ -154,7 +196,7 @@ pub struct EnqueueOutcome {
 
 /// Low-level audio playback backend used inside `AudioPlayer`'s worker thread.
 pub trait AudioBackend {
-    fn play_mp3(&mut self, mp3_bytes: Vec<u8>) -> Result<(), AudioError>;
+    fn play_audio(&mut self, audio_bytes: Vec<u8>, format: AudioFormat) -> Result<(), AudioError>;
     fn is_playing(&self) -> bool;
     fn set_volume(&mut self, volume: f32);
     fn stop_immediately(&mut self);
@@ -162,7 +204,15 @@ pub trait AudioBackend {
 
 /// Thread-safe audio playback boundary for pipeline and UI callers.
 pub trait AudioPlayback: Send + Sync {
-    fn enqueue_mp3(&self, mp3_bytes: Vec<u8>) -> Result<EnqueueOutcome, AudioError>;
+    fn enqueue_audio(
+        &self,
+        audio_bytes: Vec<u8>,
+        format: AudioFormat,
+    ) -> Result<EnqueueOutcome, AudioError>;
+    /// MP3 shorthand for `enqueue_audio(bytes, AudioFormat::Mp3)`.
+    fn enqueue_mp3(&self, mp3_bytes: Vec<u8>) -> Result<EnqueueOutcome, AudioError> {
+        self.enqueue_audio(mp3_bytes, AudioFormat::Mp3)
+    }
     fn set_volume(&self, volume: f32) -> Result<(), AudioError>;
     fn volume(&self) -> f32;
     fn stop_and_clear(&self) -> Result<(), AudioError>;
@@ -192,8 +242,8 @@ impl RodioTrack {
         self.player.play();
     }
 
-    fn play_mp3(&mut self, mp3_bytes: Vec<u8>) -> Result<(), AudioError> {
-        let decoder = decode_mp3_bytes(mp3_bytes)?;
+    fn play_audio(&mut self, audio_bytes: Vec<u8>, format: AudioFormat) -> Result<(), AudioError> {
+        let decoder = decode_audio_bytes(audio_bytes, format)?;
         self.play_source(decoder);
         Ok(())
     }
@@ -233,8 +283,8 @@ impl RodioBackend {
 }
 
 impl AudioBackend for RodioBackend {
-    fn play_mp3(&mut self, mp3_bytes: Vec<u8>) -> Result<(), AudioError> {
-        self.track.play_mp3(mp3_bytes)
+    fn play_audio(&mut self, audio_bytes: Vec<u8>, format: AudioFormat) -> Result<(), AudioError> {
+        self.track.play_audio(audio_bytes, format)
     }
 
     fn is_playing(&self) -> bool {
@@ -251,7 +301,7 @@ impl AudioBackend for RodioBackend {
 }
 
 struct SharedAudioState {
-    queue: BoundedAudioQueue<Vec<u8>>,
+    queue: BoundedAudioQueue<(Vec<u8>, AudioFormat)>,
     volume: f32,
     volume_generation: u64,
     handled_volume_generation: u64,
@@ -285,7 +335,7 @@ impl Drop for WorkerExitGuard {
     }
 }
 
-type ClipValidator = Box<dyn Fn(&[u8]) -> Result<(), AudioError> + Send + Sync>;
+type ClipValidator = Box<dyn Fn(&[u8], AudioFormat) -> Result<(), AudioError> + Send + Sync>;
 
 /// Non-overlapping bounded FIFO audio player backed by a dedicated worker thread.
 pub struct AudioPlayer {
@@ -306,7 +356,7 @@ impl AudioPlayer {
             initial_volume,
             max_pending,
             RodioBackend::open_default,
-            validate_mp3_bytes,
+            validate_audio_bytes,
         )
     }
 
@@ -320,7 +370,7 @@ impl AudioPlayer {
     where
         B: AudioBackend + 'static,
         F: FnOnce(f32) -> Result<B, AudioError> + Send + 'static,
-        V: Fn(&[u8]) -> Result<(), AudioError> + Send + Sync + 'static,
+        V: Fn(&[u8], AudioFormat) -> Result<(), AudioError> + Send + Sync + 'static,
     {
         let volume = validate_volume(initial_volume)?;
         let queue = BoundedAudioQueue::new(max_pending)?;
@@ -379,8 +429,13 @@ impl AudioPlayer {
         }
     }
 
-    /// Validate an MP3 payload and enqueue it onto the bounded FIFO queue.
-    pub fn enqueue_mp3(&self, mp3_bytes: Vec<u8>) -> Result<EnqueueOutcome, AudioError> {
+    /// Validate an audio payload in `format` and enqueue it onto the
+    /// bounded FIFO queue.
+    pub fn enqueue_audio(
+        &self,
+        audio_bytes: Vec<u8>,
+        format: AudioFormat,
+    ) -> Result<EnqueueOutcome, AudioError> {
         {
             let (lock, _) = &*self.shared;
             let state = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -389,7 +444,7 @@ impl AudioPlayer {
             }
         }
 
-        if let Err(err) = (self.validator)(&mp3_bytes) {
+        if let Err(err) = (self.validator)(&audio_bytes, format) {
             let (lock, _) = &*self.shared;
             let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
             state.last_error = Some(err.clone());
@@ -401,13 +456,18 @@ impl AudioPlayer {
         if state.worker_exited || state.shutdown {
             return Err(AudioError::WorkerStopped);
         }
-        let dropped_oldest = state.queue.push(mp3_bytes).is_some();
+        let dropped_oldest = state.queue.push((audio_bytes, format)).is_some();
         let pending_len = state.queue.len();
         cvar.notify_all();
         Ok(EnqueueOutcome {
             pending_len,
             dropped_oldest,
         })
+    }
+
+    /// MP3 shorthand for `enqueue_audio(bytes, AudioFormat::Mp3)`.
+    pub fn enqueue_mp3(&self, mp3_bytes: Vec<u8>) -> Result<EnqueueOutcome, AudioError> {
+        self.enqueue_audio(mp3_bytes, AudioFormat::Mp3)
     }
 
     /// Update playback gain linearly within `0.0..=1.0` and wait until applied by the worker.
@@ -526,7 +586,7 @@ fn run_worker_loop<B: AudioBackend>(
             Exit,
             Stop { stop_gen: u64 },
             SetVolume { volume: f32, volume_gen: u64 },
-            StartClip(Vec<u8>),
+            StartClip(Vec<u8>, AudioFormat),
             PollPlayback,
             WaitIdle,
         }
@@ -546,10 +606,10 @@ fn run_worker_loop<B: AudioBackend>(
                 }
             } else if state.is_playing {
                 WorkerAction::PollPlayback
-            } else if let Some(next_clip) = state.queue.pop_next() {
+            } else if let Some((next_clip, next_format)) = state.queue.pop_next() {
                 state.is_playing = true;
                 cvar.notify_all();
-                WorkerAction::StartClip(next_clip)
+                WorkerAction::StartClip(next_clip, next_format)
             } else {
                 WorkerAction::WaitIdle
             }
@@ -582,8 +642,8 @@ fn run_worker_loop<B: AudioBackend>(
                 }
                 cvar.notify_all();
             }
-            WorkerAction::StartClip(bytes) => {
-                let res = backend.play_mp3(bytes);
+            WorkerAction::StartClip(bytes, format) => {
+                let res = backend.play_audio(bytes, format);
                 let active_now = if res.is_ok() {
                     backend.is_playing()
                 } else {
@@ -625,6 +685,14 @@ fn run_worker_loop<B: AudioBackend>(
 }
 
 impl AudioPlayback for AudioPlayer {
+    fn enqueue_audio(
+        &self,
+        audio_bytes: Vec<u8>,
+        format: AudioFormat,
+    ) -> Result<EnqueueOutcome, AudioError> {
+        Self::enqueue_audio(self, audio_bytes, format)
+    }
+
     fn enqueue_mp3(&self, mp3_bytes: Vec<u8>) -> Result<EnqueueOutcome, AudioError> {
         Self::enqueue_mp3(self, mp3_bytes)
     }
@@ -665,8 +733,8 @@ impl AudioPlayback for AudioPlayer {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_mp3_bytes, validate_volume, AudioError, BoundedAudioQueue, RodioTrack,
-        DEFAULT_MAX_PENDING_CLIPS, DEFAULT_VOLUME,
+        decode_audio_bytes, decode_mp3_bytes, validate_audio_bytes, validate_volume, AudioError,
+        AudioFormat, BoundedAudioQueue, RodioTrack, DEFAULT_MAX_PENDING_CLIPS, DEFAULT_VOLUME,
     };
     use rodio::buffer::SamplesBuffer;
     use rodio::nz;
@@ -763,6 +831,48 @@ mod tests {
         assert!(matches!(
             validate_volume(f32::NEG_INFINITY),
             Err(AudioError::InvalidVolume { .. })
+        ));
+    }
+
+    #[test]
+    fn decode_audio_bytes_accepts_wav() {
+        // Minimal valid WAV: PCM16 mono 22050 Hz, 4 silent samples.
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&36u32.to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+        wav.extend_from_slice(&22050u32.to_le_bytes());
+        wav.extend_from_slice(&44100u32.to_le_bytes()); // byte rate
+        wav.extend_from_slice(&2u16.to_le_bytes()); // block align
+        wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&8u32.to_le_bytes());
+        wav.extend_from_slice(&[0u8; 8]);
+        // Fix the RIFF chunk size (36 + data size).
+        let riff_size = (wav.len() - 8) as u32;
+        wav[4..8].copy_from_slice(&riff_size.to_le_bytes());
+
+        assert!(validate_audio_bytes(&wav, AudioFormat::Wav).is_ok());
+        let decoder = match decode_audio_bytes(wav.clone(), AudioFormat::Wav) {
+            Ok(dec) => dec,
+            Err(err) => panic!("expected synthetic WAV to decode, got: {err}"),
+        };
+        let samples: Vec<f32> = decoder.collect();
+        assert_eq!(samples.len(), 4);
+        assert!(samples.iter().all(|s| *s == 0.0));
+
+        // NOTE: the format hint is advisory only — symphonia probes the
+        // content, so the same bytes decode under either hint. The
+        // `AudioFormat` carried with the bytes (cache, queue) is what
+        // routes them; it is not enforced here.
+        assert!(decode_audio_bytes(wav, AudioFormat::Mp3).is_ok());
+        assert!(matches!(
+            decode_audio_bytes(Vec::new(), AudioFormat::Wav),
+            Err(AudioError::EmptyAudio)
         ));
     }
 

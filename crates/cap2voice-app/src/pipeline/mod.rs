@@ -3,7 +3,7 @@
 pub mod cache;
 pub mod logger;
 
-pub use cache::{normalize_cache_key, CacheError, TranslationCache, TtsCache};
+pub use cache::{normalize_cache_key, CacheError, CachedAudio, TranslationCache, TtsCache};
 pub use logger::{daily_log_path, format_subtitle_log_line, SubtitleLogError, SubtitleLogger};
 
 use crate::api::{TranslateError, Translator, TtsEngine, TtsSynthesis};
@@ -1321,18 +1321,19 @@ async fn process_emitted_subtitle(
     }
 
     // Completed sentences consult the TTS cache (A3 / gh #2); a cache hit
-    // skips the `/tts` call entirely. `tts_calls` counts real syntheses.
-    let (cached_mp3, tts_cache_hit) = match &deps.tts_cache {
+    // skips the synthesis call entirely. `tts_calls` counts real syntheses.
+    let (cached_audio, tts_cache_hit) = match &deps.tts_cache {
         Some(cache) => match cache.get(&vietnamese, &voice, &rate) {
-            Some(mp3) => (Some(mp3), true),
+            Some(audio) => (Some(audio), true),
             None => (None, false),
         },
         None => (None, false),
     };
 
-    let tts_res = match cached_mp3 {
-        Some(mp3) => Ok(TtsSynthesis {
-            audio: mp3,
+    let tts_res = match cached_audio {
+        Some(audio) => Ok(TtsSynthesis {
+            audio: audio.bytes,
+            format: audio.format,
             retries: Vec::new(),
         }),
         None => deps.tts.synthesize(&vietnamese, &voice, &rate).await,
@@ -1362,7 +1363,7 @@ async fn process_emitted_subtitle(
         }
     }
 
-    let mp3_bytes = {
+    let (audio_bytes, audio_format) = {
         let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
         if !tts_cache_hit {
             state.snapshot.metrics.tts_calls += 1;
@@ -1373,13 +1374,19 @@ async fn process_emitted_subtitle(
         }
         match tts_res {
             Ok(synthesis) => {
-                // Store freshly synthesized audio in the TTS cache (A3).
+                // Store freshly synthesized audio in the TTS cache (A3),
+                // in the engine's format (MP3 for Edge-TTS, WAV for Piper).
                 if !tts_cache_hit {
                     if let Some(cache) = &deps.tts_cache {
-                        let _ = cache.put(&vietnamese, &voice, &rate, synthesis.audio.clone());
+                        let _ = cache.put(
+                            &vietnamese,
+                            &voice,
+                            &rate,
+                            CachedAudio::new(synthesis.audio.clone(), synthesis.format),
+                        );
                     }
                 }
-                synthesis.audio
+                (synthesis.audio, synthesis.format)
             }
             Err(err) => {
                 state.set_banner(PipelineErrorKind::Tts, format!("Lỗi giọng đọc TTS: {err}"));
@@ -1388,7 +1395,7 @@ async fn process_emitted_subtitle(
         }
     };
 
-    if let Err(err) = deps.audio.enqueue_mp3(mp3_bytes) {
+    if let Err(err) = deps.audio.enqueue_audio(audio_bytes, audio_format) {
         let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
         state.set_banner(
             PipelineErrorKind::Audio,

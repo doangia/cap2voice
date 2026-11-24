@@ -37,6 +37,7 @@
 //!   adjusting the clock skew from the server's `Date` header.
 
 use crate::api::{BoxFuture, TtsEngine, TtsError, TtsRetryAttempt, TtsSynthesis, TTS_MAX_RETRIES};
+use crate::audio::AudioFormat;
 use futures_util::{SinkExt, StreamExt};
 use sha2::{Digest, Sha256};
 use std::future::Future;
@@ -44,6 +45,13 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message;
+
+/// Built-in Edge-TTS Vietnamese voice options (`id`, Vietnamese UI label).
+/// The default voice is `vi-VN-NamMinhNeural` (`config.rs`).
+pub const AVAILABLE_VOICES: &[(&str, &str)] = &[
+    ("vi-VN-NamMinhNeural", "vi-VN-NamMinhNeural (Nam)"),
+    ("vi-VN-HoaiMyNeural", "vi-VN-HoaiMyNeural (Nữ)"),
+];
 
 /// The trusted client token doubles as the subscription key (public
 /// constant from the `edge-tts` source; it is the Edge browser's key).
@@ -673,7 +681,11 @@ impl TtsEngine for EdgeTtsEngine {
             let (result, retries) =
                 retry_with_backoff(|| self.synthesize_attempt(&text, &voice, &rate), &delays).await;
             match result {
-                Ok(audio) => Ok(TtsSynthesis { audio, retries }),
+                Ok(audio) => Ok(TtsSynthesis {
+                    audio,
+                    format: AudioFormat::Mp3,
+                    retries,
+                }),
                 Err(mut err) => {
                     err.set_retries(retries);
                     Err(err)

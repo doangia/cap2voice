@@ -4,8 +4,8 @@
 
 use cap2voice_app::api::TtsEngine;
 use cap2voice_app::audio::{
-    validate_mp3_bytes, AudioBackend, AudioError, AudioPlayback, AudioPlayer, EnqueueOutcome,
-    DEFAULT_MAX_PENDING_CLIPS, DEFAULT_VOLUME,
+    validate_audio_bytes, AudioBackend, AudioError, AudioFormat, AudioPlayback, AudioPlayer,
+    EnqueueOutcome, DEFAULT_MAX_PENDING_CLIPS, DEFAULT_VOLUME,
 };
 use cap2voice_app::tts::EdgeTtsEngine;
 use std::sync::{Arc, Condvar, Mutex};
@@ -109,7 +109,7 @@ struct FakeAudioBackend {
 }
 
 impl AudioBackend for FakeAudioBackend {
-    fn play_mp3(&mut self, mp3_bytes: Vec<u8>) -> Result<(), AudioError> {
+    fn play_audio(&mut self, audio_bytes: Vec<u8>, _format: AudioFormat) -> Result<(), AudioError> {
         let (lock, cvar) = &*self.controller.inner;
         let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(err) = guard.fail_next_play_with.take() {
@@ -119,8 +119,8 @@ impl AudioBackend for FakeAudioBackend {
         if guard.active_count > guard.max_concurrent_active {
             guard.max_concurrent_active = guard.active_count;
         }
-        guard.active_clip = Some(mp3_bytes.clone());
-        guard.played_order.push(mp3_bytes);
+        guard.active_clip = Some(audio_bytes.clone());
+        guard.played_order.push(audio_bytes);
         cvar.notify_all();
         Ok(())
     }
@@ -147,7 +147,7 @@ impl AudioBackend for FakeAudioBackend {
     }
 }
 
-fn accept_non_empty(bytes: &[u8]) -> Result<(), AudioError> {
+fn accept_non_empty(bytes: &[u8], _format: AudioFormat) -> Result<(), AudioError> {
     if bytes.is_empty() {
         return Err(AudioError::EmptyAudio);
     }
@@ -425,7 +425,7 @@ fn audio_player_surfaces_device_open_and_decode_errors_without_panicking() {
                 controller: backend_ctrl,
             })
         },
-        validate_mp3_bytes,
+        validate_audio_bytes,
     ) {
         Ok(p) => p,
         Err(err) => panic!("expected fake AudioPlayer init to succeed: {err}"),

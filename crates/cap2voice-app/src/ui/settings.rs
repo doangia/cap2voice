@@ -4,9 +4,12 @@
 use crate::config::{AppConfig, CaptureRegion, HotkeyConfig};
 use crate::ocr::{resolve_wechat_paths_from_config, WeChatOcrPaths};
 use crate::translate::{TranslationEngine, TranslatorStatus};
+use crate::tts::{
+    default_voices_dir, find_piper_voice, voice_files_present, PiperDownloadEvent, TtsEngineKind,
+    AVAILABLE_VOICES, DEFAULT_PIPER_VOICE_ID, PIPER_VOICES,
+};
 use crate::ui::fonts::parse_hex_color;
 use crate::ui::icons::{IconButton, UiIcon};
-use crate::ui::overlay::AVAILABLE_VOICES;
 use eframe::egui;
 use std::path::PathBuf;
 
@@ -84,7 +87,7 @@ impl SettingsTab {
         match self {
             Self::General => "Tốc độ chụp, vùng phụ đề, WeChat OCR và hành vi cửa sổ",
             Self::Translation => "Engine dịch và độ nhạy phát hiện phụ đề",
-            Self::Voice => "Cấu hình giọng đọc Edge-TTS tiếng Việt và nghe thử",
+            Self::Voice => "Engine giọng đọc (Edge-TTS / Piper), giọng, và nghe thử",
             Self::Display => "Cỡ chữ, độ mờ và màu sắc phụ đề trên overlay",
             Self::Hotkeys => "Phím tắt toàn cục khi xem video ở cửa sổ khác",
         }
@@ -107,13 +110,33 @@ pub enum SettingsCommand {
     Save(Box<AppConfig>),
     SelectRegion,
     PreviewVoice {
+        engine: TtsEngineKind,
         voice: String,
         rate: String,
         volume: f32,
     },
+    /// Download a Piper voice on demand (Settings → Giọng đọc, "Tải giọng").
+    /// The app spawns the background download and reports progress into
+    /// the draft's `piper_download` state.
+    DownloadPiperVoice {
+        voice_id: String,
+    },
     /// Clear the translation + TTS caches (A3 / gh #2): removes all cached
     /// text and audio from memory and disk.
     ClearCache,
+}
+
+/// Progress of an in-flight (or just finished) Piper voice download,
+/// shown on the Voice tab. Plain data — the channel receiver lives on
+/// `Cap2VoiceApp`, which drains it and updates this struct each frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PiperDownloadProgress {
+    pub voice_id: String,
+    pub downloaded: u64,
+    pub total: Option<u64>,
+    /// User-facing status line ("Đang tải…", "Đã tải xong", "Lỗi: …").
+    pub status: String,
+    pub done: bool,
 }
 
 /// Isolated draft model backing the Settings window until saved or discarded.
@@ -132,6 +155,12 @@ pub struct SettingsDraftState {
     /// translator was available at open time.
     pub translator_status: Option<TranslatorStatus>,
     pub tts_preview_status: AsyncFeedbackState,
+    /// Resolved Piper voices directory (`%APPDATA%\cap2voice\voices\piper`),
+    /// `None` when it cannot be resolved (no APPDATA) — the download UI
+    /// then shows a notice instead of the download button.
+    pub piper_voices_dir: Option<PathBuf>,
+    /// Progress of the Piper voice download started from this window.
+    pub piper_download: Option<PiperDownloadProgress>,
 }
 
 fn optional_path_from_input(raw: &str) -> Option<PathBuf> {
@@ -223,6 +252,64 @@ impl SettingsDraftState {
             validation_error: None,
             translator_status: None,
             tts_preview_status: AsyncFeedbackState::Idle,
+            piper_voices_dir: default_voices_dir().ok(),
+            piper_download: None,
+        }
+    }
+
+    /// Default voice id for a TTS engine (Edge → NamMinh, Piper → Ngọc Huyền).
+    pub fn default_voice_for_engine(engine: TtsEngineKind) -> &'static str {
+        match engine {
+            TtsEngineKind::Edge => "vi-VN-NamMinhNeural",
+            TtsEngineKind::Piper => DEFAULT_PIPER_VOICE_ID,
+        }
+    }
+
+    /// Mark a Piper voice download as started (called when the user clicks
+    /// "Tải giọng"); the app updates `piper_download` as progress arrives.
+    pub fn start_piper_download(&mut self, voice_id: String) {
+        self.piper_download = Some(PiperDownloadProgress {
+            voice_id,
+            downloaded: 0,
+            total: None,
+            status: "Đang bắt đầu tải…".to_string(),
+            done: false,
+        });
+    }
+
+    /// Apply one download event to the draft's progress state.
+    pub fn apply_piper_download_event(&mut self, event: PiperDownloadEvent) {
+        match event {
+            PiperDownloadEvent::Progress { downloaded, total } => {
+                if let Some(progress) = &mut self.piper_download {
+                    progress.downloaded = downloaded;
+                    progress.total = total;
+                    let total_mb = total.map(|t| t as f64 / 1_048_576.0);
+                    progress.status = match total_mb {
+                        Some(total) => format!(
+                            "Đang tải… {:.1} / {:.1} MB",
+                            downloaded as f64 / 1_048_576.0,
+                            total
+                        ),
+                        None => format!("Đang tải… {:.1} MB", downloaded as f64 / 1_048_576.0),
+                    };
+                }
+            }
+            PiperDownloadEvent::Done { voice_id } => {
+                self.piper_download = Some(PiperDownloadProgress {
+                    voice_id,
+                    downloaded: 0,
+                    total: None,
+                    status: "Đã tải xong — sẵn sàng dùng".to_string(),
+                    done: true,
+                });
+            }
+            PiperDownloadEvent::Error(detail) => {
+                if let Some(progress) = &mut self.piper_download {
+                    progress.status = format!("Lỗi tải giọng: {detail}");
+                    progress.done = false;
+                }
+            }
         }
     }
 
@@ -622,28 +709,65 @@ fn render_voice_tab(
     state: &mut SettingsDraftState,
     emitted: &mut Option<SettingsCommand>,
 ) {
+    // Switching the engine resets the voice to that engine's default, so
+    // the draft never pairs an Edge voice id with Piper (or vice versa).
+    let prev_engine = state.draft.voice.engine;
     egui::Grid::new("settings_voice_grid")
         .num_columns(2)
         .spacing([18.0, 12.0])
         .show(ui, |ui| {
-            ui.label("Giọng đọc");
-            let voice_label = AVAILABLE_VOICES
-                .iter()
-                .find(|(id, _)| *id == state.draft.voice.voice)
-                .map(|(_, label)| *label)
-                .unwrap_or(state.draft.voice.voice.as_str());
-            egui::ComboBox::from_id_salt("settings_voice_select")
-                .selected_text(voice_label)
+            ui.label("Engine giọng đọc");
+            egui::ComboBox::from_id_salt("settings_tts_engine")
+                .selected_text(state.draft.voice.engine.label())
                 .width(230.0)
                 .show_ui(ui, |ui| {
-                    for (voice_id, label) in AVAILABLE_VOICES {
-                        ui.selectable_value(
-                            &mut state.draft.voice.voice,
-                            (*voice_id).to_string(),
-                            *label,
-                        );
+                    for engine in TtsEngineKind::ALL {
+                        ui.selectable_value(&mut state.draft.voice.engine, engine, engine.label());
                     }
                 });
+            ui.end_row();
+
+            ui.label("Giọng đọc");
+            match state.draft.voice.engine {
+                TtsEngineKind::Edge => {
+                    let voice_label = AVAILABLE_VOICES
+                        .iter()
+                        .find(|(id, _)| *id == state.draft.voice.voice)
+                        .map(|(_, label)| *label)
+                        .unwrap_or(state.draft.voice.voice.as_str());
+                    egui::ComboBox::from_id_salt("settings_voice_select")
+                        .selected_text(voice_label)
+                        .width(230.0)
+                        .show_ui(ui, |ui| {
+                            for (voice_id, label) in AVAILABLE_VOICES {
+                                ui.selectable_value(
+                                    &mut state.draft.voice.voice,
+                                    (*voice_id).to_string(),
+                                    *label,
+                                );
+                            }
+                        });
+                }
+                TtsEngineKind::Piper => {
+                    let voice_label = PIPER_VOICES
+                        .iter()
+                        .find(|voice| voice.id == state.draft.voice.voice)
+                        .map(|voice| voice.label)
+                        .unwrap_or(state.draft.voice.voice.as_str());
+                    egui::ComboBox::from_id_salt("settings_piper_voice_select")
+                        .selected_text(voice_label)
+                        .width(230.0)
+                        .show_ui(ui, |ui| {
+                            for voice in PIPER_VOICES {
+                                ui.selectable_value(
+                                    &mut state.draft.voice.voice,
+                                    voice.id.to_string(),
+                                    voice.label,
+                                );
+                            }
+                        });
+                }
+            }
             ui.end_row();
 
             ui.label("Âm lượng");
@@ -680,6 +804,98 @@ fn render_voice_tab(
                 });
             ui.end_row();
         });
+    if state.draft.voice.engine != prev_engine {
+        state.draft.voice.voice =
+            SettingsDraftState::default_voice_for_engine(state.draft.voice.engine).to_string();
+        // A fresh engine has no download in flight for the new voice.
+        state.piper_download = None;
+    }
+
+    // Piper voice download (on demand — the 63.5 MB model is never
+    // bundled). Shown only when Piper is the selected engine.
+    if state.draft.voice.engine == TtsEngineKind::Piper {
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(8.0);
+        match &state.piper_voices_dir {
+            None => {
+                ui.label(
+                    egui::RichText::new(
+                        "Không xác định được thư mục giọng (thiếu APPDATA) — không tải được giọng Piper.",
+                    )
+                    .size(12.5)
+                    .color(egui::Color32::from_rgb(248, 113, 113)),
+                );
+            }
+            Some(voices_dir) => {
+                let voice_id = state.draft.voice.voice.clone();
+                let voice = find_piper_voice(&voice_id);
+                let downloaded = voice.is_some_and(|v| voice_files_present(v, voices_dir));
+                let downloading = state
+                    .piper_download
+                    .as_ref()
+                    .is_some_and(|p| p.voice_id == voice_id && !p.done);
+                ui.horizontal(|ui| {
+                    if downloaded {
+                        ui.label(
+                            egui::RichText::new("Giọng đã tải — sẵn sàng dùng (offline).")
+                                .size(12.5)
+                                .color(egui::Color32::from_rgb(74, 222, 128)),
+                        );
+                    } else if downloading {
+                        if let Some(progress) = &state.piper_download {
+                            let fraction = match progress.total {
+                                Some(total) if total > 0 => {
+                                    (progress.downloaded as f32 / total as f32).clamp(0.0, 1.0)
+                                }
+                                _ => 0.0,
+                            };
+                            ui.add(
+                                egui::ProgressBar::new(fraction)
+                                    .desired_width(220.0)
+                                    .text(progress.status.clone()),
+                            );
+                        }
+                    } else if ui.button("Tải giọng").clicked() {
+                        state.start_piper_download(voice_id.clone());
+                        *emitted = Some(SettingsCommand::DownloadPiperVoice {
+                            voice_id: voice_id.clone(),
+                        });
+                    }
+                    if let Some(progress) = &state.piper_download {
+                        if progress.voice_id == voice_id && progress.done {
+                            ui.label(
+                                egui::RichText::new(progress.status.clone())
+                                    .size(12.5)
+                                    .color(egui::Color32::from_rgb(74, 222, 128)),
+                            );
+                        } else if progress.voice_id == voice_id
+                            && progress.status.starts_with("Lỗi")
+                        {
+                            ui.label(
+                                egui::RichText::new(progress.status.clone())
+                                    .size(12.5)
+                                    .color(egui::Color32::from_rgb(248, 113, 113)),
+                            );
+                        }
+                    }
+                });
+                if !downloaded && !downloading {
+                    if let Some(voice) = voice {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Giọng Piper tải về khi cần ({} MB), lưu tại %APPDATA%\\cap2voice\\voices\\piper\\{} — chỉ dùng cá nhân.",
+                                voice.onnx_bytes / 1_048_576,
+                                voice.id
+                            ))
+                            .size(12.0)
+                            .color(muted_text_color()),
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     ui.add_space(10.0);
     ui.checkbox(
@@ -695,6 +911,7 @@ fn render_voice_tab(
             .clicked()
         {
             *emitted = Some(SettingsCommand::PreviewVoice {
+                engine: state.draft.voice.engine,
                 voice: state.draft.voice.voice.clone(),
                 rate: state.draft.voice.speech_rate.clone(),
                 volume: state.draft.voice.volume,
@@ -1108,7 +1325,8 @@ mod tests {
         draft_state.draft.translation.pixel_diff_threshold = 0.05;
         draft_state.draft.translation.blank_reset_frames = 8;
 
-        draft_state.draft.voice.voice = "vi-VN-HoaiMyNeural".to_string();
+        draft_state.draft.voice.engine = crate::tts::TtsEngineKind::Piper;
+        draft_state.draft.voice.voice = "ngochuyen".to_string();
         draft_state.draft.voice.volume = 0.45;
         draft_state.draft.voice.speech_rate = "+10%".to_string();
         draft_state.draft.voice.auto_read = false;
@@ -1147,7 +1365,8 @@ mod tests {
         assert!((committed.translation.dedupe_threshold - 0.88).abs() < 1e-6);
         assert!((committed.translation.pixel_diff_threshold - 0.05).abs() < 1e-6);
         assert_eq!(committed.translation.blank_reset_frames, 8);
-        assert_eq!(committed.voice.voice, "vi-VN-HoaiMyNeural");
+        assert_eq!(committed.voice.engine, crate::tts::TtsEngineKind::Piper);
+        assert_eq!(committed.voice.voice, "ngochuyen");
         assert!((committed.voice.volume - 0.45).abs() < 1e-6);
         assert_eq!(committed.voice.speech_rate, "+10%");
         assert!(!committed.voice.auto_read);

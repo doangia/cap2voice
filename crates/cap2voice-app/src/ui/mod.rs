@@ -20,7 +20,7 @@ use crate::config::{AppConfig, CaptureRegion, WindowPosition};
 use crate::ocr::OcrEngine;
 use crate::pipeline::{PipelineHandle, PipelineSnapshot, TranslationCache, TtsCache};
 use crate::translate::SwitchableTranslator;
-use crate::tts::EdgeTtsEngine;
+use crate::tts::{default_voices_dir, PiperDownloadEvent, SwitchableTtsEngine};
 pub(crate) use bootstrap::{
     apply_wda_to_handle, build_native_options, build_native_translator, load_bootstrap,
     stop_pipeline_with_timeout, AppBootstrap,
@@ -100,6 +100,9 @@ pub struct Cap2VoiceApp {
     /// as the voice preview channel but reported via `ui_notice` instead of
     /// the settings draft.
     chinese_replay_rx: Option<mpsc::Receiver<Result<TtsPreviewAudio, TtsError>>>,
+    /// In-flight Vietnamese click-to-replay synthesis (Piper, 2026-11-24),
+    /// same shape as `chinese_replay_rx`.
+    vietnamese_replay_rx: Option<mpsc::Receiver<Result<TtsPreviewAudio, TtsError>>>,
     /// Shared native translation engine (D1+A5). Built on a background
     /// thread at startup because Vietphrase dictionary load takes seconds;
     /// `None` until the loader thread delivers it (see `translator_rx`).
@@ -113,7 +116,12 @@ pub struct Cap2VoiceApp {
     /// while the loader is still running.
     translator_error: Option<String>,
     /// Native Edge-TTS client (D1): stateless, always available.
-    tts_engine: Arc<EdgeTtsEngine>,
+    tts_engine: Arc<SwitchableTtsEngine>,
+    /// Piper voices directory (`%APPDATA%\cap2voice\voices\piper`), used
+    /// for on-demand voice downloads from Settings.
+    voices_dir: PathBuf,
+    /// In-flight Piper voice download channel (Settings → Giọng đọc).
+    piper_download_rx: Option<mpsc::Receiver<PiperDownloadEvent>>,
     capturer: Arc<dyn FrameCapturer>,
     ocr: Option<Arc<dyn OcrEngine>>,
     audio: Option<Arc<dyn AudioPlayback>>,
@@ -287,6 +295,22 @@ impl Cap2VoiceApp {
         }
         let start_minimized_to_tray = bootstrap.config.general.start_minimized_to_tray;
 
+        // Piper voices live under `%APPDATA%\cap2voice\voices\piper`
+        // (on-demand download, never bundled). If the dir cannot be
+        // resolved (no APPDATA), fall back to the temp dir so Piper stays
+        // usable in tests; the Settings download UI shows a notice.
+        let voices_dir = default_voices_dir().unwrap_or_else(|_| {
+            std::env::temp_dir()
+                .join("cap2voice")
+                .join("voices")
+                .join("piper")
+        });
+        let tts_engine = SwitchableTtsEngine::new(
+            bootstrap.config.voice.engine,
+            bootstrap.config.voice.voice.clone(),
+            voices_dir.clone(),
+        );
+
         Self {
             runtime,
             config_path: bootstrap.config_path,
@@ -309,10 +333,13 @@ impl Cap2VoiceApp {
             settings_focused: false,
             tts_preview_rx: None,
             chinese_replay_rx: None,
+            vietnamese_replay_rx: None,
             translator: None,
             translator_rx,
             translator_error,
-            tts_engine: Arc::new(EdgeTtsEngine::new()),
+            tts_engine,
+            voices_dir,
+            piper_download_rx: None,
             capturer: Arc::new(XcapCapturer::new()),
             ocr: None,
             audio: None,
@@ -562,6 +589,8 @@ impl eframe::App for Cap2VoiceApp {
             || self.state.is_running()
             || self.tts_preview_rx.is_some()
             || self.chinese_replay_rx.is_some()
+            || self.vietnamese_replay_rx.is_some()
+            || self.piper_download_rx.is_some()
         {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
@@ -737,6 +766,7 @@ mod tests {
             Box::pin(async move {
                 Ok(TtsSynthesis {
                     audio: vec![0x49, 0x44, 0x33, 0x01],
+                    format: crate::audio::AudioFormat::Mp3,
                     retries: Vec::new(),
                 })
             })
@@ -760,7 +790,11 @@ mod tests {
     }
 
     impl AudioPlayback for TestAudio {
-        fn enqueue_mp3(&self, _mp3_bytes: Vec<u8>) -> Result<EnqueueOutcome, AudioError> {
+        fn enqueue_audio(
+            &self,
+            _audio_bytes: Vec<u8>,
+            _format: crate::audio::AudioFormat,
+        ) -> Result<EnqueueOutcome, AudioError> {
             self.enqueued.fetch_add(1, Ordering::Relaxed);
             Ok(EnqueueOutcome {
                 pending_len: 1,
@@ -1201,6 +1235,8 @@ mod tests {
                 engine_changed: true,
                 wechat_paths_changed: false,
                 always_on_top_changed: true,
+                tts_engine_changed: false,
+                piper_voice_changed: false,
             }
         );
         assert_eq!(
@@ -1208,7 +1244,9 @@ mod tests {
             vec![true]
         );
         assert_eq!(live_cfg, committed);
-        assert_eq!(ui_state.selected_voice, "vi-VN-HoaiMyNeural");
+        // The overlay no longer carries a voice (voice selection lives
+        // ONLY in Settings); the live config holds the new voice.
+        assert_eq!(live_cfg.voice.voice, "vi-VN-HoaiMyNeural");
 
         let reloaded = match load_config_from(&cfg_path) {
             Ok(out) => out.config,
@@ -1245,15 +1283,15 @@ mod tests {
         assert!(res.is_err());
         assert_eq!(live_cfg, initial_cfg);
         assert!(!cfg_path.exists());
-        assert_eq!(ui_state.selected_voice, initial_cfg.voice.voice);
     }
 
     #[test]
     fn settings_cancel_leaves_config_file_and_live_overlay_state_unchanged() {
         let mut live_cfg = AppConfig::default();
         live_cfg.voice.volume = 0.75;
-        let ui_state = OverlayState::from_config(&live_cfg, Vec::new());
-
+        // The overlay state no longer carries a voice (voice selection
+        // lives ONLY in Settings), so this test only checks the draft
+        // discard path against the live config.
         let mut draft_state = SettingsDraftState::from_config(&live_cfg);
         draft_state.draft.voice.volume = 0.15;
         draft_state.draft.voice.voice = "vi-VN-HoaiMyNeural".to_string();
@@ -1261,7 +1299,6 @@ mod tests {
 
         let discarded = draft_state.discard();
         assert_eq!(discarded, live_cfg);
-        assert_eq!(ui_state.selected_voice, "vi-VN-NamMinhNeural");
         assert!((live_cfg.voice.volume - 0.75).abs() < 1e-6);
     }
 

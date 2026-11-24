@@ -19,7 +19,20 @@ muda = "0.16"
 ort = { version = "=2.0.0-rc.15", features = ["download-binaries"] }
 pinyin = { version = "0.11", default-features = false, features = ["with_tone"] }
 regex = "1"
-rodio = { version = "0.23", default-features = false, features = ["playback", "symphonia-mp3"] }
+# Piper TTS (2026-11-24, direction (a) — see `src/tts/piper.rs` header):
+# the sherpa-onnx + piper-phonemize Rust crates, `shared` feature (DLLs).
+# Both crates' Windows STATIC libs are built with /MT (static CRT), which
+# conflicts with this app's /MD (LNK2038 — the same conflict that forced
+# dropping esaxx_fast from tokenizers). The `shared` DLLs carry their own
+# CRT, so no conflict; the `-sys` build scripts copy the DLLs next to the
+# exe in `target/release/`. sherpa-onnx bundles its own onnxruntime.dll
+# (separate from `ort`'s); piper-phonemize embeds espeak-ng-data (~7 MB)
+# into the binary and is GPL-3.0-or-later — personal/hobby use only.
+sherpa-onnx = { version = "2.0.3", default-features = false, features = ["shared"] }
+piper-phonemize = { version = "1.6.1", default-features = false, features = ["shared"] }
+# On-demand Piper voice download (blocking HTTP on a background thread).
+ureq = "3.5"
+rodio = { version = "0.23", default-features = false, features = ["playback", "symphonia-mp3", "symphonia-wav", "symphonia-pcm"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

@@ -4,7 +4,7 @@
 use cap2voice_app::api::{
     BoxFuture, TranslateError, Translator, TtsEngine, TtsError, TtsRetryAttempt, TtsSynthesis,
 };
-use cap2voice_app::audio::{AudioError, AudioPlayback, AudioPlayer, EnqueueOutcome};
+use cap2voice_app::audio::{AudioError, AudioFormat, AudioPlayback, AudioPlayer, EnqueueOutcome};
 use cap2voice_app::capture::{
     CaptureError, CapturedFrame, FrameCapturer, MonitorInfo, XcapCapturer,
 };
@@ -457,6 +457,7 @@ impl TtsEngine for MockTtsEngine {
                 Some(res) => res,
                 None => Ok(TtsSynthesis {
                     audio: format!("MP3({}:{})", req.voice, req.text).into_bytes(),
+                    format: AudioFormat::Mp3,
                     retries: Vec::new(),
                 }),
             }
@@ -505,7 +506,11 @@ impl MockAudioPlayback {
 }
 
 impl AudioPlayback for MockAudioPlayback {
-    fn enqueue_mp3(&self, mp3_bytes: Vec<u8>) -> Result<EnqueueOutcome, AudioError> {
+    fn enqueue_audio(
+        &self,
+        audio_bytes: Vec<u8>,
+        _format: AudioFormat,
+    ) -> Result<EnqueueOutcome, AudioError> {
         if let Some(res) = self
             .enqueue_results
             .lock()
@@ -515,7 +520,7 @@ impl AudioPlayback for MockAudioPlayback {
             return res;
         }
         let mut enqueued = self.enqueued.lock().unwrap_or_else(|e| e.into_inner());
-        enqueued.push(mp3_bytes);
+        enqueued.push(audio_bytes);
         Ok(EnqueueOutcome {
             pending_len: enqueued.len().min(3),
             dropped_oldest: false,
@@ -1531,6 +1536,7 @@ async fn pipeline_tts_and_audio_errors_surface_non_blocking_warning_while_keepin
         }),
         Ok(TtsSynthesis {
             audio: b"MP3_OK".to_vec(),
+            format: AudioFormat::Mp3,
             retries: Vec::new(),
         }),
     ]));
@@ -1621,6 +1627,7 @@ async fn pipeline_tts_retries_then_failure_land_in_the_subtitle_log_in_order() {
         }),
         Ok(TtsSynthesis {
             audio: b"MP3_OK".to_vec(),
+            format: AudioFormat::Mp3,
             retries: Vec::new(),
         }),
     ]));

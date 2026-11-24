@@ -2,6 +2,7 @@
 
 > **Status:** Approved — 2026-11-19 (Danh via delegation to Muse; all 12 assumptions in §11 confirmed as-is)
 > **D1+A5 amendment — 2026-11-23:** The temporary Python server is **gone**. Translation and TTS are now native in-process Rust (§3.8 rewritten): a selectable engine (Helsinki-NLP `opus-mt-zh-vi` ONNX, lazy-loaded, or offline Vietphrase) and a native Edge-TTS WebSocket client. §3.8's `AC-SRV-1..5`, the `429`/`RateLimited` path, and the server-port/`GET /health` UI are superseded; `AC-TR-2`'s mock-HTTP-server wording is superseded by native-engine error tests. The rest of this spec stands.
+> **Piper amendment — 2026-11-24:** Piper TTS (voice Ngọc Huyền) is a second, selectable TTS engine beside Edge-TTS (§3.4, §3.6, §3.8): on-demand download in Settings → `Giọng đọc`, saved under `%APPDATA%\cap2voice\voices\piper\`, never bundled into the binary or repo. Edge-TTS stays the default. **Voice selection lives ONLY in Settings from now on** — the voice dropdown on the main overlay window is removed (§3.5, `AC-UI-4`).
 > **Version:** V1 (MVP)  
 > **Date:** 2026-11-19  
 > **Owner / Approver:** Danh  
@@ -176,9 +177,12 @@ Reference mockup: `docs/mockups/media-generation-region-select-*.webp`.
 
 ### 3.4 Text-to-Speech & Audio Playback (`tts`)
 
-- Rust defines an async `TtsEngine` trait: `async fn synthesize(&self, text: &str, voice: &str, rate: &str) -> Result<Vec<u8>, TtsError>`.
+- Rust defines an async `TtsEngine` trait: `async fn synthesize(&self, text: &str, voice: &str, rate: &str) -> Result<TtsSynthesis { audio, format, retries }, TtsError>`, where `format` is `AudioFormat` (`Mp3` for Edge-TTS, `Wav` for Piper) and travels with the bytes through the cache and the audio queue.
 - V1 implements the `TtsEngine` trait with a native Rust Edge-TTS WebSocket client (`wss://api.msedgeservices.com/tts/cognitiveservices/websocket/v1`), receiving raw MP3 bytes. No HTTP server or Python is involved.
 - Default voice: `vi-VN-NamMinhNeural`. Built-in selectable Vietnamese voices: `vi-VN-NamMinhNeural` (Nam — mặc định) and `vi-VN-HoaiMyNeural` (Nữ).
+- **Selectable TTS engine (`SwitchableTtsEngine`, `voice.engine` in `config.toml`, default `edge`) — Piper, 2026-11-24:** beside Edge-TTS, the app offers Piper (VITS, offline) with the Vietnamese voice Ngọc Huyền. The engine and voice are chosen ONLY in Settings → `Giọng đọc` (the overlay has no voice selector since 2026-11-24); switching the engine resets the voice to that engine's default so an Edge voice id is never paired with Piper (or vice versa). Chinese click-to-replay always uses Edge-TTS (`zh-CN-XiaoxiaoNeural`) even when Piper is the active Vietnamese engine, because Piper ships Vietnamese voices only. Piper runs fully offline, so it has no 429 retry; the Edge-TTS retry (429/5xx/network, backoff 500 ms/1 s/2 s, max 3) applies to Edge-TTS only.
+- **Piper voice download (on demand):** the 63.5 MB Ngọc Huyền model (`ngochuyen.onnx` + `tokens.txt`) is downloaded from Hugging Face only when Danh clicks `Tải giọng` in Settings → `Giọng đọc`, with a progress bar; files land in `%APPDATA%\cap2voice\voices\piper\ngochuyen\` (override `CAP2VOICE_PIPER_VOICES_DIR`). The model is never bundled into the binary or committed to git. The voice registry (`PIPER_VOICES` in `tts/piper.rs`) is designed so later voices from the same repo (Mạnh Dũng, Minh Quang, …) can be added as one registry entry each.
+- **License note (Piper voices):** the voice source is an unofficial mirror (`doof-ferb/nghitts-copy` on Hugging Face) of NGHI-TTS; metadata says Apache-2.0 but the voices are named after real people. Personal/hobby use only for Danh — not for commercial use or redistribution.
 - Audio playback uses `rodio` `0.23` on a dedicated background audio worker thread:
   - **Non-overlapping FIFO queue:** One sentence plays at a time; incoming sentences wait in queue until the current sentence finishes.
   - **Bounded queue depth (max 3 pending items):** When the queue already has 3 unplayed items and a new item arrives, drop the **oldest unplayed** item (never interrupt the currently playing clip) so speech stays synchronized with fast dialogue.
@@ -188,7 +192,9 @@ Reference mockup: `docs/mockups/media-generation-region-select-*.webp`.
 
 **Acceptance Criteria:**
 - `AC-TTS-1`: With `Tự động đọc phụ đề` ON and unmuted, each newly translated Vietnamese subtitle is read aloud clearly using `vi-VN-NamMinhNeural` on the PC's default audio output.
-- `AC-TTS-2`: Switching voice to `vi-VN-HoaiMyNeural` (in overlay dropdown or Settings) causes the very next subtitle to play in the female voice.
+- `AC-TTS-2`: Switching voice to `vi-VN-HoaiMyNeural` (in Settings → `Giọng đọc` — the ONLY place to change voices since 2026-11-24; the overlay has no voice selector) causes the very next subtitle to play in the female voice.
+- `AC-TTS-8` (Piper): With the TTS engine set to Piper in Settings, the app downloads the Ngọc Huyền model on demand into `%APPDATA%\cap2voice\voices\piper\ngochuyen\` with visible progress, then reads the next Vietnamese subtitle aloud with the Piper voice (WAV, 22,050 Hz) — a new cache file appears, distinct from Edge-TTS output — and click-to-replay on the Vietnamese line replays with Piper.
+- `AC-TTS-9` (Piper): Switching the TTS engine back to Edge-TTS restores Edge-TTS speech on the next subtitle; on a fresh config the engine is Edge-TTS.
 - `AC-TTS-3`: Rapidly feeding 5 subtitle lines plays them strictly sequentially without audio overlap; unit tests on the queue verify bounded capacity (max 3 pending) drops oldest unplayed items first.
 - `AC-TTS-4`: Clicking `Dừng` or the overlay speaker mute button halts currently playing audio within 200 ms and empties queued items.
 - `AC-TTS-5`: Adjusting the `Âm lượng` slider changes playback loudness linearly (`0%` = silent, `75%` default, `100%` max).
@@ -211,6 +217,7 @@ Reference mockup: `docs/mockups/media-generation-overlay-main-*.webp`.
   - Top line: Chinese original text in white (`#FFFFFF`), size = `base_font_size × 1.35` (default ~24 px).
   - Bottom line: Vietnamese translation in green (`#4ADE80`, configurable), size = `base_font_size` (default `18 px`).
   - Both lines wrap cleanly inside the panel width without clipping.
+- **Click-to-replay:** clicking the pinyin or Chinese line replays it in Chinese via Edge-TTS (`zh-CN-XiaoxiaoNeural`); clicking the Vietnamese line replays it in Vietnamese via the CURRENT TTS engine (Piper when Piper is active, Edge-TTS otherwise). Both are explicit user actions, so they play even while muted, and both go through the TTS cache first. (Vietnamese click-to-replay did not exist before the Piper slice — only Chinese replay did — and was added here so `AC-TTS-8` is verifiable.)
 - **Controls (matching Mockup 1 & `brief.md` §6):** icon buttons with Vietnamese hover tooltips (vector glyphs, no text labels; the Settings sidebar tabs keep text labels because they are navigation, not actions):
   - Compact top header strip (or hoverable corner controls): app status indicator dot + status text (`Đang chờ` / `Đang dịch` / error message), Settings gear icon button (tooltip `Cài đặt`), and Close icon button (tooltip `Đóng` — hides to tray when close-to-tray is enabled).
   - Bottom action bar:
@@ -218,7 +225,7 @@ Reference mockup: `docs/mockups/media-generation-overlay-main-*.webp`.
     - `Bắt đầu` icon button (play icon, tooltip `Bắt đầu`; disabled while running; if clicked with no saved region, prompts user to select a region first or opens region selector)
     - `Dừng` icon button (stop icon, tooltip `Dừng`; disabled while idle)
     - Speaker mute/unmute icon button (tooltip `Tắt tiếng` / `Bật tiếng`)
-    - Voice selector dropdown (`vi-VN-NamMinhNeural` / `vi-VN-HoaiMyNeural`)
+    - **No voice selector on the overlay (since 2026-11-24):** voice selection — both the TTS engine choice and the voice choice — lives ONLY in Settings → `Giọng đọc`. The overlay shows the current voice in the settings summary panel but offers no control to change it.
 - **In-place subtitle window (optional mode, default OFF):**
   - Settings → `Hiển thị`: `Hiển thị phụ đề tại vị trí gốc trên video` checkbox (default OFF) + `Độ mờ nền phụ đề tại chỗ` slider (`0%`–`100%`, default `70%`), saved in `config.toml` as `display.inplace_subtitle` / `display.inplace_bg_opacity`.
   - When ON, an ADDITIONAL separate borderless, fully transparent, click-through window appears exactly over the capture region (position + size = region), showing only the translated subtitle text on a background rectangle of the chosen opacity that covers the original subtitle underneath. The main floating overlay stays visible and usable at all times.
@@ -231,7 +238,7 @@ Reference mockup: `docs/mockups/media-generation-overlay-main-*.webp`.
 - `AC-UI-1`: Overlay floats borderless and always-on-top over both a local media player (e.g. VLC/MPV) and a maximized browser video (e.g. Chrome/Edge on Bilibili/YouTube).
 - `AC-UI-2`: Chinese line renders in white above Vietnamese line in green; verified visually via real-PC screenshot with mixed Chinese + Vietnamese diacritics (e.g. `"夜深了，雨还在下。"` / `"Đêm đã khuya, mưa vẫn còn rơi."`) showing zero missing-glyph tofu boxes.
 - `AC-UI-3`: Dragging the overlay moves it smoothly and persists its coordinates across app restarts.
-- `AC-UI-4`: All 5 control-bar elements (`Chọn vùng`, `Bắt đầu`, `Dừng` icon buttons, speaker mute icon button, voice dropdown) plus the `Cài đặt` gear and `Đóng` icon buttons work as specified and reflect live running/muted/voice state; every icon button shows a Vietnamese tooltip on hover.
+- `AC-UI-4`: All 4 control-bar elements (`Chọn vùng`, `Bắt đầu`, `Dừng` icon buttons, speaker mute icon button) plus the `Cài đặt` gear and `Đóng` icon buttons work as specified and reflect live running/muted state; every icon button shows a Vietnamese tooltip on hover. (The voice dropdown was removed from the overlay on 2026-11-24; voice selection lives ONLY in Settings → `Giọng đọc`.)
 - `AC-UI-5`: Network, engine, or OCR errors render visibly inside the overlay status banner in Vietnamese and clear automatically once a subsequent request succeeds.
 - `AC-UI-6`: Placing the overlay partially over the captured subtitle region does not cause an OCR feedback loop (verified via `WDA_EXCLUDEFROMCAPTURE` on Windows 10/11).
 - `AC-UI-7` (in-place mode): With the mode ON, a separate transparent window sits exactly over the capture region (window rect == region rect) showing the translated line on the chosen-opacity background while the main overlay stays visible and usable; toggling OFF hides the text window immediately; re-selecting the region moves the text window to the new region.
@@ -258,12 +265,14 @@ Reference mockup: `docs/mockups/media-generation-settings-tray-*.webp`.
        - Engine selector (`Helsinki (mô hình AI)` / `Vietphrase (từ điển)`, default Helsinki) + live engine status line; switching applies immediately without restart
        - Fuzzy deduplication threshold slider (`0.80`–`0.99`, default `0.93`)
        - Pixel-diff sensitivity threshold slider (`0.5%`–`10.0%`, default `2.0%`)
-    3. `Giọng đọc` (Voice / TTS):
-       - `Giọng đọc` dropdown (`vi-VN-NamMinhNeural` default, `vi-VN-HoaiMyNeural`)
+    3. `Giọng đọc` (Voice / TTS) — the ONLY place to change the TTS engine or voice (since 2026-11-24):
+       - `Engine giọng đọc` dropdown (`Edge-TTS (trực tuyến)` default, `Piper (offline)`); switching the engine resets the voice to that engine's default and applies live on save, without restart
+       - `Giọng đọc` dropdown — engine-dependent: Edge-TTS offers `vi-VN-NamMinhNeural` (default) / `vi-VN-HoaiMyNeural`; Piper offers `Ngọc Huyền` (default, first voice)
+       - Piper voice download: when Piper is selected and the voice is not yet downloaded, a `Tải giọng` button with progress bar downloads the model on demand into `%APPDATA%\cap2voice\voices\piper\<voice-id>\`; a downloaded voice shows `Giọng đã tải — sẵn sàng dùng (offline).`
        - `Âm lượng` slider (`0%`–`100%`, default `75%`)
        - Speech rate selector (`-20%`, `-10%`, `0% (Mặc định)`, `+10%`, `+20%`)
        - Toggle: `Tự động đọc phụ đề` (default ON)
-       - `Nghe thử` icon button (tooltip `Nghe thử`, plays a short Vietnamese sample sentence via native Edge-TTS)
+       - `Nghe thử` icon button (tooltip `Nghe thử`, plays a short Vietnamese sample sentence via the DRAFT engine/voice — Piper preview uses the downloaded model, Edge-TTS preview uses the network)
     4. `Hiển thị` (Display):
        - `Cỡ chữ phụ đề` slider (`12 px`–`40 px`, default `18 px`)
        - Overlay background opacity slider (`30%`–`100%`, default `85%`)
@@ -327,6 +336,8 @@ The temporary Python server (`server/`, `AC-SRV-1..6`) was **removed in D1+A5**.
   - **Fallback:** while the Helsinki model is still loading, sentences translate via Vietphrase; each fallback is counted (`helsinki_fallbacks`) and shown in Settings → `Dịch`. Switching engines in Settings applies live, without restart.
   - **Cache:** per-engine cache keys (`helsinki|…` / `vietphrase|…`) so the same sentence cached under one engine is never served as the other engine's output.
 - **TTS — native Edge-TTS WebSocket client (`EdgeTtsEngine`):** direct `wss://` connection to Microsoft Edge-TTS, SSML chunks ≤ 4096 bytes, MP3 bytes returned. Default voice `vi-VN-NamMinhNeural`; Chinese click-to-replay uses `zh-CN-XiaoxiaoNeural`. No API key; network failure surfaces as a visible non-blocking warning, never a silent stall.
+- **TTS — Piper offline engine (`PiperTtsEngine`, 2026-11-24):** `sherpa-onnx` `2.0.3` + `piper-phonemize` `1.6.1` Rust crates, `shared` feature (DLLs shipped beside the exe). Implementation direction (a) — sherpa-onnx with external phonemization — was chosen and is documented in `tts/piper.rs`: sherpa-onnx v2 dropped espeak-ng, so the text is phonemized FIRST with piper-phonemize (espeak-ng `vi` voice) and the resulting Unicode codepoints are passed as `GenerationConfig::phoneme_codepoints` with empty text. Direction (c) (Piper directly via the app's existing `ort`) was evaluated and rejected: the exact VITS token sequence could not be reverse-engineered reliably (length-based matching was inconclusive across test sentences). Direction (b) (pin sherpa v1) was rejected: v1 is unmaintained and its README is the trap that fails with "phoneme_codepoints is empty" on v2. Both crates' Windows static libs are built with `/MT` while the app uses `/MD`, so the `shared` (DLL) feature is required — static linking would fail with `LNK2038`. The sherpa `onnxruntime.dll` shipped beside the exe does not conflict with `ort`'s runtime (verified live: Helsinki still translates after the DLLs land). Output is WAV PCM16 mono 22,050 Hz, encoded in `tts/piper.rs`; Edge rate strings map to Piper speed (`+10%` → 1.1, clamped `0.5`–`2.0`). `GenerationConfig.silence_scale` is set to `1.0` explicitly (the Rust crate defaults it to `0.2`; the reference run Danh approved used the C++ default `1.0`). Model + `tokens.txt` per voice under `%APPDATA%\cap2voice\voices\piper\<voice-id>\` (override `CAP2VOICE_PIPER_VOICES_DIR`); `espeak-ng-data` (~7 MB) is embedded in the binary by piper-phonemize (no feature to disable it) — the exe grows ~7 MB, justified as required offline phonemization data. Voice source is an unofficial mirror (`doof-ferb/nghitts-copy`, NGHI-TTS); personal/hobby use only, not for commercial use or redistribution. **Download robustness (fixed 2026-11-24 after the first live run stalled at ~3 MB with no error):** the HTTP client uses a per-read timeout of 60 s (a stalled connection fails visibly instead of hanging forever; no global timeout, a 63.5 MB download on a slow link legitimately takes minutes); progress events are sent with `try_send` so a full channel can never stall the download thread; the app schedules repaints while a download is in flight so the progress bar drains and updates live.
+- **Audio format:** `AudioFormat` (`Mp3` / `Wav`) travels with the audio bytes through `TtsSynthesis`, the TTS cache (filenames carry the extension, `.wav` for Piper), and the `rodio` queue (`symphonia-wav` + `symphonia-pcm` features — WAV decoding needs the PCM codec, `symphonia-wav` alone fails the probe with "format not recognized"); a format-hint mismatch is rejected at decode time.
 
 **Acceptance Criteria (replacing `AC-SRV-1..6`):**
 - `AC-NAT-1`: With no Python on `PATH` and `server/` deleted, the app builds, starts, translates, and speaks normally.

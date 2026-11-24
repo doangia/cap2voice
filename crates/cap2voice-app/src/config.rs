@@ -11,6 +11,7 @@ pub use io::{
 };
 
 use crate::translate::TranslationEngine;
+use crate::tts::TtsEngineKind;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use thiserror::Error;
@@ -85,10 +86,17 @@ impl Default for TranslationConfig {
     }
 }
 
-/// Vietnamese text-to-speech voice and playback settings (`Giọng đọc` tab).
+/// Vietnamese text-to-speech engine + voice and playback settings (`Giọng đọc` tab).
+/// `engine` picks the TTS engine (Edge-TTS online by default, or Piper
+/// offline); `voice` is the voice id FOR that engine — an Edge-TTS voice id
+/// (`vi-VN-NamMinhNeural`, …) when the engine is Edge, a Piper voice id
+/// (`ngochuyen`, …) when it is Piper. The Settings window only offers
+/// matching pairs, so a mismatched hand-edited config fails synthesis with
+/// a clear message instead of silently using the wrong voice.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VoiceConfig {
+    pub engine: TtsEngineKind,
     pub voice: String,
     pub volume: f32,
     pub speech_rate: String,
@@ -98,6 +106,7 @@ pub struct VoiceConfig {
 impl Default for VoiceConfig {
     fn default() -> Self {
         Self {
+            engine: TtsEngineKind::default(),
             voice: "vi-VN-NamMinhNeural".to_string(),
             volume: 0.75,
             speech_rate: "+0%".to_string(),
@@ -355,6 +364,7 @@ mod tests {
         assert!((cfg.translation.pixel_diff_threshold - 0.02).abs() < f32::EPSILON);
         assert_eq!(cfg.translation.blank_reset_frames, 5);
 
+        assert_eq!(cfg.voice.engine, crate::tts::TtsEngineKind::Edge);
         assert_eq!(cfg.voice.voice, "vi-VN-NamMinhNeural");
         assert!((cfg.voice.volume - 0.75).abs() < f32::EPSILON);
         assert_eq!(cfg.voice.speech_rate, "+0%");

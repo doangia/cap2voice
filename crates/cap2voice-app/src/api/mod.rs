@@ -5,6 +5,7 @@
 //! Vietphrase) and TTS is a direct Edge-TTS WebSocket client
 //! (`tts::EdgeTtsEngine`).
 
+use crate::audio::AudioFormat;
 use std::future::Future;
 use std::pin::Pin;
 use thiserror::Error;
@@ -60,6 +61,9 @@ pub enum TtsError {
         retries: Vec<TtsRetryAttempt>,
     },
 
+    #[error("không có engine TTS khả dụng: {detail}")]
+    EngineUnavailable { detail: String },
+
     #[error("hết thời gian chờ TTS sau {timeout_ms} ms")]
     Timeout { timeout_ms: u64 },
 
@@ -110,13 +114,16 @@ pub struct TtsRetryAttempt {
     pub backoff_ms: u64,
 }
 
-/// A completed TTS synthesis: the MP3 bytes plus the retries it took to
-/// get them (empty when the first attempt succeeded). The pipeline logs
-/// non-empty `retries` to the subtitle log file so a transient 429 stays
-/// visible even though the sentence still got its audio.
+/// A completed TTS synthesis: the audio bytes in `format` plus the retries
+/// it took to get them (empty when the first attempt succeeded). The pipeline
+/// logs non-empty `retries` to the subtitle log file so a transient 429 stays
+/// visible even though the sentence still got its audio. Edge-TTS returns
+/// MP3; Piper returns WAV (PCM16, 22050 Hz mono) — the format travels with
+/// the bytes so the cache and the player decode them correctly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TtsSynthesis {
     pub audio: Vec<u8>,
+    pub format: AudioFormat,
     pub retries: Vec<TtsRetryAttempt>,
 }
 
@@ -133,7 +140,11 @@ pub trait Translator: Send + Sync {
 }
 
 /// Asynchronous Vietnamese text-to-speech synthesis boundary (returns the
-/// MP3 bytes plus any retries it took; see `TtsSynthesis`).
+/// audio bytes in `TtsSynthesis::format` plus any retries it took; see
+/// `TtsSynthesis`). The `voice` id is engine-dependent: an Edge-TTS voice id
+/// (`vi-VN-NamMinhNeural`, …) for the Edge engine, a Piper voice id
+/// (`ngochuyen`, …) for the Piper engine. The caller (pipeline / Settings
+/// preview) passes the voice that matches the active engine.
 pub trait TtsEngine: Send + Sync {
     fn synthesize<'a>(
         &'a self,

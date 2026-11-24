@@ -64,12 +64,6 @@ pub const PINYIN_FONT_SCALE: f32 = 0.72;
 /// Pinyin line text color (muted slate, distinct from the white Chinese line).
 pub const PINYIN_TEXT_COLOR: egui::Color32 = egui::Color32::from_rgb(148, 163, 184);
 
-/// Built-in Edge-TTS Vietnamese voice options (`id`, Vietnamese UI label).
-pub const AVAILABLE_VOICES: &[(&str, &str)] = &[
-    ("vi-VN-NamMinhNeural", "vi-VN-NamMinhNeural (Nam)"),
-    ("vi-VN-HoaiMyNeural", "vi-VN-HoaiMyNeural (Nữ)"),
-];
-
 /// Debounce interval before persisting dragged `(x, y)` coordinates to `config.toml`.
 pub const POSITION_SAVE_DEBOUNCE: Duration = Duration::from_millis(400);
 
@@ -91,13 +85,17 @@ pub enum OverlayCommand {
     StartPipeline,
     StopPipeline,
     ToggleMute,
-    SelectVoice(String),
     ToggleRegionPanel,
     ToggleSettingsPanel,
     CloseWindow,
     /// Replay the current Chinese line in Chinese (click on the pinyin or
     /// Chinese line, D2). The shell no-ops when no Chinese line is shown.
     ReplayChinese,
+    /// Replay the current Vietnamese line in Vietnamese (click on the
+    /// Vietnamese line). Uses the CURRENT TTS engine — Piper when Piper is
+    /// the active engine — unlike `ReplayChinese`, which always uses
+    /// Edge-TTS. No-ops when no Vietnamese line is shown.
+    ReplayVietnamese,
 }
 
 /// Typed errors emitted when applying `WDA_EXCLUDEFROMCAPTURE` to the overlay HWND.
@@ -122,7 +120,6 @@ pub struct OverlayState {
     /// `apply_pipeline_snapshot` whenever the Chinese line changes.
     pub pinyin_line: String,
     pub muted: bool,
-    pub selected_voice: String,
     pub ui_notice: Option<String>,
     pub region_panel_open: bool,
     pub settings_panel_open: bool,
@@ -131,13 +128,12 @@ pub struct OverlayState {
 }
 
 impl OverlayState {
-    pub fn from_config(config: &AppConfig, startup_warnings: Vec<String>) -> Self {
+    pub fn from_config(_config: &AppConfig, startup_warnings: Vec<String>) -> Self {
         Self {
             server_status: ServerUiStatus::Starting,
             pipeline: PipelineSnapshot::default(),
             pinyin_line: String::new(),
             muted: false,
-            selected_voice: config.voice.voice.clone(),
             ui_notice: None,
             region_panel_open: false,
             settings_panel_open: false,
@@ -429,7 +425,7 @@ fn render_inline_info_panels(ui: &mut egui::Ui, state: &mut OverlayState, config
                     let summary = format!(
                         "Cài đặt hiện tại: {} fps · {} · âm lượng {}% · chữ {} px · độ mờ {}%",
                         config.general.capture_fps,
-                        state.selected_voice,
+                        config.voice.voice,
                         (config.voice.volume * 100.0).round() as u32,
                         config.display.font_size_px.round() as u32,
                         (config.display.overlay_opacity * 100.0).round() as u32,
@@ -629,10 +625,21 @@ pub fn render_overlay_ui(
                             egui::Color32::from_rgb(134, 239, 172),
                         )
                     };
-                    ui.add(
+                    // Click-to-replay: a click replays the current
+                    // Vietnamese line in Vietnamese via the current TTS
+                    // engine (Piper when Piper is active); a drag still
+                    // moves the window.
+                    let vi_resp = ui.add(
                         egui::Label::new(egui::RichText::new(vi_text).size(vi_size).color(color))
-                            .wrap(),
+                            .wrap()
+                            .sense(egui::Sense::click_and_drag()),
                     );
+                    if vi_resp.clicked() && !state.pipeline.vietnamese_line.is_empty() {
+                        commands.push(OverlayCommand::ReplayVietnamese);
+                    }
+                    if vi_resp.drag_started_by(egui::PointerButton::Primary) {
+                        start_drag = true;
+                    }
                 }
             });
             if body_resp
@@ -654,7 +661,9 @@ pub fn render_overlay_ui(
             );
             ui.add_space(8.0);
 
-            // Bottom action bar (icon buttons + tooltips): region | start | stop | mute | voice dropdown.
+            // Bottom action bar (icon buttons + tooltips): region | start | stop | mute.
+            // Voice selection lives ONLY in Settings (Giọng đọc tab) — the
+            // overlay no longer has a voice dropdown (2026-11-24).
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
 
@@ -691,29 +700,6 @@ pub fn render_overlay_ui(
                     .clicked()
                 {
                     commands.push(OverlayCommand::ToggleMute);
-                }
-
-                let current_voice_label = AVAILABLE_VOICES
-                    .iter()
-                    .find(|(id, _)| *id == state.selected_voice)
-                    .map(|(_, label)| *label)
-                    .unwrap_or(state.selected_voice.as_str());
-
-                let mut pending_voice = state.selected_voice.clone();
-                egui::ComboBox::from_id_salt("overlay_voice_select")
-                    .selected_text(egui::RichText::new(current_voice_label).size(12.5))
-                    .width(205.0)
-                    .show_ui(ui, |ui| {
-                        for (voice_id, label) in AVAILABLE_VOICES {
-                            ui.selectable_value(
-                                &mut pending_voice,
-                                (*voice_id).to_string(),
-                                *label,
-                            );
-                        }
-                    });
-                if pending_voice != state.selected_voice {
-                    commands.push(OverlayCommand::SelectVoice(pending_voice));
                 }
             });
 
@@ -865,16 +851,17 @@ mod tests {
     }
 
     #[test]
-    fn overlay_state_voice_switch_and_mute_toggle_update_cleanly() {
+    fn overlay_state_mute_toggle_updates_cleanly() {
         let cfg = AppConfig::default();
         let mut state = OverlayState::from_config(&cfg, Vec::new());
-        assert_eq!(state.selected_voice, "vi-VN-NamMinhNeural");
         assert!(!state.muted);
 
         state.muted = true;
-        state.selected_voice = "vi-VN-HoaiMyNeural".to_string();
         assert!(state.muted);
-        assert_eq!(state.selected_voice, "vi-VN-HoaiMyNeural");
+        // Voice selection lives ONLY in Settings (no `selected_voice` on
+        // the overlay state since 2026-11-24); the overlay reads the
+        // voice from `AppConfig` instead.
+        assert_eq!(cfg.voice.voice, "vi-VN-NamMinhNeural");
     }
 
     #[test]
