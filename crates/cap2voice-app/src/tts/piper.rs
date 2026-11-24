@@ -554,7 +554,9 @@ mod tests {
         assert_eq!(u16::from_le_bytes(wav[22..24].try_into().unwrap()), 1); // mono
         assert_eq!(u16::from_le_bytes(wav[34..36].try_into().unwrap()), 16); // bits
         let samples: Vec<i16> = wav[44..]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect();
         assert_eq!(samples, vec![0, 16383, -16383, 32767, -32767, 32767]);
