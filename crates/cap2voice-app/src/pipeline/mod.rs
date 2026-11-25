@@ -112,6 +112,17 @@ pub struct PipelineMetrics {
     pub logged_pairs: u64,
 }
 
+/// One completed subtitle pair (Chinese + its Vietnamese translation)
+/// as shown on the overlay. The pipeline keeps the last two for the
+/// optional subtitle-history display (fixed-size overlay, 2026-11-25):
+/// the overlay shows the newest `config.display.history_lines` of
+/// them, dimmed, above the current subtitle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubtitlePair {
+    pub chinese: String,
+    pub vietnamese: String,
+}
+
 /// Latest immutable UI/observer snapshot published over `watch::Receiver<PipelineSnapshot>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipelineSnapshot {
@@ -121,6 +132,9 @@ pub struct PipelineSnapshot {
     pub vietnamese_line: String,
     pub error_banner: Option<PipelineErrorBanner>,
     pub metrics: PipelineMetrics,
+    /// Most recently completed subtitle pairs, most-recent-first, at
+    /// most `MAX_HISTORY_PAIRS` (see `crate::ui::overlay`).
+    pub history: Vec<SubtitlePair>,
 }
 
 impl Default for PipelineSnapshot {
@@ -132,6 +146,7 @@ impl Default for PipelineSnapshot {
             vietnamese_line: String::new(),
             error_banner: None,
             metrics: PipelineMetrics::default(),
+            history: Vec::new(),
         }
     }
 }
@@ -304,6 +319,18 @@ struct SharedPipelineState {
     /// whose lines the overlay is currently showing, if it had more than
     /// one line. `None` for single-line frames.
     display_group: Option<DisplayGroup>,
+    /// Last completed subtitle pair that became the displayed current
+    /// pair (most recent first is `history`). Only Completed landings
+    /// that actually update the display set this; preliminaries and
+    /// stale completions never do.
+    last_completed_pair: Option<SubtitlePair>,
+    /// Emission sequence of `last_completed_pair` (0 = none recorded).
+    /// History only moves forward: a translation that resolves out of
+    /// order (older `seq`) never moves it backwards.
+    last_completed_seq: u64,
+    /// Completed pairs that used to be current, most-recent-first, at
+    /// most two (mirrored into `snapshot.history` on every change).
+    history: Vec<SubtitlePair>,
 }
 
 impl SharedPipelineState {
@@ -337,6 +364,74 @@ impl SharedPipelineState {
             Some(group) => group.note(chinese, vietnamese),
             None => GroupContribution::NotGrouped,
         }
+    }
+
+    /// Record a Completed pair for subtitle history, in emission order
+    /// (subtitle history, 2026-11-25). Called when a Completed
+    /// translation succeeds — single line or joined group — and moves
+    /// the previous completed pair into history, then records this pair
+    /// as the latest, mirroring the history into the snapshot.
+    ///
+    /// This runs at translation-complete time, not at emit time: the
+    /// previous design pushed at emit (when the next sentence takes
+    /// the screen) but only recorded the pair at display time (after
+    /// its translation finished), so a sentence emitted while the
+    /// previous translation was still in flight was lost from history
+    /// (the next emission's push ran before the previous pair was
+    /// recorded). Recording push+record atomically here closes that
+    /// race. The display update itself stays gated by staleness
+    /// elsewhere; history only needs the sentence to have completed
+    /// (translated + logged), and its Chinese was already shown on
+    /// screen at emit time.
+    ///
+    /// Ordering by `seq`: a pair newer than the latest becomes the new
+    /// latest (the old latest moves into history). A pair OLDER than
+    /// the latest — typically a multi-line group whose lines land after
+    /// a newer single line was already recorded — is inserted at the
+    /// front of history instead of being dropped: it was emitted after
+    /// the pairs already in history, only its translation landed late,
+    /// so it is newer than them and belongs ahead of them (the current
+    /// latest stays latest). Guards: nothing is pushed when there is no
+    /// previous pair, when the new sentence repeats the previous pair's
+    /// text, or when the previous pair is already in history.
+    fn record_completed_for_history(&mut self, seq: u64, chinese: String, vietnamese: String) {
+        // Never record a pair that is already the latest or already in
+        // history (a repeated line, or a group line resolving twice).
+        if self
+            .last_completed_pair
+            .as_ref()
+            .is_some_and(|pair| pair.chinese == chinese)
+            || self.history.iter().any(|pair| pair.chinese == chinese)
+        {
+            return;
+        }
+        if seq >= self.last_completed_seq {
+            if let Some(prev) = self.last_completed_pair.take() {
+                if prev.chinese != chinese
+                    && !self.history.iter().any(|pair| pair.chinese == prev.chinese)
+                {
+                    self.history.insert(0, prev);
+                    self.history.truncate(2);
+                }
+            }
+            self.last_completed_pair = Some(SubtitlePair {
+                chinese,
+                vietnamese,
+            });
+            self.last_completed_seq = seq;
+        } else {
+            // Older pair resolving late: insert at the front of history
+            // (newer than the pairs already there); the latest stays.
+            self.history.insert(
+                0,
+                SubtitlePair {
+                    chinese,
+                    vietnamese,
+                },
+            );
+            self.history.truncate(2);
+        }
+        self.snapshot.history = self.history.clone();
     }
 }
 
@@ -382,6 +477,9 @@ impl PipelineRunner {
             snapshot_tx,
             stopped: false,
             display_group: None,
+            last_completed_pair: None,
+            last_completed_seq: 0,
+            history: Vec::new(),
         }));
 
         let worker_shared = Arc::clone(&shared);
@@ -1020,6 +1118,10 @@ fn emit_subtitle(
         }
         state.snapshot.latest_seq = state.snapshot.latest_seq.saturating_add(1);
         let seq = state.snapshot.latest_seq;
+        // History is recorded when the translation succeeds
+        // (`record_completed_for_history` in `process_emitted_subtitle`),
+        // not here: pushing at emit time raced with the previous
+        // sentence's translation still being in flight.
         state.snapshot.chinese_line = chinese.clone();
         state.snapshot.vietnamese_line.clear();
         state.snapshot.metrics.subtitles_emitted += 1;
@@ -1099,6 +1201,16 @@ impl DisplayGroup {
         Self {
             lines: lines.into_iter().map(|line| (line, None)).collect(),
         }
+    }
+
+    /// The frame's Chinese lines joined in top-to-bottom order, as
+    /// displayed on the overlay (subtitle history, 2026-11-25).
+    fn joined_chinese(&self) -> String {
+        self.lines
+            .iter()
+            .map(|(line, _)| line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Record a resolved Vietnamese translation for one of the group's
@@ -1849,12 +1961,37 @@ async fn process_emitted_subtitle(
                 // single line of a multi-line frame.
                 match state.note_group_translation(&chinese, vi.clone()) {
                     GroupContribution::GroupedComplete(joined) => {
-                        state.snapshot.vietnamese_line = joined;
+                        state.snapshot.vietnamese_line = joined.clone();
+                        if is_completed {
+                            // The group completed (all lines translated);
+                            // record its joined pair for history. No
+                            // still-on-screen guard: the group's Chinese
+                            // was already shown at emit time, and the
+                            // next subtitle may already have replaced
+                            // `snapshot.chinese_line` by the time these
+                            // translations resolve — gating on it dropped
+                            // whole groups from history.
+                            if let Some(group_chinese) = state
+                                .display_group
+                                .as_ref()
+                                .map(DisplayGroup::joined_chinese)
+                            {
+                                state.record_completed_for_history(seq, group_chinese, joined);
+                            }
+                        }
                     }
                     GroupContribution::GroupedPending => {}
                     GroupContribution::NotGrouped => {
                         if !display_stale {
                             state.snapshot.vietnamese_line = vi.clone();
+                        }
+                        if is_completed {
+                            // History records on translation success
+                            // even when the display update was superseded:
+                            // the sentence completed (translated +
+                            // logged) and its Chinese was shown at emit
+                            // time. The display update above stays gated.
+                            state.record_completed_for_history(seq, chinese.clone(), vi.clone());
                         }
                     }
                 }
@@ -1994,9 +2131,10 @@ mod tests {
     use super::{
         map_translate_error_banner, split_line_into_utterances, split_speakers, BufferDecision,
         DisplayGroup, Duration, GroupContribution, Instant, PipelineError, PipelineErrorBanner,
-        PipelineErrorKind, PipelineSettings, SentenceBuffer, SentenceEvent, SubtitleHold,
-        DEFAULT_HOLD_DELAY, DEFAULT_SENTENCE_BLANK_FRAMES, ERR_BANNER_ENGINE_UNAVAILABLE,
-        ERR_BANNER_TRANSLATE_NETWORK, MAX_SENTENCE_BUFFER_AGE,
+        PipelineErrorKind, PipelineSettings, PipelineSnapshot, SentenceBuffer, SentenceEvent,
+        SharedPipelineState, SubtitleHold, SubtitlePair, DEFAULT_HOLD_DELAY,
+        DEFAULT_SENTENCE_BLANK_FRAMES, ERR_BANNER_ENGINE_UNAVAILABLE, ERR_BANNER_TRANSLATE_NETWORK,
+        MAX_SENTENCE_BUFFER_AGE,
     };
     use crate::api::TranslateError;
     use crate::config::{AppConfig, CaptureRegion};
@@ -2773,5 +2911,106 @@ mod tests {
             group.note("你好。", "Chào.".to_string()),
             GroupContribution::GroupedComplete("Chào.\nChào.".to_string())
         );
+    }
+
+    fn test_shared_state() -> SharedPipelineState {
+        let mut cfg = AppConfig::default();
+        cfg.general.region = Some(CaptureRegion {
+            monitor_id: "DISPLAY1".to_string(),
+            x: 100,
+            y: 900,
+            width: 800,
+            height: 80,
+        });
+        let settings = PipelineSettings::from_app_config(&cfg)
+            .expect("valid AppConfig converts to PipelineSettings");
+        let (snapshot_tx, _snapshot_rx) = tokio::sync::watch::channel(PipelineSnapshot::default());
+        SharedPipelineState {
+            settings,
+            snapshot: PipelineSnapshot::default(),
+            snapshot_tx,
+            stopped: false,
+            display_group: None,
+            last_completed_pair: None,
+            last_completed_seq: 0,
+            history: Vec::new(),
+        }
+    }
+
+    fn pair(chinese: &str, vietnamese: &str) -> SubtitlePair {
+        SubtitlePair {
+            chinese: chinese.to_string(),
+            vietnamese: vietnamese.to_string(),
+        }
+    }
+
+    #[test]
+    fn history_keeps_last_two_completed_pairs_most_recent_first() {
+        let mut state = test_shared_state();
+        assert!(state.history.is_empty());
+
+        // A completes (seq 1): latest, nothing in history yet.
+        state.record_completed_for_history(1, "第一句。".to_string(), "Câu thứ nhất.".to_string());
+        assert!(state.history.is_empty());
+
+        // B completes (seq 2): A moves into history.
+        state.record_completed_for_history(2, "第二句。".to_string(), "Câu thứ hai.".to_string());
+        assert_eq!(state.history, vec![pair("第一句。", "Câu thứ nhất.")]);
+        assert_eq!(state.snapshot.history, state.history);
+
+        // C completes (seq 3): B joins, A stays second.
+        state.record_completed_for_history(3, "第三句。".to_string(), "Câu thứ ba.".to_string());
+        assert_eq!(
+            state.history,
+            vec![
+                pair("第二句。", "Câu thứ hai."),
+                pair("第一句。", "Câu thứ nhất."),
+            ]
+        );
+
+        // D completes (seq 4): the oldest (A) ages out (at most two kept).
+        state.record_completed_for_history(4, "第四句。".to_string(), "Câu thứ tư.".to_string());
+        assert_eq!(
+            state.history,
+            vec![
+                pair("第三句。", "Câu thứ ba."),
+                pair("第二句。", "Câu thứ hai."),
+            ]
+        );
+    }
+
+    #[test]
+    fn history_ignores_same_text_repeat() {
+        let mut state = test_shared_state();
+        state.record_completed_for_history(1, "你好。".to_string(), "Chào.".to_string());
+        // A repeated line must not push itself into history.
+        state.record_completed_for_history(2, "你好。".to_string(), "Chào.".to_string());
+        assert!(state.history.is_empty());
+        assert_eq!(state.last_completed_pair, Some(pair("你好。", "Chào.")));
+    }
+
+    #[test]
+    fn history_ignores_out_of_order_completion() {
+        let mut state = test_shared_state();
+        state.record_completed_for_history(1, "第一句。".to_string(), "Câu thứ nhất.".to_string());
+        state.record_completed_for_history(3, "第三句。".to_string(), "Câu thứ ba.".to_string());
+        assert_eq!(state.history, vec![pair("第一句。", "Câu thứ nhất.")]);
+        // An older seq resolving late (e.g. a multi-line group whose
+        // lines land after a newer single line) is inserted at the front
+        // of history — newer than the pairs already there — while the
+        // latest stays latest. It must not move history backwards.
+        state.record_completed_for_history(2, "第二句。".to_string(), "Câu thứ hai.".to_string());
+        assert_eq!(
+            state.history,
+            vec![
+                pair("第二句。", "Câu thứ hai."),
+                pair("第一句。", "Câu thứ nhất."),
+            ]
+        );
+        assert_eq!(
+            state.last_completed_pair,
+            Some(pair("第三句。", "Câu thứ ba."))
+        );
+        assert_eq!(state.last_completed_seq, 3);
     }
 }

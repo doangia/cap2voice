@@ -33,6 +33,16 @@ pub struct WindowPosition {
     pub y: f32,
 }
 
+/// Last saved size of the floating overlay window (fixed-size overlay,
+/// 2026-11-25): the window never resizes with the subtitle content — only
+/// the user's resize-grip drag changes it, and that size persists across
+/// restarts. `None` means the built-in default (620 x 204).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WindowSize {
+    pub width: f32,
+    pub height: f32,
+}
+
 /// General capture, OCR path, logging, and window behavior settings (`Chung` tab).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -135,6 +145,13 @@ pub struct DisplayConfig {
     pub chinese_color_hex: String,
     pub vietnamese_color_hex: String,
     pub overlay_position: Option<WindowPosition>,
+    /// Last saved overlay window size (fixed-size overlay, 2026-11-25).
+    /// `None` means the built-in default (620 x 204).
+    pub overlay_size: Option<WindowSize>,
+    /// How many previously completed subtitle pairs to show, dimmed,
+    /// above the current subtitle (0 = off, 1–2). Values above 2 are
+    /// clamped to 2 where the setting is used.
+    pub history_lines: u8,
     /// Show the translated subtitle in a separate transparent window
     /// placed exactly over the capture region, in addition to the
     /// floating overlay (in-place mode, default OFF).
@@ -156,6 +173,8 @@ impl Default for DisplayConfig {
             chinese_color_hex: "#FFFFFF".to_string(),
             vietnamese_color_hex: "#4ADE80".to_string(),
             overlay_position: None,
+            overlay_size: None,
+            history_lines: 0,
             inplace_subtitle: false,
             inplace_bg_opacity: 0.70,
         }

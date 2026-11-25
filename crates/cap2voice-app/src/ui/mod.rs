@@ -34,8 +34,8 @@ use inplace::{
     render_inplace_subtitle_ui, INPLACE_WINDOW_TITLE,
 };
 use overlay::{
-    apply_exclude_from_capture_by_title, clamp_overlay_resize, overlay_desired_height,
-    render_overlay_ui, OverlayState, PositionTracker, ServerUiStatus, POSITION_SAVE_DEBOUNCE,
+    apply_exclude_from_capture_by_title, render_overlay_ui, OverlayState, PositionTracker,
+    ServerUiStatus, SizeTracker, POSITION_SAVE_DEBOUNCE,
 };
 pub(crate) use pipeline::TtsPreviewAudio;
 #[cfg(test)]
@@ -72,6 +72,10 @@ pub struct Cap2VoiceApp {
     wda_attempted_frame: bool,
     wda_error_detail: Option<String>,
     position_tracker: PositionTracker,
+    /// Debounced tracker for the user-resized overlay size (fixed-size
+    /// overlay, 2026-11-25): the window size only changes via the resize
+    /// grip, and the chosen size persists to `config.display.overlay_size`.
+    size_tracker: SizeTracker,
     last_overlay_outer_pos: Option<WindowPosition>,
     region_selector: Option<RegionSelectorState>,
     region_selector_focused: bool,
@@ -98,11 +102,6 @@ pub struct Cap2VoiceApp {
     /// Whether `WDA_EXCLUDEFROMCAPTURE` was already attempted on the
     /// in-place subtitle window (once per app run).
     inplace_wda_attempted: bool,
-    /// Height (logical px) this app last set automatically for multi-line
-    /// subtitles (2-line bug fix); `None` when the height is the user's
-    /// own (manual resize or default). Used to shrink back after a
-    /// multi-line frame without undoing a manual resize.
-    overlay_auto_height: Option<f32>,
     /// WDA failure detail for the in-place window (shown as a notice).
     inplace_wda_error: Option<String>,
     settings_draft: Option<SettingsDraftState>,
@@ -203,6 +202,10 @@ impl Cap2VoiceApp {
 
         let position_tracker = PositionTracker::new(
             bootstrap.config.display.overlay_position.clone(),
+            POSITION_SAVE_DEBOUNCE,
+        );
+        let size_tracker = SizeTracker::new(
+            bootstrap.config.display.overlay_size,
             POSITION_SAVE_DEBOUNCE,
         );
         let initial_outer_pos = bootstrap.config.display.overlay_position.clone();
@@ -332,6 +335,7 @@ impl Cap2VoiceApp {
             wda_attempted_frame: false,
             wda_error_detail,
             position_tracker,
+            size_tracker,
             last_overlay_outer_pos: initial_outer_pos,
             region_selector: None,
             region_selector_focused: false,
@@ -342,7 +346,6 @@ impl Cap2VoiceApp {
             inplace_rect_source: None,
             inplace_viewport_rect: None,
             inplace_wda_attempted: false,
-            overlay_auto_height: None,
             inplace_wda_error: None,
             settings_draft: None,
             settings_focused: false,
@@ -433,37 +436,6 @@ impl Cap2VoiceApp {
             }
         }
     }
-
-    /// Grow/shrink the overlay window height so multi-line subtitles fit
-    /// (2-line bug fix). The default 204 px window fits one Chinese + one
-    /// Vietnamese line; a 2-line frame needs ~55 px more. Policy: grow
-    /// when the content needs more height than the window has; shrink
-    /// back only when the window is still at a height this method set
-    /// (never undo a manual resize, except to keep content visible).
-    fn apply_multiline_height(&mut self, ctx: &egui::Context) {
-        let desired = overlay_desired_height(
-            &self.config,
-            &self.state.pipeline.chinese_line,
-            &self.state.pipeline.vietnamese_line,
-        );
-        let Some(size) = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size())) else {
-            return;
-        };
-        let current = size.y;
-        let at_auto_height = self
-            .overlay_auto_height
-            .is_some_and(|h| (current - h).abs() < 1.0);
-        let should_resize =
-            current + 0.5 < desired || (at_auto_height && (current - desired).abs() > 0.5);
-        if should_resize {
-            let next = clamp_overlay_resize([size.x, desired]);
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(next.into()));
-            self.overlay_auto_height = Some(next[1]);
-        } else if !at_auto_height && current + 0.5 >= desired {
-            // The user resized away from the auto height: stop tracking it.
-            self.overlay_auto_height = None;
-        }
-    }
 }
 
 impl eframe::App for Cap2VoiceApp {
@@ -495,6 +467,16 @@ impl eframe::App for Cap2VoiceApp {
                     .observe(outer_rect.min.x, outer_rect.min.y, now);
                 if let Some(ready_pos) = self.position_tracker.take_ready_to_save(now) {
                     self.save_overlay_position(ready_pos);
+                }
+            }
+            // Fixed-size overlay: the size only changes via the resize
+            // grip, so observing it here persists the user's chosen size
+            // (debounced, like the position above).
+            if let Some(inner_size) = ui.input(|i| i.viewport().inner_rect.map(|r| r.size())) {
+                let now = Instant::now();
+                self.size_tracker.observe(inner_size.x, inner_size.y, now);
+                if let Some(ready_size) = self.size_tracker.take_ready_to_save(now) {
+                    self.save_overlay_size(ready_size);
                 }
             }
         }
@@ -653,8 +635,6 @@ impl eframe::App for Cap2VoiceApp {
                 })
                 .inner;
             self.dispatch_commands(&ctx, commands);
-            // Multi-line subtitles need a taller window (2-line bug fix).
-            self.apply_multiline_height(&ctx);
         }
 
         if matches!(self.state.server_status, ServerUiStatus::Starting)
@@ -673,6 +653,9 @@ impl eframe::App for Cap2VoiceApp {
         self.hotkeys.take();
         if let Some(pending_pos) = self.position_tracker.take_pending() {
             self.save_overlay_position(pending_pos);
+        }
+        if let Some(pending_size) = self.size_tracker.take_pending() {
+            self.save_overlay_size(pending_size);
         }
         if let Some(forwarder) = self.repaint_forwarder.take() {
             forwarder.abort();
@@ -720,7 +703,7 @@ mod tests {
         PipelineDeps, PipelineRunner, PipelineSettings, PipelineStatus, SubtitleLogger,
     };
     use crate::translate::TranslationEngine;
-    use eframe::egui::{Pos2, WindowLevel};
+    use eframe::egui::{Pos2, Vec2, WindowLevel};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -969,12 +952,36 @@ mod tests {
         assert_eq!(opts.viewport.transparent, Some(true));
         assert_eq!(opts.viewport.window_level, Some(WindowLevel::AlwaysOnTop));
         assert_eq!(opts.viewport.position, Some(Pos2::new(320.0, 740.0)));
+        // No saved size: the default fixed size.
+        assert_eq!(opts.viewport.inner_size, Some(Vec2::new(620.0, 204.0)));
 
         cfg.display.always_on_top = false;
         cfg.display.overlay_position = None;
         let normal_opts = build_native_options(&cfg);
         assert_eq!(normal_opts.viewport.window_level, Some(WindowLevel::Normal));
         assert_eq!(normal_opts.viewport.position, None);
+    }
+
+    #[test]
+    fn build_native_options_restores_saved_overlay_size_clamped_to_grip_bounds() {
+        use crate::config::WindowSize;
+
+        let mut cfg = AppConfig::default();
+        cfg.display.overlay_size = Some(WindowSize {
+            width: 800.0,
+            height: 300.0,
+        });
+        let opts = build_native_options(&cfg);
+        assert_eq!(opts.viewport.inner_size, Some(Vec2::new(800.0, 300.0)));
+
+        // An out-of-range saved size (hand-edited config) is clamped,
+        // never applied raw.
+        cfg.display.overlay_size = Some(WindowSize {
+            width: 5000.0,
+            height: 50.0,
+        });
+        let clamped = build_native_options(&cfg);
+        assert_eq!(clamped.viewport.inner_size, Some(Vec2::new(1200.0, 140.0)));
     }
 
     #[test]

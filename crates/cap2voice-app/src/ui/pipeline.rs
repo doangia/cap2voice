@@ -9,7 +9,7 @@ use super::settings::AsyncFeedbackState;
 use super::tray::TrayMenuAction;
 use crate::api::{Translator, TtsEngine};
 use crate::audio::AudioPlayer;
-use crate::config::{save_config_to, AppConfig, ConfigError, WindowPosition};
+use crate::config::{save_config_to, AppConfig, ConfigError, WindowPosition, WindowSize};
 use crate::ocr::{resolve_wechat_paths_from_config, WeChatOcrAdapter};
 use crate::pipeline::{
     OcrDebugLogger, PipelineDeps, PipelineRunner, PipelineSettings, PipelineSnapshot,
@@ -434,6 +434,12 @@ impl super::Cap2VoiceApp {
         self.config.display.overlay_position = Some(pos.clone());
         self.persist_config();
         self.position_tracker.mark_saved(pos);
+    }
+
+    pub(crate) fn save_overlay_size(&mut self, size: WindowSize) {
+        self.config.display.overlay_size = Some(size);
+        self.persist_config();
+        self.size_tracker.mark_saved(size);
     }
 
     /// Load (or reuse) the translation + TTS caches from

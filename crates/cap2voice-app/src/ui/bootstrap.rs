@@ -1,7 +1,10 @@
 //! Application bootstrap: config load, native window options, native
 //! engine construction, and shutdown helpers (D1+A5: no Python server).
 
-use super::overlay::{apply_exclude_from_capture_hwnd, DisplayAffinityError, DEFAULT_OVERLAY_SIZE};
+use super::overlay::{
+    apply_exclude_from_capture_hwnd, clamp_overlay_resize, DisplayAffinityError,
+    DEFAULT_OVERLAY_SIZE,
+};
 use crate::config::{default_config_path, load_config_from, AppConfig};
 use crate::pipeline::PipelineHandle;
 use crate::translate::{
@@ -22,9 +25,17 @@ pub(crate) fn configured_window_level(config: &AppConfig) -> egui::WindowLevel {
 
 /// Build `eframe::NativeOptions` for the borderless, transparent, always-on-top overlay.
 pub fn build_native_options(config: &AppConfig) -> eframe::NativeOptions {
+    // Fixed-size overlay (2026-11-25): start at the user's saved size
+    // when present (clamped to the grip bounds), else the default. The
+    // size never changes with the subtitle content afterwards.
+    let initial_size = config
+        .display
+        .overlay_size
+        .map(|size| clamp_overlay_resize([size.width, size.height]))
+        .unwrap_or(DEFAULT_OVERLAY_SIZE);
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("cap2voice")
-        .with_inner_size(DEFAULT_OVERLAY_SIZE)
+        .with_inner_size(initial_size)
         .with_min_inner_size([460.0, 140.0])
         .with_decorations(false)
         .with_transparent(true)

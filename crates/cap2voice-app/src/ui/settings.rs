@@ -1,6 +1,7 @@
 //! Decorated 5-tab Settings window (`Cài đặt`) with isolated draft state,
 //! live validation, `Huỷ` / `Lưu thay đổi`, engine selector, and voice preview.
 
+use super::overlay::dim_color;
 use crate::config::{AppConfig, CaptureRegion, HotkeyConfig};
 use crate::ocr::{resolve_wechat_paths_from_config, WeChatOcrPaths};
 use crate::translate::{TranslationEngine, TranslatorStatus};
@@ -1040,6 +1041,32 @@ fn render_display_tab(ui: &mut egui::Ui, state: &mut SettingsDraftState) {
     );
 
     ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        ui.label("Hiện phụ đề trước đó");
+        let history_label = match state.draft.display.history_lines {
+            1 => "1 dòng",
+            2 => "2 dòng",
+            _ => "Tắt",
+        };
+        egui::ComboBox::from_id_salt("settings_history_lines")
+            .selected_text(history_label)
+            .width(120.0)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut state.draft.display.history_lines, 0, "Tắt");
+                ui.selectable_value(&mut state.draft.display.history_lines, 1, "1 dòng");
+                ui.selectable_value(&mut state.draft.display.history_lines, 2, "2 dòng");
+            });
+    });
+    ui.label(
+        egui::RichText::new(
+            "Hiện 1–2 cặp phụ đề đã hoàn tất (mờ hơn) phía trên phụ đề hiện tại. \
+             Áp dụng ngay khi lưu, không cần khởi động lại.",
+        )
+        .size(11.5)
+        .color(muted_text_color()),
+    );
+
+    ui.add_space(10.0);
     ui.checkbox(
         &mut state.draft.display.inplace_subtitle,
         "Hiển thị phụ đề tại vị trí gốc trên video",
@@ -1074,6 +1101,27 @@ fn render_display_tab(ui: &mut egui::Ui, state: &mut SettingsDraftState) {
         .inner_margin(egui::Margin::symmetric(12, 8))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
+            // Sample history pair (dimmed), shown when the setting is on.
+            if state.draft.display.history_lines > 0 {
+                let zh_hist = parse_hex_color(&state.draft.display.chinese_color_hex)
+                    .unwrap_or(egui::Color32::WHITE);
+                let vi_hist = parse_hex_color(&state.draft.display.vietnamese_color_hex)
+                    .unwrap_or(egui::Color32::from_rgb(74, 222, 128));
+                if state.draft.display.show_chinese_line {
+                    ui.label(
+                        egui::RichText::new("之前的一句。")
+                            .size((state.draft.display.font_size_px * 1.1).clamp(14.0, 28.0))
+                            .color(dim_color(zh_hist)),
+                    );
+                }
+                if state.draft.display.show_vietnamese_line {
+                    ui.label(
+                        egui::RichText::new("Câu trước đó.")
+                            .size((state.draft.display.font_size_px * 0.85).clamp(12.0, 22.0))
+                            .color(dim_color(vi_hist)),
+                    );
+                }
+            }
             if state.draft.display.show_pinyin_line && state.draft.display.show_chinese_line {
                 ui.label(
                     egui::RichText::new("yè shēn le, yǔ hái zài xià。")
