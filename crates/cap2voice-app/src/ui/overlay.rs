@@ -186,8 +186,8 @@ pub fn fit_subtitle_blocks(
                 break;
             };
             // Whole-drop blocks at this order go together (a history
-            // pair's Chinese + Vietnamese lines drop as one unit, so a
-            // Vietnamese line never survives without its Chinese line).
+            // pair drops as one unit — all its shown lines at once,
+            // however many the language filter left it with).
             let whole: Vec<usize> = blocks
                 .iter()
                 .enumerate()
@@ -240,6 +240,54 @@ pub fn fit_subtitle_blocks(
 pub fn dim_color(color: egui::Color32) -> egui::Color32 {
     let [r, g, b, a] = color.to_array();
     egui::Color32::from_rgba_unmultiplied(r, g, b, ((a as f32) * HISTORY_DIM_ALPHA) as u8)
+}
+
+/// Build the fit blocks (and their kinds) for the shown history pairs
+/// (2026-11-25): a history pair shows exactly the lines the current
+/// subtitle shows — the Chinese line only when `show_chinese` is on,
+/// the Vietnamese line only when `show_vietnamese` is on — so history
+/// follows the display language toggles instead of always showing both
+/// lines. A pair with both languages off contributes no blocks at all
+/// (it takes no space and renders nothing). The pairs arrive oldest
+/// first; the two lines of one pair share one `drop_order`, so a pair
+/// always drops as a whole unit. The first line of a pair gets the pair
+/// gap (0.0 for the very first block, 4.0 otherwise); the second line
+/// of the same pair sits closer (2.0 within-pair gap).
+fn history_blocks(
+    shown_history: &[&SubtitlePair],
+    show_chinese: bool,
+    show_vietnamese: bool,
+    zh_size: f32,
+    vi_size: f32,
+) -> (Vec<FitBlock>, Vec<BodyBlockKind>) {
+    let mut blocks: Vec<FitBlock> = Vec::new();
+    let mut kinds: Vec<BodyBlockKind> = Vec::new();
+    for (pair_idx, pair) in shown_history.iter().enumerate() {
+        let order = pair_idx as u8; // Oldest pair drops first.
+        let mut pair_gap = if blocks.is_empty() { 0.0 } else { 4.0 };
+        if show_chinese {
+            blocks.push(FitBlock {
+                text: pair.chinese.clone(),
+                base_size: zh_size,
+                space_before: pair_gap,
+                drop_order: order,
+                drop_whole: true,
+            });
+            kinds.push(BodyBlockKind::HistoryChinese);
+            pair_gap = 2.0;
+        }
+        if show_vietnamese {
+            blocks.push(FitBlock {
+                text: pair.vietnamese.clone(),
+                base_size: vi_size,
+                space_before: pair_gap,
+                drop_order: order,
+                drop_whole: true,
+            });
+            kinds.push(BodyBlockKind::HistoryVietnamese);
+        }
+    }
+    (blocks, kinds)
 }
 
 /// Clamp a resize-grip target size to the allowed overlay bounds.
@@ -873,27 +921,13 @@ pub fn render_overlay_ui(
             // `state.history` is most-recent-first; display oldest first.
             let shown_history: Vec<&SubtitlePair> =
                 state.history.iter().take(history_count).rev().collect();
-            let mut blocks: Vec<FitBlock> = Vec::new();
-            let mut kinds: Vec<BodyBlockKind> = Vec::new();
-            for (pair_idx, pair) in shown_history.iter().enumerate() {
-                let order = pair_idx as u8; // Oldest pair drops first.
-                blocks.push(FitBlock {
-                    text: pair.chinese.clone(),
-                    base_size: zh_size,
-                    space_before: if blocks.is_empty() { 0.0 } else { 4.0 },
-                    drop_order: order,
-                    drop_whole: true,
-                });
-                kinds.push(BodyBlockKind::HistoryChinese);
-                blocks.push(FitBlock {
-                    text: pair.vietnamese.clone(),
-                    base_size: vi_size,
-                    space_before: 2.0,
-                    drop_order: order,
-                    drop_whole: true,
-                });
-                kinds.push(BodyBlockKind::HistoryVietnamese);
-            }
+            let (mut blocks, mut kinds) = history_blocks(
+                &shown_history,
+                config.display.show_chinese_line,
+                config.display.show_vietnamese_line,
+                zh_size,
+                vi_size,
+            );
             let history_shown = !blocks.is_empty();
             let pinyin_shown = config.display.show_chinese_line
                 && config.display.show_pinyin_line
@@ -1112,8 +1146,9 @@ pub fn render_overlay_ui(
 mod tests {
     use super::{
         apply_exclude_from_capture_hwnd, clamp_overlay_resize, dim_color, fit_subtitle_blocks,
-        overlay_overlaps_region, DisplayAffinityError, FitBlock, OverlayState, PositionTracker,
-        ServerUiStatus, SizeTracker, MAX_HISTORY_PAIRS, MIN_SUBTITLE_FONT_SIZE,
+        history_blocks, overlay_overlaps_region, BodyBlockKind, DisplayAffinityError, FitBlock,
+        OverlayState, PositionTracker, ServerUiStatus, SizeTracker, MAX_HISTORY_PAIRS,
+        MIN_SUBTITLE_FONT_SIZE,
     };
     use crate::config::{AppConfig, CaptureRegion, WindowPosition, WindowSize};
     use crate::pipeline::{
@@ -1472,8 +1507,8 @@ mod tests {
         // history pair with them.
         let fit = fit_subtitle_blocks(&blocks, MIN_SUBTITLE_FONT_SIZE / 18.0, 60.0, &stub_measure);
         assert!(fit.truncated);
-        // The whole history pair drops together (no orphaned
-        // Vietnamese line without its Chinese line).
+        // The whole history pair drops together (all its shown lines
+        // at once, never a single line left behind).
         assert_eq!(fit.texts[0], None);
         assert_eq!(fit.texts[1], None);
         assert_eq!(fit.texts[2].as_deref(), Some("nǐ hǎo。"));
@@ -1561,6 +1596,80 @@ mod tests {
         assert!((r as i16 - 74).abs() <= 2, "r={r}");
         assert!((g as i16 - 222).abs() <= 2, "g={g}");
         assert!((b as i16 - 128).abs() <= 2, "b={b}");
+    }
+
+    #[test]
+    fn history_blocks_follow_display_language_toggles() {
+        let pair_a = SubtitlePair {
+            chinese: "第一句。".to_string(),
+            vietnamese: "Câu thứ nhất.".to_string(),
+        };
+        let pair_b = SubtitlePair {
+            chinese: "第二句。".to_string(),
+            vietnamese: "Câu thứ hai.".to_string(),
+        };
+        let shown: Vec<&SubtitlePair> = vec![&pair_a, &pair_b];
+
+        // (a) Chinese off + Vietnamese on (Danh's config): one
+        // Vietnamese line per pair; the pair gap (4.0) still separates
+        // the pairs, and both lines share the pair's drop order.
+        let (blocks, kinds) = history_blocks(&shown, false, true, 24.3, 18.0);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].text, "Câu thứ nhất.");
+        assert_eq!(blocks[1].text, "Câu thứ hai.");
+        assert_eq!(
+            kinds,
+            vec![
+                BodyBlockKind::HistoryVietnamese,
+                BodyBlockKind::HistoryVietnamese
+            ]
+        );
+        assert_eq!(blocks[0].drop_order, 0);
+        assert_eq!(blocks[1].drop_order, 1);
+        assert_eq!(blocks[0].space_before, 0.0);
+        assert_eq!(blocks[1].space_before, 4.0);
+        assert!(blocks.iter().all(|b| b.drop_whole));
+
+        // (b) Both on: two lines per pair, Chinese above Vietnamese,
+        // both lines of one pair sharing its drop order.
+        let (blocks, kinds) = history_blocks(&shown, true, true, 24.3, 18.0);
+        assert_eq!(blocks.len(), 4);
+        assert_eq!(blocks[0].text, "第一句。");
+        assert_eq!(blocks[1].text, "Câu thứ nhất.");
+        assert_eq!(blocks[2].text, "第二句。");
+        assert_eq!(blocks[3].text, "Câu thứ hai.");
+        assert_eq!(
+            kinds,
+            vec![
+                BodyBlockKind::HistoryChinese,
+                BodyBlockKind::HistoryVietnamese,
+                BodyBlockKind::HistoryChinese,
+                BodyBlockKind::HistoryVietnamese
+            ]
+        );
+        assert_eq!(blocks[0].drop_order, blocks[1].drop_order);
+        assert_eq!(blocks[2].drop_order, blocks[3].drop_order);
+        assert_ne!(blocks[0].drop_order, blocks[2].drop_order);
+        // Pair gap between pairs (4.0), within-pair gap (2.0).
+        assert_eq!(blocks[0].space_before, 0.0);
+        assert_eq!(blocks[1].space_before, 2.0);
+        assert_eq!(blocks[2].space_before, 4.0);
+        assert_eq!(blocks[3].space_before, 2.0);
+
+        // (c) Chinese on + Vietnamese off: one Chinese line per pair.
+        let (blocks, kinds) = history_blocks(&shown, true, false, 24.3, 18.0);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].text, "第一句。");
+        assert_eq!(blocks[1].text, "第二句。");
+        assert_eq!(
+            kinds,
+            vec![BodyBlockKind::HistoryChinese, BodyBlockKind::HistoryChinese]
+        );
+
+        // (d) Both off: no history lines at all.
+        let (blocks, kinds) = history_blocks(&shown, false, false, 24.3, 18.0);
+        assert!(blocks.is_empty());
+        assert!(kinds.is_empty());
     }
 
     #[test]
@@ -1703,5 +1812,78 @@ mod tests {
             assert!(cmds.is_empty());
         });
         assert!(!full_output.shapes.is_empty());
+    }
+
+    #[test]
+    fn render_overlay_ui_history_follows_language_toggles() {
+        // Danh's config: Chinese hidden, Vietnamese shown, history 2.
+        // The history pairs must render only their Vietnamese lines —
+        // no Chinese text anywhere in the overlay.
+        let ctx = eframe::egui::Context::default();
+        let mut cfg = AppConfig::default();
+        cfg.display.show_chinese_line = false;
+        cfg.display.show_vietnamese_line = true;
+        cfg.display.history_lines = 2;
+        let mut state = OverlayState::from_config(&cfg, Vec::new());
+        state.server_status = ServerUiStatus::Ready;
+        state.apply_pipeline_snapshot(PipelineSnapshot {
+            status: PipelineStatus::Running,
+            latest_seq: 3,
+            chinese_line: "第三句。".to_string(),
+            vietnamese_line: "Câu thứ ba.".to_string(),
+            error_banner: None,
+            metrics: PipelineMetrics::default(),
+            history: vec![
+                SubtitlePair {
+                    chinese: "第二句。".to_string(),
+                    vietnamese: "Câu thứ hai.".to_string(),
+                },
+                SubtitlePair {
+                    chinese: "第一句。".to_string(),
+                    vietnamese: "Câu thứ nhất.".to_string(),
+                },
+            ],
+        });
+
+        let raw_input = eframe::egui::RawInput {
+            screen_rect: Some(eframe::egui::Rect::from_min_size(
+                eframe::egui::Pos2::ZERO,
+                eframe::egui::vec2(620.0, 204.0),
+            )),
+            ..Default::default()
+        };
+        let full_output = ctx.run_ui(raw_input, |ui| {
+            let cmds = super::render_overlay_ui(ui, &mut state, &cfg, &[]);
+            assert!(cmds.is_empty());
+        });
+        assert!(!full_output.shapes.is_empty());
+        // All label texts rendered, in draw order (the item type is
+        // inferred — `ClippedShape` is `epaint`, not `egui`).
+        let texts: Vec<String> = full_output
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                eframe::egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.iter().any(|t| t.contains("Câu thứ hai.")),
+            "expected the newest history line, texts={texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("Câu thứ nhất.")),
+            "expected the oldest history line, texts={texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("Câu thứ ba.")),
+            "expected the current line, texts={texts:?}"
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|t| t.contains("第二句") || t.contains("第一句") || t.contains("第三句")),
+            "no Chinese line may render while Chinese is hidden: texts={texts:?}"
+        );
     }
 }
