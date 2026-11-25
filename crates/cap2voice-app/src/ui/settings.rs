@@ -558,6 +558,19 @@ fn render_general_tab(
 
     ui.add_space(8.0);
     ui.checkbox(
+        &mut state.draft.general.debug_logging,
+        "Ghi log debug OCR (chẩn đoán câu miss / câu gộp)",
+    );
+    ui.label(
+        egui::RichText::new(
+            "Khi bật: ghi ocr-debug-NGÀY.log vào thư mục log — raw OCR từng frame kèm quyết định pixel-diff / dedupe / hold / buffer. Áp dụng khi bắt đầu dịch lần sau. Mặc định tắt.",
+        )
+        .size(12.0)
+        .color(muted_text_color()),
+    );
+
+    ui.add_space(8.0);
+    ui.checkbox(
         &mut state.draft.general.close_to_tray,
         "Ẩn xuống khay hệ thống khi đóng cửa sổ",
     );
@@ -1316,6 +1329,7 @@ mod tests {
         draft_state.weixin_dir_input = r"C:\Custom\Weixin".to_string();
         draft_state.draft.general.enable_subtitle_log = false;
         draft_state.log_dir_input = r"C:\Logs\cap2voice".to_string();
+        draft_state.draft.general.debug_logging = true;
         draft_state.draft.general.close_to_tray = false;
         draft_state.draft.general.start_with_windows = true;
         draft_state.draft.general.start_minimized_to_tray = true;
@@ -1358,6 +1372,7 @@ mod tests {
             committed.general.subtitle_log_dir,
             Some(PathBuf::from(r"C:\Logs\cap2voice"))
         );
+        assert!(committed.general.debug_logging);
         assert!(!committed.general.close_to_tray);
         assert!(committed.general.start_with_windows);
         assert!(committed.general.start_minimized_to_tray);

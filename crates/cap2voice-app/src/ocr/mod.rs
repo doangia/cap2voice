@@ -4,8 +4,10 @@
 pub mod filter;
 
 pub use filter::{
-    extract_chinese_subtitle, extract_chinese_subtitle_lines, filter_cjk_text, is_cjk_ideograph,
-    join_sorted_blocks, normalized_similarity, sort_text_blocks, FuzzyDeduplicator,
+    extract_chinese_subtitle, extract_chinese_subtitle_lines,
+    extract_chinese_subtitle_lines_with_decisions, filter_cjk_text, is_cjk_ideograph,
+    join_sorted_blocks, normalize_for_comparison, normalized_similarity, sort_text_blocks,
+    FuzzyDeduplicator, GeometricSplitAction, GeometricSplitDecision, GeometricSplitKind,
     TextDeduplicator, DEFAULT_BLANK_RESET_FRAMES, DEFAULT_DEDUPE_THRESHOLD,
 };
 pub use wcocr_rs::{CharDetail, OcrError, OcrResult, TextBlock};

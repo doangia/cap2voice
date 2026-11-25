@@ -181,6 +181,7 @@ fn test_settings(fps: u32) -> PipelineSettings {
         muted: false,
         volume: 0.75,
         enable_subtitle_log: true,
+        debug_logging: false,
     }
 }
 
@@ -633,6 +634,7 @@ async fn pipeline_happy_path_captures_skips_static_frames_translates_speaks_and_
             tts: tts.clone(),
             audio: audio.clone(),
             logger: Some(logger),
+            ocr_debug_logger: None,
             translation_cache: None,
             tts_cache: None,
         },
@@ -720,6 +722,7 @@ async fn pipeline_hold_and_replace_suppresses_transitional_garbage_line() {
             tts: tts.clone(),
             audio: audio.clone(),
             logger: Some(logger),
+            ocr_debug_logger: None,
             translation_cache: None,
             tts_cache: None,
         },
@@ -763,17 +766,25 @@ async fn pipeline_hold_and_replace_suppresses_transitional_garbage_line() {
 
 #[tokio::test]
 async fn pipeline_sentence_buffer_translates_split_sentence_as_one_unit() {
-    // A2 / gh #1: "明天" then "早上见。" arrive as two fragments; the
+    // A2 / gh #1: "明天" then "明天早上见。" arrive as two fragments; the
     // preliminary translation shows fast, but only the completed sentence
     // "明天早上见。" is logged and spoken.
+    // (Merge fix, 2026-11-25: the old test fed only the new part,
+    // "早上见。", as the second fragment. The fix treats a bare
+    // continuation with no shared prefix as a new subtitle — it is
+    // indistinguishable from a hard cut to the next subtitle, so the
+    // buffer completed "明天" first and the test logged two pairs. The
+    // accumulation case that still holds is the progressive reveal, where
+    // the re-read contains the buffered text; the split case is pinned at
+    // the unit level in `sentence_buffer_splits_merged_subtitles_from_real_log`.)
     let temp = TempDirGuard::new("sentence_split");
     let capturer = Arc::new(MockCapturer::new(
         vec![Ok(frame_with_band(20, 230)), Ok(frame_with_band(20, 100))],
         Ok(frame_with_band(20, 100)),
     ));
     let ocr = Arc::new(MockOcrEngine::new(
-        vec![Ok(ocr_block("明天")), Ok(ocr_block("早上见。"))],
-        Ok(ocr_block("早上见。")),
+        vec![Ok(ocr_block("明天")), Ok(ocr_block("明天早上见。"))],
+        Ok(ocr_block("明天早上见。")),
     ));
     let translator = Arc::new(ControllableTranslator::scripted(Vec::new()));
     let tts = Arc::new(MockTtsEngine::new(Vec::new()));
@@ -789,6 +800,7 @@ async fn pipeline_sentence_buffer_translates_split_sentence_as_one_unit() {
             tts: tts.clone(),
             audio: audio.clone(),
             logger: Some(logger),
+            ocr_debug_logger: None,
             translation_cache: None,
             tts_cache: None,
         },
@@ -863,6 +875,7 @@ async fn pipeline_completed_sentence_survives_newer_preliminary_but_keeps_its_di
             tts: tts.clone(),
             audio: audio.clone(),
             logger: Some(logger),
+            ocr_debug_logger: None,
             translation_cache: None,
             tts_cache: None,
         },
@@ -944,6 +957,7 @@ async fn pipeline_two_lines_in_one_frame_stay_separate_utterances() {
             tts: tts.clone(),
             audio: audio.clone(),
             logger: Some(logger),
+            ocr_debug_logger: None,
             translation_cache: None,
             tts_cache: None,
         },
@@ -1016,6 +1030,7 @@ async fn pipeline_fragment_without_completion_never_triggers_tts_or_log() {
             tts: tts.clone(),
             audio: audio.clone(),
             logger: Some(logger),
+            ocr_debug_logger: None,
             translation_cache: None,
             tts_cache: None,
         },
@@ -1088,6 +1103,7 @@ async fn pipeline_sentence_completes_when_subtitle_disappears() {
             tts: tts.clone(),
             audio: audio.clone(),
             logger: Some(logger),
+            ocr_debug_logger: None,
             translation_cache: None,
             tts_cache: None,
         },
@@ -1165,6 +1181,7 @@ async fn pipeline_cache_serves_repeated_short_line_with_one_translate_and_one_tt
             tts: tts.clone(),
             audio: audio.clone(),
             logger: Some(logger),
+            ocr_debug_logger: None,
             translation_cache: Some(translation_cache),
             tts_cache: Some(tts_cache),
         },
@@ -1240,6 +1257,7 @@ async fn pipeline_cache_survives_restart_via_disk_round_trip() {
                 tts: tts.clone(),
                 audio: audio.clone(),
                 logger: Some(logger),
+                ocr_debug_logger: None,
                 translation_cache: Some(translation_cache),
                 tts_cache: Some(tts_cache),
             },
@@ -1310,6 +1328,7 @@ async fn pipeline_late_completed_sentence_is_logged_and_spoken_without_overwriti
             tts: tts.clone(),
             audio: audio.clone(),
             logger: Some(logger),
+            ocr_debug_logger: None,
             translation_cache: None,
             tts_cache: None,
         },
@@ -1397,6 +1416,7 @@ async fn pipeline_auto_read_false_makes_zero_tts_calls_while_translating_and_log
             tts: tts.clone(),
             audio: audio.clone(),
             logger: Some(logger),
+            ocr_debug_logger: None,
             translation_cache: None,
             tts_cache: None,
         },
@@ -1452,6 +1472,7 @@ async fn pipeline_translation_and_network_errors_clear_stale_vietnamese_and_emit
             tts,
             audio,
             logger: Some(logger),
+            ocr_debug_logger: None,
             translation_cache: None,
             tts_cache: None,
         },
@@ -1555,6 +1576,7 @@ async fn pipeline_tts_and_audio_errors_surface_non_blocking_warning_while_keepin
             tts,
             audio,
             logger: Some(logger),
+            ocr_debug_logger: None,
             translation_cache: None,
             tts_cache: None,
         },
@@ -1643,6 +1665,7 @@ async fn pipeline_tts_retries_then_failure_land_in_the_subtitle_log_in_order() {
             tts,
             audio,
             logger: Some(logger),
+            ocr_debug_logger: None,
             translation_cache: None,
             tts_cache: None,
         },
@@ -1733,6 +1756,7 @@ async fn pipeline_capture_and_ocr_errors_surface_explicit_vietnamese_banners_wit
             tts,
             audio,
             logger: Some(logger),
+            ocr_debug_logger: None,
             translation_cache: None,
             tts_cache: None,
         },
@@ -1798,6 +1822,7 @@ async fn pipeline_live_settings_update_switches_voice_and_mute_stops_audio_immed
             tts: tts.clone(),
             audio: audio.clone(),
             logger: Some(logger),
+            ocr_debug_logger: None,
             translation_cache: None,
             tts_cache: None,
         },
@@ -1879,6 +1904,7 @@ async fn pipeline_stop_clears_audio_aborts_inflight_translation_and_returns_idle
             tts,
             audio: audio.clone(),
             logger: Some(logger),
+            ocr_debug_logger: None,
             translation_cache: None,
             tts_cache: None,
         },
@@ -1952,6 +1978,7 @@ fn start_on_from_non_tokio_thread_drives_pipeline_and_stops_via_block_on() {
             tts: tts.clone(),
             audio: audio.clone(),
             logger: Some(logger),
+            ocr_debug_logger: None,
             translation_cache: None,
             tts_cache: None,
         },
@@ -2120,6 +2147,7 @@ async fn real_pc_60s_headless_pipeline_smoke_test() {
             tts,
             audio,
             logger: Some(logger),
+            ocr_debug_logger: None,
             translation_cache: None,
             tts_cache: None,
         },

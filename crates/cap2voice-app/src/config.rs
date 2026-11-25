@@ -43,6 +43,12 @@ pub struct GeneralConfig {
     pub weixin_dir_path: Option<PathBuf>,
     pub enable_subtitle_log: bool,
     pub subtitle_log_dir: Option<PathBuf>,
+    /// Raw-OCR debug log toggle (merge fix, 2026-11-25): when ON, the
+    /// pipeline writes `ocr-debug-YYYY-MM-DD.log` (raw OCR per frame plus
+    /// pixel-diff / dedupe / hold / buffer decisions) next to the subtitle
+    /// log. Default OFF — when OFF nothing extra is written. Takes effect
+    /// on the next pipeline start (the logger is built at start).
+    pub debug_logging: bool,
     pub close_to_tray: bool,
     pub start_with_windows: bool,
     pub start_minimized_to_tray: bool,
@@ -57,6 +63,7 @@ impl Default for GeneralConfig {
             weixin_dir_path: None,
             enable_subtitle_log: true,
             subtitle_log_dir: None,
+            debug_logging: false,
             close_to_tray: true,
             start_with_windows: false,
             start_minimized_to_tray: false,
@@ -355,6 +362,7 @@ mod tests {
         assert_eq!(cfg.general.capture_fps, 10);
         assert_eq!(cfg.general.region, None);
         assert!(cfg.general.enable_subtitle_log);
+        assert!(!cfg.general.debug_logging);
         assert!(cfg.general.close_to_tray);
         assert!(!cfg.general.start_with_windows);
         assert!(!cfg.general.start_minimized_to_tray);

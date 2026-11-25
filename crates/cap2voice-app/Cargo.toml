@@ -11,6 +11,12 @@ eframe = { version = "0.35", default-features = false, features = ["accesskit", 
 futures-util = "0.3"
 global-hotkey = "0.6"
 image = { version = "0.25", default-features = false, features = ["png"] }
+# Sentence segmentation (UAX #29) for the buffer (merge fix, 2026-11-25):
+# replaces the hand-written 7-character terminal-punctuation list in
+# `SentenceBuffer::drain_completed`. `compiled_data` bakes the
+# sentence-break tables into the binary - the size cost is measured and
+# reported in `docs/spec.md` section 3.5.
+icu_segmenter = { version = "2", features = ["compiled_data"] }
 muda = "0.16"
 # ort 2.x is the current release line (2.0.0-rc.15 latest; 1.x is legacy).
 # Pinned exact: the rc is mature (15th RC). `download-binaries` fetches

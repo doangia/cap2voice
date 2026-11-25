@@ -12,8 +12,8 @@ use crate::audio::AudioPlayer;
 use crate::config::{save_config_to, AppConfig, ConfigError, WindowPosition};
 use crate::ocr::{resolve_wechat_paths_from_config, WeChatOcrAdapter};
 use crate::pipeline::{
-    PipelineDeps, PipelineRunner, PipelineSettings, PipelineSnapshot, PipelineStatus,
-    SubtitleLogger, TranslationCache, TtsCache,
+    OcrDebugLogger, PipelineDeps, PipelineRunner, PipelineSettings, PipelineSnapshot,
+    PipelineStatus, SubtitleLogger, TranslationCache, TtsCache,
 };
 use crate::translate::{HelsinkiState, TranslationEngine};
 use eframe::egui;
@@ -532,6 +532,25 @@ impl super::Cap2VoiceApp {
             None
         };
 
+        // Raw-OCR debug log (merge fix, 2026-11-25): built ONLY when the
+        // Settings → Chung toggle `debug_logging` is ON (default OFF).
+        // The toggle takes effect on the next pipeline start: the logger
+        // is built once here and lives in `PipelineDeps`. When OFF, no
+        // debug file is created and the pipeline pays nothing but a
+        // `None` check per decision (the counters are already kept for
+        // the UI metrics).
+        let ocr_debug_logger = if self.config.general.debug_logging {
+            match self.config.effective_log_dir() {
+                Ok(dir) => Some(Arc::new(OcrDebugLogger::new(dir))),
+                Err(err) => {
+                    self.state.ui_notice = Some(format!("Không xác định được thư mục log: {err}"));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
         // Translation + TTS caches (A3 / gh #2). A load failure is not
         // fatal: the pipeline runs uncached and retries the load next start.
         let (translation_cache, tts_cache) = match self.ensure_caches() {
@@ -551,6 +570,7 @@ impl super::Cap2VoiceApp {
             tts,
             audio,
             logger,
+            ocr_debug_logger,
             translation_cache,
             tts_cache,
         };

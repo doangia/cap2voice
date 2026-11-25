@@ -954,6 +954,7 @@ mod tests {
             muted: false,
             volume: 0.75,
             enable_subtitle_log: false,
+            debug_logging: false,
         }
     }
 
@@ -1000,6 +1001,7 @@ mod tests {
             }),
             audio: Arc::new(TestAudio::new()),
             logger: None,
+            ocr_debug_logger: None,
             translation_cache: None,
             tts_cache: None,
         };
@@ -1069,6 +1071,7 @@ mod tests {
             tts: tts.clone(),
             audio: audio.clone(),
             logger: Some(Arc::new(SubtitleLogger::new(temp_dir.path().to_path_buf()))),
+            ocr_debug_logger: None,
             translation_cache: None,
             tts_cache: None,
         };
@@ -1160,6 +1163,7 @@ mod tests {
             }),
             audio,
             logger: None,
+            ocr_debug_logger: None,
             translation_cache: None,
             tts_cache: None,
         };

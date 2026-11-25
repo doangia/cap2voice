@@ -8,12 +8,14 @@
 //! second format.
 
 use crate::api::{TtsError, TtsRetryAttempt, TTS_MAX_RETRIES};
+use crate::ocr::{GeometricSplitAction, GeometricSplitDecision, GeometricSplitKind};
 use chrono::{NaiveDate, NaiveDateTime};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use thiserror::Error;
+use wcocr_rs::TextBlock;
 
 /// Typed errors emitted when validating or writing subtitle log entries.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -28,6 +30,126 @@ pub enum SubtitleLogError {
 /// Build the daily UTF-8 subtitle log file path (`subtitles-YYYY-MM-DD.log`).
 pub fn daily_log_path(log_dir: &Path, date: NaiveDate) -> PathBuf {
     log_dir.join(format!("subtitles-{}.log", date.format("%Y-%m-%d")))
+}
+
+/// Build the daily raw-OCR debug log file path (`ocr-debug-YYYY-MM-DD.log`).
+pub fn daily_ocr_debug_path(log_dir: &Path, date: NaiveDate) -> PathBuf {
+    log_dir.join(format!("ocr-debug-{}.log", date.format("%Y-%m-%d")))
+}
+
+/// Escape raw OCR text for a single debug-log line: newlines become
+/// spaces, backslashes and double quotes are escaped, so one OCR call
+/// stays exactly one line.
+fn escape_debug_text(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        match c {
+            '\r' | '\n' => {
+                if !out.ends_with(' ') {
+                    out.push(' ');
+                }
+            }
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            c => out.push(c),
+        }
+    }
+    out.trim().to_string()
+}
+
+/// Format one raw-OCR debug line, e.g.
+/// `[14:40:46.353] OCR blocks=2 | [222,29-305,74 r=0.99] "你好。" | [220,63-310,109 r=0.99] "再见。" | lines=["你好。", "再见。"]`
+///
+/// Block text is the raw OCR text, before CJK filtering; `lines` are the
+/// filtered Chinese lines the pipeline derived from those blocks. A frame
+/// with no blocks logs `OCR blocks=0 | lines=[]`, so an OCR miss is
+/// distinguishable from a pixel-diff skip (no line at all), and blocks
+/// with no lines pin the miss on the CJK filter instead of the engine.
+pub fn format_ocr_debug_line(
+    timestamp: NaiveDateTime,
+    blocks: &[TextBlock],
+    lines: &[String],
+) -> String {
+    let mut out = format!(
+        "[{}] OCR blocks={}",
+        timestamp.format("%H:%M:%S%.3f"),
+        blocks.len()
+    );
+    for block in blocks {
+        out.push_str(&format!(
+            " | [{:.0},{:.0}-{:.0},{:.0} r={:.2}] \"{}\"",
+            block.left,
+            block.top,
+            block.right,
+            block.bottom,
+            block.rate,
+            escape_debug_text(block.text.trim())
+        ));
+    }
+    let quoted: Vec<String> = lines
+        .iter()
+        .map(|line| format!("\"{}\"", escape_debug_text(line)))
+        .collect();
+    out.push_str(&format!(" | lines=[{}]\n", quoted.join(", ")));
+    out
+}
+
+/// Append one pre-formatted line to the daily file at `path` (opened or
+/// rotated as needed), flushing immediately. Shared by the subtitle log
+/// and the OCR debug log so the rotation behavior stays identical.
+fn append_line_to_daily_file(
+    state: &Mutex<Option<OpenDailyFile>>,
+    log_dir: &Path,
+    date: NaiveDate,
+    path: PathBuf,
+    line: String,
+) -> Result<PathBuf, SubtitleLogError> {
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    let needs_reopen = match guard.as_ref() {
+        Some(open) => open.date != date,
+        None => true,
+    };
+    if needs_reopen {
+        std::fs::create_dir_all(log_dir).map_err(|err| SubtitleLogError::Io {
+            path: log_dir.to_path_buf(),
+            detail: err.to_string(),
+        })?;
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|err| SubtitleLogError::Io {
+                path: path.clone(),
+                detail: err.to_string(),
+            })?;
+        *guard = Some(OpenDailyFile {
+            date,
+            path: path.clone(),
+            file,
+        });
+    }
+
+    let Some(open) = guard.as_mut() else {
+        return Err(SubtitleLogError::Io {
+            path,
+            detail: "open daily log file handle missing".to_string(),
+        });
+    };
+
+    if let Err(err) = open
+        .file
+        .write_all(line.as_bytes())
+        .and_then(|()| open.file.flush())
+    {
+        let err_path = open.path.clone();
+        *guard = None;
+        return Err(SubtitleLogError::Io {
+            path: err_path,
+            detail: err.to_string(),
+        });
+    }
+
+    Ok(open.path.clone())
 }
 
 fn sanitize_single_line(raw: &str) -> String {
@@ -222,60 +344,221 @@ impl SubtitleLogger {
         line: String,
     ) -> Result<PathBuf, SubtitleLogError> {
         let date = timestamp.date();
+        let path = daily_log_path(&self.log_dir, date);
+        append_line_to_daily_file(&self.state, &self.log_dir, date, path, line)
+    }
+}
 
-        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let needs_reopen = match guard.as_ref() {
-            Some(open) => open.date != date,
-            None => true,
-        };
-        if needs_reopen {
-            std::fs::create_dir_all(&self.log_dir).map_err(|err| SubtitleLogError::Io {
-                path: self.log_dir.clone(),
-                detail: err.to_string(),
-            })?;
-            let path = daily_log_path(&self.log_dir, date);
-            let file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .map_err(|err| SubtitleLogError::Io {
-                    path: path.clone(),
-                    detail: err.to_string(),
-                })?;
-            *guard = Some(OpenDailyFile { date, path, file });
+/// Thread-safe daily raw-OCR debug log writer (merge fix, 2026-11-25).
+///
+/// One line per OCR call, written next to the subtitle log with the same
+/// daily rotation and immediate flush. The file is opened lazily on the
+/// first OCR call, so an idle pipeline writes nothing and creates no
+/// file; when OCR runs, each call costs one short line. Only OCR text is
+/// ever logged — never audio, never translations.
+pub struct OcrDebugLogger {
+    log_dir: PathBuf,
+    state: Mutex<Option<OpenDailyFile>>,
+}
+
+impl OcrDebugLogger {
+    pub fn new(log_dir: PathBuf) -> Self {
+        Self {
+            log_dir,
+            state: Mutex::new(None),
         }
+    }
 
-        let Some(open) = guard.as_mut() else {
-            return Err(SubtitleLogError::Io {
-                path: daily_log_path(&self.log_dir, date),
-                detail: "open daily subtitle log file handle missing".to_string(),
-            });
+    pub fn log_dir(&self) -> &Path {
+        &self.log_dir
+    }
+
+    /// Append and flush one raw-OCR debug line using the current local
+    /// timestamp. Best-effort diagnostics: the caller ignores the error.
+    pub fn log_blocks(
+        &self,
+        blocks: &[TextBlock],
+        lines: &[String],
+    ) -> Result<PathBuf, SubtitleLogError> {
+        let now = chrono::Local::now().naive_local();
+        self.log_blocks_at(now, blocks, lines)
+    }
+
+    /// Append and flush one raw-OCR debug line at an explicit timestamp.
+    pub fn log_blocks_at(
+        &self,
+        timestamp: NaiveDateTime,
+        blocks: &[TextBlock],
+        lines: &[String],
+    ) -> Result<PathBuf, SubtitleLogError> {
+        let line = format_ocr_debug_line(timestamp, blocks, lines);
+        self.write_debug_line(timestamp, line)
+    }
+
+    /// Append one pre-formatted debug line at an explicit timestamp
+    /// (shared by every debug-line kind below).
+    fn write_debug_line(
+        &self,
+        timestamp: NaiveDateTime,
+        line: String,
+    ) -> Result<PathBuf, SubtitleLogError> {
+        let date = timestamp.date();
+        let path = daily_ocr_debug_path(&self.log_dir, date);
+        append_line_to_daily_file(&self.state, &self.log_dir, date, path, line)
+    }
+
+    /// Current local timestamp plus its `[HH:MM:SS.mmm]` rendering, for
+    /// the decision lines (all share the same clock as the OCR lines).
+    fn now_debug_timestamp() -> (NaiveDateTime, String) {
+        let now = chrono::Local::now().naive_local();
+        (now, now.format("%H:%M:%S%.3f").to_string())
+    }
+
+    /// Aggregate line for a run of frames skipped by the pixel-diff gate
+    /// (the subtitle was static, so OCR did not run). One line per run,
+    /// not one per frame, so the log does not flood while idle.
+    pub fn log_pixel_diff_skipped(&self, frames: u32) -> Result<PathBuf, SubtitleLogError> {
+        let (now, ts) = Self::now_debug_timestamp();
+        self.write_debug_line(now, format!("[{ts}] PIXEL-DIFF skipped {frames} frames\n"))
+    }
+
+    /// A line the fuzzy dedupe swallowed as a re-read of the previous
+    /// line, with the similarity that decided it.
+    pub fn log_dedupe_dropped(
+        &self,
+        text: &str,
+        similarity: Option<f32>,
+    ) -> Result<PathBuf, SubtitleLogError> {
+        let (now, ts) = Self::now_debug_timestamp();
+        let sim = similarity.map_or(String::new(), |s| format!(" sim={s:.2}"));
+        self.write_debug_line(
+            now,
+            format!(
+                "[{ts}] DEDUPE dropped \"{}\"{sim}\n",
+                escape_debug_text(text)
+            ),
+        )
+    }
+
+    /// A held line the hold-and-replace debounce replaced with a newer
+    /// line (transitional garbage suppressed).
+    pub fn log_hold_replaced(&self, old: &str, new: &str) -> Result<PathBuf, SubtitleLogError> {
+        let (now, ts) = Self::now_debug_timestamp();
+        self.write_debug_line(
+            now,
+            format!(
+                "[{ts}] HOLD replaced \"{}\" with \"{}\"\n",
+                escape_debug_text(old),
+                escape_debug_text(new)
+            ),
+        )
+    }
+
+    /// One OCR line the speaker rules split into several utterances.
+    pub fn log_speaker_split(
+        &self,
+        original: &str,
+        pieces: &[String],
+    ) -> Result<PathBuf, SubtitleLogError> {
+        let (now, ts) = Self::now_debug_timestamp();
+        let quoted: Vec<String> = pieces
+            .iter()
+            .map(|piece| format!("\"{}\"", escape_debug_text(piece)))
+            .collect();
+        self.write_debug_line(
+            now,
+            format!(
+                "[{ts}] SPEAKER split \"{}\" into [{}]\n",
+                escape_debug_text(original),
+                quoted.join(", ")
+            ),
+        )
+    }
+
+    /// What the `SentenceBuffer` decided about one fragment: the relation
+    /// (`Started` when the buffer was empty), the fragment, the sentences
+    /// that completed from it, and what stays buffered.
+    pub fn log_buffer_decision(
+        &self,
+        relation: &str,
+        fragment: &str,
+        completed: &[String],
+        buffer: &str,
+    ) -> Result<PathBuf, SubtitleLogError> {
+        let (now, ts) = Self::now_debug_timestamp();
+        let flushed: Vec<String> = completed
+            .iter()
+            .map(|text| format!("\"{}\"", escape_debug_text(text)))
+            .collect();
+        self.write_debug_line(
+            now,
+            format!(
+                "[{ts}] BUFFER {relation} frag=\"{}\" flushed=[{}] buf=\"{}\"\n",
+                escape_debug_text(fragment),
+                flushed.join(", "),
+                escape_debug_text(buffer)
+            ),
+        )
+    }
+
+    /// A buffered sentence completed by a blank run or by the timeout
+    /// (`reason` is `blank` or `timeout`).
+    pub fn log_buffer_flush(&self, reason: &str, text: &str) -> Result<PathBuf, SubtitleLogError> {
+        let (now, ts) = Self::now_debug_timestamp();
+        self.write_debug_line(
+            now,
+            format!(
+                "[{ts}] BUFFER flush({reason}) \"{}\"\n",
+                escape_debug_text(text)
+            ),
+        )
+    }
+
+    /// One geometric split/join decision (merge fix, 2026-11-25): the gap
+    /// that was judged, the threshold it was judged against, the boxes on
+    /// either side, and the resulting texts. `kind` is `block-gap`
+    /// (between two blocks/pieces on one row) or `char-gap` (between two
+    /// character boxes inside one block); `action` is `split` or `joined`.
+    pub fn log_geometric_split(
+        &self,
+        decision: &GeometricSplitDecision,
+    ) -> Result<PathBuf, SubtitleLogError> {
+        let (now, ts) = Self::now_debug_timestamp();
+        let kind = match decision.kind {
+            GeometricSplitKind::BlockGap => "block-gap",
+            GeometricSplitKind::CharGap => "char-gap",
         };
-
-        if let Err(err) = open
-            .file
-            .write_all(line.as_bytes())
-            .and_then(|()| open.file.flush())
-        {
-            let err_path = open.path.clone();
-            *guard = None;
-            return Err(SubtitleLogError::Io {
-                path: err_path,
-                detail: err.to_string(),
-            });
-        }
-
-        Ok(open.path.clone())
+        let action = match decision.action {
+            GeometricSplitAction::Split => "split",
+            GeometricSplitAction::Joined => "joined",
+        };
+        let (ll, lt, lr, lb) = decision.left_box;
+        let (rl, rt, rr, rb) = decision.right_box;
+        self.write_debug_line(
+            now,
+            format!(
+                "[{ts}] GEO {action} {kind} gap={:.0}px thr={:.0}px boxes=[{ll:.0},{lt:.0}-{lr:.0},{lb:.0}] [{rl:.0},{rt:.0}-{rr:.0},{rb:.0}] \"{}\" | \"{}\"\n",
+                decision.gap_px,
+                decision.threshold_px,
+                escape_debug_text(&decision.left_text),
+                escape_debug_text(&decision.right_text)
+            ),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{daily_log_path, format_subtitle_log_line, SubtitleLogError, SubtitleLogger};
+    use super::{
+        daily_log_path, daily_ocr_debug_path, format_ocr_debug_line, format_subtitle_log_line,
+        GeometricSplitAction, GeometricSplitDecision, GeometricSplitKind, OcrDebugLogger,
+        SubtitleLogError, SubtitleLogger,
+    };
     use chrono::NaiveDate;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use wcocr_rs::TextBlock;
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -511,6 +794,202 @@ mod tests {
         assert_eq!(
             format_tts_failure_line(ts, "Xin chào.", "vi-VN-NamMinhNeural", &err),
             "[2026-11-23 15:30:00] TTS THẤT BẠI (vi-VN-NamMinhNeural): lỗi tạo giọng đọc TTS (HTTP 429): Too Many Requests : Xin chào.\n"
+        );
+    }
+
+    #[test]
+    fn format_ocr_debug_line_matches_known_24_11_format() {
+        // The 24/11 debug-trace build wrote these exact lines; the real
+        // logger must keep the same shape so old and new files compare.
+        let ts = NaiveDate::from_ymd_opt(2026, 11, 24)
+            .unwrap()
+            .and_hms_milli_opt(14, 40, 46, 353)
+            .unwrap();
+        let blocks = vec![TextBlock {
+            left: 192.0,
+            top: 33.0,
+            right: 363.0,
+            bottom: 71.0,
+            rate: 1.0,
+            text: "你好，我是".to_string(),
+            details: vec![],
+        }];
+        assert_eq!(
+            format_ocr_debug_line(ts, &blocks, &["你好，我是".to_string()]),
+            "[14:40:46.353] OCR blocks=1 | [192,33-363,71 r=1.00] \"你好，我是\" | lines=[\"你好，我是\"]\n"
+        );
+
+        // Two blocks, one per visual line; an empty result pins an OCR miss.
+        let ts2 = NaiveDate::from_ymd_opt(2026, 11, 24)
+            .unwrap()
+            .and_hms_milli_opt(14, 40, 56, 331)
+            .unwrap();
+        let blocks2 = vec![
+            TextBlock {
+                left: 222.0,
+                top: 29.0,
+                right: 305.0,
+                bottom: 74.0,
+                rate: 0.99,
+                text: "你好。".to_string(),
+                details: vec![],
+            },
+            TextBlock {
+                left: 220.0,
+                top: 63.0,
+                right: 310.0,
+                bottom: 109.0,
+                rate: 0.99,
+                text: "再见。".to_string(),
+                details: vec![],
+            },
+        ];
+        assert_eq!(
+            format_ocr_debug_line(
+                ts2,
+                &blocks2,
+                &["你好。".to_string(), "再见。".to_string()]
+            ),
+            "[14:40:56.331] OCR blocks=2 | [222,29-305,74 r=0.99] \"你好。\" | [220,63-310,109 r=0.99] \"再见。\" | lines=[\"你好。\", \"再见。\"]\n"
+        );
+        assert_eq!(
+            format_ocr_debug_line(ts2, &[], &[]),
+            "[14:40:56.331] OCR blocks=0 | lines=[]\n"
+        );
+        // Blocks but no lines: the CJK filter dropped everything.
+        assert_eq!(
+            format_ocr_debug_line(ts2, &blocks2[..1], &[]),
+            "[14:40:56.331] OCR blocks=1 | [222,29-305,74 r=0.99] \"你好。\" | lines=[]\n"
+        );
+    }
+
+    #[test]
+    fn ocr_debug_logger_appends_and_rotates_daily_files() {
+        let temp = TempDirGuard::new("ocr_dbg");
+        let logger = OcrDebugLogger::new(temp.path().to_path_buf());
+        let block = TextBlock {
+            left: 192.0,
+            top: 33.0,
+            right: 363.0,
+            bottom: 71.0,
+            rate: 1.0,
+            text: "你好，我是".to_string(),
+            details: vec![],
+        };
+
+        let day1 = match logger.log_blocks_at(
+            dt(2026, 11, 24, 23, 59, 58),
+            std::slice::from_ref(&block),
+            &["你好，我是".to_string()],
+        ) {
+            Ok(p) => p,
+            Err(err) => panic!("day1 write failed: {err}"),
+        };
+        let day2 = match logger.log_blocks_at(dt(2026, 11, 25, 0, 0, 2), &[], &[]) {
+            Ok(p) => p,
+            Err(err) => panic!("day2 write failed: {err}"),
+        };
+
+        assert_ne!(day1, day2);
+        assert_eq!(
+            day1.file_name().and_then(|n| n.to_str()),
+            Some("ocr-debug-2026-11-24.log")
+        );
+        assert_eq!(
+            day2.file_name().and_then(|n| n.to_str()),
+            Some("ocr-debug-2026-11-25.log")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&day1).ok().as_deref(),
+            Some("[23:59:58.000] OCR blocks=1 | [192,33-363,71 r=1.00] \"你好，我是\" | lines=[\"你好，我是\"]\n")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&day2).ok().as_deref(),
+            Some("[00:00:02.000] OCR blocks=0 | lines=[]\n")
+        );
+        assert_eq!(
+            daily_ocr_debug_path(temp.path(), NaiveDate::from_ymd_opt(2026, 11, 24).unwrap()),
+            day1
+        );
+    }
+
+    #[test]
+    fn ocr_debug_logger_decision_lines_carry_the_pipeline_reason() {
+        // Decision lines use the current clock, so the test strips the
+        // `[HH:MM:SS.mmm] ` prefix and compares the rest.
+        fn strip_debug_timestamp(line: &str) -> &str {
+            match line.find("] ") {
+                Some(idx) => &line[idx + 2..],
+                None => line,
+            }
+        }
+        let temp = TempDirGuard::new("ocr_dbg_decisions");
+        let logger = OcrDebugLogger::new(temp.path().to_path_buf());
+        let _ = logger.log_pixel_diff_skipped(87).unwrap();
+        let _ = logger.log_dedupe_dropped("你好吗", Some(0.97)).unwrap();
+        let _ = logger.log_dedupe_dropped("再见", None).unwrap();
+        let _ = logger
+            .log_hold_replaced("对不起时说找来晚了。", "对不起，我来晚了。")
+            .unwrap();
+        let _ = logger
+            .log_speaker_split(
+                "你先睡吧 不用等我吃饭了",
+                &["你先睡吧".to_string(), "不用等我吃饭了".to_string()],
+            )
+            .unwrap();
+        let _ = logger
+            .log_buffer_decision(
+                "NewSubtitle",
+                "哦 挺好的嘛",
+                &["啊 下个月啊到金泽住一晚吗".to_string()],
+                "哦 挺好的嘛",
+            )
+            .unwrap();
+        let _ = logger.log_buffer_flush("blank", "你好吗").unwrap();
+        let _ = logger
+            .log_geometric_split(&GeometricSplitDecision {
+                kind: GeometricSplitKind::BlockGap,
+                action: GeometricSplitAction::Split,
+                gap_px: 82.0,
+                threshold_px: 19.5,
+                left_box: (95.0, 85.0, 212.0, 128.0),
+                right_box: (294.0, 86.0, 410.0, 129.0),
+                left_text: "你好吗".to_string(),
+                right_text: "我很好".to_string(),
+            })
+            .unwrap();
+        let _ = logger
+            .log_geometric_split(&GeometricSplitDecision {
+                kind: GeometricSplitKind::CharGap,
+                action: GeometricSplitAction::Split,
+                gap_px: 91.0,
+                threshold_px: 19.0,
+                left_box: (165.0, 85.0, 203.0, 127.0),
+                right_box: (294.0, 86.0, 332.0, 128.0),
+                left_text: "你好吗".to_string(),
+                right_text: "我很好".to_string(),
+            })
+            .unwrap();
+
+        let path = daily_ocr_debug_path(temp.path(), chrono::Local::now().date_naive());
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(err) => panic!("failed reading {}: {err}", path.display()),
+        };
+        let stripped: Vec<&str> = content.lines().map(strip_debug_timestamp).collect();
+        assert_eq!(
+            stripped,
+            vec![
+                "PIXEL-DIFF skipped 87 frames",
+                "DEDUPE dropped \"你好吗\" sim=0.97",
+                "DEDUPE dropped \"再见\"",
+                "HOLD replaced \"对不起时说找来晚了。\" with \"对不起，我来晚了。\"",
+                "SPEAKER split \"你先睡吧 不用等我吃饭了\" into [\"你先睡吧\", \"不用等我吃饭了\"]",
+                "BUFFER NewSubtitle frag=\"哦 挺好的嘛\" flushed=[\"啊 下个月啊到金泽住一晚吗\"] buf=\"哦 挺好的嘛\"",
+                "BUFFER flush(blank) \"你好吗\"",
+                "GEO split block-gap gap=82px thr=20px boxes=[95,85-212,128] [294,86-410,129] \"你好吗\" | \"我很好\"",
+                "GEO split char-gap gap=91px thr=19px boxes=[165,85-203,127] [294,86-332,128] \"你好吗\" | \"我很好\"",
+            ]
         );
     }
 

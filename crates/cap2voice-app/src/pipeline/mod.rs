@@ -4,14 +4,22 @@ pub mod cache;
 pub mod logger;
 
 pub use cache::{normalize_cache_key, CacheError, CachedAudio, TranslationCache, TtsCache};
-pub use logger::{daily_log_path, format_subtitle_log_line, SubtitleLogError, SubtitleLogger};
+pub use logger::{
+    daily_log_path, daily_ocr_debug_path, format_ocr_debug_line, format_subtitle_log_line,
+    OcrDebugLogger, SubtitleLogError, SubtitleLogger,
+};
 
 use crate::api::{TranslateError, Translator, TtsEngine, TtsSynthesis};
 use crate::audio::{validate_volume, AudioError, AudioPlayback};
 use crate::capture::{validate_region_dimensions, FrameCapturer, PixelDiffGate};
 use crate::config::{AppConfig, CaptureRegion};
-use crate::ocr::{extract_chinese_subtitle_lines, FuzzyDeduplicator, OcrEngine, TextDeduplicator};
-use std::sync::{Arc, Mutex};
+use crate::ocr::{
+    extract_chinese_subtitle_lines_with_decisions, normalize_for_comparison, normalized_similarity,
+    FuzzyDeduplicator, OcrEngine, TextDeduplicator, DEFAULT_DEDUPE_THRESHOLD,
+};
+use icu_segmenter::options::SentenceBreakInvariantOptions;
+use icu_segmenter::{SentenceSegmenter, SentenceSegmenterBorrowed};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{watch, Semaphore};
@@ -145,6 +153,11 @@ pub struct PipelineSettings {
     pub muted: bool,
     pub volume: f32,
     pub enable_subtitle_log: bool,
+    /// Raw-OCR debug log toggle (merge fix, 2026-11-25): recorded here so
+    /// the orchestrator knows the setting, but the logger itself lives in
+    /// `PipelineDeps` (built at pipeline start) — the toggle takes effect
+    /// on the next pipeline start.
+    pub debug_logging: bool,
 }
 
 fn validate_unit_f32(name: &str, value: f32, min: f32, max: f32) -> Result<(), PipelineError> {
@@ -180,6 +193,7 @@ impl PipelineSettings {
             muted: false,
             volume: config.voice.volume,
             enable_subtitle_log: config.general.enable_subtitle_log,
+            debug_logging: config.general.debug_logging,
         };
         settings.validate()?;
         Ok(settings)
@@ -267,6 +281,11 @@ pub struct PipelineDeps {
     pub tts: Arc<dyn TtsEngine>,
     pub audio: Arc<dyn AudioPlayback>,
     pub logger: Option<Arc<SubtitleLogger>>,
+    /// Raw-OCR debug log (merge fix, 2026-11-25): one line per OCR call
+    /// with the raw blocks, before dedupe/hold/buffer. Lives beside the
+    /// subtitle log (`ocr-debug-YYYY-MM-DD.log`); `None` disables it.
+    /// Constructed together with `logger` from the same log directory.
+    pub ocr_debug_logger: Option<Arc<OcrDebugLogger>>,
     /// Translation cache (A3 / gh #2). Consulted only for completed
     /// sentences; the preliminary translation never consults it. `None`
     /// disables caching (the translator is always called).
@@ -507,6 +526,10 @@ pub struct SubtitleHold {
     hold_delay: Duration,
     pending: Option<PendingSubtitle>,
     replaced: u64,
+    /// Text of the most recently replaced pending line (`None` when the
+    /// last push did not replace anything). Read by the OCR debug log so
+    /// a hold replacement can show old → new (merge fix, 2026-11-25).
+    last_replaced: Option<String>,
 }
 
 impl SubtitleHold {
@@ -515,6 +538,7 @@ impl SubtitleHold {
             hold_delay,
             pending: None,
             replaced: 0,
+            last_replaced: None,
         }
     }
 
@@ -532,19 +556,33 @@ impl SubtitleHold {
         self.replaced
     }
 
+    /// Text of the line replaced by the most recent push, if the push
+    /// replaced a pending line.
+    pub fn last_replaced(&self) -> Option<&str> {
+        self.last_replaced.as_deref()
+    }
+
+    /// Text of the currently pending line, if any (the newest line after
+    /// the most recent push).
+    pub fn pending_text(&self) -> Option<&str> {
+        self.pending
+            .as_ref()
+            .map(|pending| pending.chinese.as_str())
+    }
+
     /// Push a newly deduped line. Returns `true` when it replaced a pending
     /// line. A zero hold delay stores the line with a deadline of `now`, so
     /// `take_ready(now)` returns it right away.
     pub fn push(&mut self, chinese: String, now: Instant) -> bool {
-        let replaced = self.pending.is_some();
-        if replaced {
+        self.last_replaced = self.pending.take().map(|pending| pending.chinese);
+        if self.last_replaced.is_some() {
             self.replaced += 1;
         }
         self.pending = Some(PendingSubtitle {
             chinese,
             deadline: now + self.hold_delay,
         });
-        replaced
+        self.last_replaced.is_some()
     }
 
     /// Take the held line once its deadline has passed. Returns `None` when
@@ -562,9 +600,58 @@ impl SubtitleHold {
     }
 }
 
-/// Sentence-final punctuation that completes a subtitle sentence (A2 / gh #1).
-/// Both fullwidth CJK forms and their halfwidth ASCII equivalents.
-const SENTENCE_FINAL_PUNCT: [char; 7] = ['。', '？', '！', '…', '.', '!', '?'];
+/// Sentence segmenter (ICU4X, UAX #29) shared by the buffer — replaces the
+/// hand-written 7-character `SENTENCE_FINAL_PUNCT` list (merge fix,
+/// 2026-11-25). `SentenceSegmenter::new` is a `const fn` returning the
+/// borrowed `&'static` view (`SentenceSegmenterBorrowed`: `Copy`,
+/// `Send + Sync`); the owned `SentenceSegmenter` holds an `Rc`-carted data
+/// payload and is neither `Send` nor `Sync`, so it cannot live in a static.
+/// `compiled_data` bakes the sentence-break tables into the binary; the
+/// segmenter is built once per process. See `segment_is_complete` for how
+/// a trailing fragment is judged.
+static SENTENCE_SEGMENTER: LazyLock<SentenceSegmenterBorrowed<'static>> =
+    LazyLock::new(|| SentenceSegmenter::new(SentenceBreakInvariantOptions::default()));
+
+/// Split `text` into sentence segments with the shared segmenter (UAX
+/// #29). `segment_str` yields breakpoint byte offsets (always starting at
+/// 0 and ending at `text.len()`), so the segments are the slices between
+/// consecutive breakpoints.
+fn sentence_segments(text: &str) -> Vec<&str> {
+    let breaks: Vec<usize> = SENTENCE_SEGMENTER.segment_str(text).collect();
+    breaks
+        .windows(2)
+        .map(|pair| &text[pair[0]..pair[1]])
+        .collect()
+}
+
+/// Whether a sentence segment ends a sentence, judged by the segmenter
+/// itself (UAX #29 has no "is this a complete sentence?" query): append a
+/// dummy sentence after the segment; if the segmenter breaks right after
+/// the segment, the segment ended with sentence-terminal punctuation —
+/// allowing trailing closers such as `"` or `」`, which the old punct list
+/// stranded in the buffer as a lone `"` preliminary. If it does not break
+/// (no terminal punctuation), the segment is an unfinished fragment.
+///
+/// This also fixes two cases the old list got wrong: `3.5` (the old list
+/// split at the `.`) and `...` after a closing quote.
+///
+/// One explicit exception: ICU4X 2.4 (invariant locale) does NOT break
+/// after U+2026 HORIZONTAL ELLIPSIS — verified by probe 2026-11-25
+/// (`等一下…… X`, `等一下…… 再见`, and `等一下……你好` all stay one
+/// segment), although a trailing ellipsis is a complete subtitle line in
+/// practice and the old list treated it as terminal. A segment ending in
+/// `…` is therefore treated as complete by an explicit check, preserving
+/// that one behavior instead of silently losing it.
+fn segment_is_complete(segment: &str) -> bool {
+    if segment.trim_end().ends_with('\u{2026}') {
+        return true;
+    }
+    let probe = format!("{segment} X");
+    match sentence_segments(&probe).into_iter().next() {
+        Some(first) => first.trim_end() == segment.trim_end(),
+        None => false,
+    }
+}
 
 /// Default timeout for completing a buffered sentence that received no new
 /// fragment (A2 / gh #1): 1.2 s, inside the 1.0–1.5 s range from the issue.
@@ -594,6 +681,58 @@ pub enum SentenceEvent {
     Completed(String),
 }
 
+/// How an incoming fragment relates to the buffered sentence (merge fix,
+/// 2026-11-25). Comparison uses the same normalized text (CJK ideographs +
+/// digits only) and the same normalized-Levenshtein similarity as the
+/// upstream `FuzzyDeduplicator`, so the buffer and the dedupe agree on what
+/// counts as "the same subtitle".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FragmentRelation {
+    /// The new fragment extends the buffer (the buffer's normalized text
+    /// is a strict prefix of the fragment's): a progressive reveal, or a
+    /// re-read with more text. The longer reading wins.
+    ExtendsLonger,
+    /// The new fragment is a strict prefix of the buffer (a truncated
+    /// re-read): the buffer already holds the longer reading.
+    ExtendsShorter,
+    /// The fragment is highly similar to the buffer (>= the configured
+    /// dedupe threshold): the same subtitle re-read with OCR misread(s).
+    /// The freshest reading wins.
+    SameSubtitle,
+    /// None of the above: a new subtitle began (hard cut). The buffer
+    /// completes first; the fragment starts a fresh sentence.
+    NewSubtitle,
+}
+
+/// What `SentenceBuffer::push` decided about the latest fragment (merge
+/// fix, 2026-11-25). Read by the OCR debug log so the next real run can
+/// show, per fragment, whether the buffer extended, kept, replaced, or
+/// flushed-and-restarted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferDecision {
+    /// The fragment extended the buffer (progressive reveal).
+    Extended,
+    /// The fragment was a truncated re-read; the buffer kept the longer
+    /// reading.
+    KeptLonger,
+    /// The fragment replaced the buffer (highly similar re-read).
+    ReplacedSimilar,
+    /// The fragment was a new subtitle; the buffer flushed first.
+    NewSubtitle,
+}
+
+impl BufferDecision {
+    /// Short stable label for the debug log.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BufferDecision::Extended => "Extended",
+            BufferDecision::KeptLonger => "KeptLonger",
+            BufferDecision::ReplacedSimilar => "ReplacedSimilar",
+            BufferDecision::NewSubtitle => "NewSubtitle",
+        }
+    }
+}
+
 /// Accumulates OCR fragments into sentences (A2 / gh #1).
 ///
 /// The translation unit is a *sentence*, not an OCR frame: a long sentence
@@ -603,8 +742,20 @@ pub enum SentenceEvent {
 ///
 /// Composes with the Task 15 hold-and-replace debounce: the hold sits
 /// *upstream* and only emits stable lines; the buffer sits *downstream* and
-/// accumulates those stable lines into sentences. The hold suppresses
-/// transitional garbage frames; the buffer assembles real fragments.
+/// assembles those stable lines into sentences. The hold suppresses
+/// transitional garbage frames; the buffer decides, per fragment, whether
+/// the fragment continues, re-reads, or replaces the buffered sentence
+/// (merge fix, 2026-11-25 — see `push`).
+///
+/// Known limit, stated plainly: a sentence split across two subtitle cards
+/// whose second card shares no prefix and no high similarity with the
+/// first (e.g. `你好，我是` then `小明。`) is indistinguishable from a new
+/// subtitle, and this rule treats it as a new subtitle — the first card
+/// completes on its own and the second starts fresh. The old behavior
+/// appended everything, which merged unrelated consecutive subtitles into
+/// one long line (real log 2026-11-25: 33/383 lines merged); the new
+/// behavior only ever joins fragments that provably continue or re-read
+/// the buffered sentence. Each half still translates correctly on its own.
 #[derive(Debug)]
 pub struct SentenceBuffer {
     buffer: String,
@@ -615,6 +766,16 @@ pub struct SentenceBuffer {
     blank_frames: u32,
     blank_frames_to_flush: u32,
     timeout: Duration,
+    /// Normalized-Levenshtein similarity at or above which an incoming
+    /// fragment counts as a re-read of the buffered subtitle (merge fix,
+    /// 2026-11-25). Always kept equal to the upstream dedupe threshold:
+    /// the orchestrator sets it from `PipelineSettings` at construction
+    /// and on every settings change.
+    similarity_threshold: f32,
+    /// What `push` decided about the latest fragment (`None` when the
+    /// buffer was empty and the fragment simply started a sentence).
+    /// Read by the OCR debug log (merge fix, 2026-11-25).
+    last_decision: Option<BufferDecision>,
 }
 
 impl SentenceBuffer {
@@ -626,7 +787,22 @@ impl SentenceBuffer {
             blank_frames: 0,
             blank_frames_to_flush: blank_frames_to_flush.max(1),
             timeout,
+            similarity_threshold: DEFAULT_DEDUPE_THRESHOLD,
+            last_decision: None,
         }
+    }
+
+    /// Keep the re-read similarity threshold equal to the configured
+    /// dedupe threshold (called by the orchestrator at construction and
+    /// on settings changes).
+    pub fn set_similarity_threshold(&mut self, threshold: f32) {
+        self.similarity_threshold = threshold;
+    }
+
+    /// What the latest `push` decided about its fragment (`None` when
+    /// the fragment simply started a sentence in an empty buffer).
+    pub fn last_decision(&self) -> Option<BufferDecision> {
+        self.last_decision
     }
 
     /// Current buffered (incomplete) text, if any.
@@ -638,18 +814,81 @@ impl SentenceBuffer {
         self.buffer.is_empty()
     }
 
-    /// Push a fragment that continues the current sentence (the next display
-    /// of the same sentence, or the first line of a frame). Returns the
-    /// events to act on, in order: zero or more completed sentences, then
-    /// at most one preliminary for the incomplete remainder.
+    /// Decide, per fragment, what the fragment does to the buffered
+    /// sentence (merge fix, 2026-11-25 — the old code appended every
+    /// fragment unconditionally, so two consecutive subtitles with no
+    /// terminal punctuation and no blank gap merged into one long line):
+    ///
+    /// * fragment EXTENDS the buffer (buffer is a strict prefix of the
+    ///   fragment, or vice versa) — progressive reveal / re-read with
+    ///   more text: REPLACE the buffer with the longer reading.
+    /// * fragment is HIGHLY SIMILAR to the buffer (>= the configured
+    ///   dedupe threshold) — same subtitle re-read with OCR misread(s):
+    ///   REPLACE the buffer with the freshest reading.
+    /// * otherwise — a new subtitle began: FLUSH the buffer as Completed
+    ///   first, then push the fragment fresh.
+    ///
+    /// Returns the events to act on, in order: zero or more completed
+    /// sentences, then at most one preliminary for the incomplete remainder.
     pub fn push(&mut self, fragment: String, now: Instant) -> Vec<SentenceEvent> {
         self.blank_frames = 0;
+        self.last_push = Some(now);
         if self.buffer.is_empty() {
             self.buffer_started = Some(now);
+            self.last_decision = None;
+            self.buffer = fragment;
+            return self.drain_completed();
         }
-        self.last_push = Some(now);
-        self.buffer.push_str(&fragment);
-        self.drain_completed()
+        let mut events = Vec::new();
+        match self.classify_fragment(&fragment) {
+            FragmentRelation::ExtendsLonger => {
+                self.last_decision = Some(BufferDecision::Extended);
+                self.buffer = fragment;
+            }
+            FragmentRelation::SameSubtitle => {
+                self.last_decision = Some(BufferDecision::ReplacedSimilar);
+                self.buffer = fragment;
+            }
+            FragmentRelation::ExtendsShorter => {
+                // Truncated re-read: the buffer already holds the longer
+                // reading, so keep it (only the timeout is refreshed).
+                self.last_decision = Some(BufferDecision::KeptLonger);
+            }
+            FragmentRelation::NewSubtitle => {
+                self.last_decision = Some(BufferDecision::NewSubtitle);
+                if let Some(done) = self.flush() {
+                    events.push(SentenceEvent::Completed(done));
+                }
+                // `flush` clears the timing state; the fresh fragment
+                // starts a new sentence, so restart it here.
+                self.buffer_started = Some(now);
+                self.last_push = Some(now);
+                self.buffer = fragment;
+            }
+        }
+        events.extend(self.drain_completed());
+        events
+    }
+
+    /// Classify an incoming fragment against the buffered sentence. Both
+    /// sides are compared normalized (CJK ideographs + digits only), the
+    /// same normalization the upstream dedupe uses, so punctuation and
+    /// spacing differences never decide the outcome.
+    fn classify_fragment(&self, fragment: &str) -> FragmentRelation {
+        let norm_buf = normalize_for_comparison(&self.buffer);
+        let norm_frag = normalize_for_comparison(fragment);
+        let buf_len = norm_buf.chars().count();
+        let frag_len = norm_frag.chars().count();
+        if frag_len > buf_len && norm_frag.starts_with(&norm_buf) {
+            return FragmentRelation::ExtendsLonger;
+        }
+        if buf_len > frag_len && norm_buf.starts_with(&norm_frag) {
+            return FragmentRelation::ExtendsShorter;
+        }
+        if normalized_similarity(&norm_buf, &norm_frag) >= self.similarity_threshold {
+            return FragmentRelation::SameSubtitle;
+        }
+        FragmentRelation::NewSubtitle
     }
 
     /// Push a new visual line from the *same* frame as the previous line.
@@ -729,19 +968,34 @@ impl SentenceBuffer {
     /// Split off every complete sentence at the end of the buffer (a
     /// fragment may contain more than one sentence), returning a
     /// `Completed` event per sentence plus a `Preliminary` for the
-    /// incomplete remainder, if any.
+    /// incomplete remainder, if any. Sentence boundaries come from the
+    /// ICU4X segmenter (UAX #29, merge fix 2026-11-25), not from a
+    /// hand-written punctuation list: every segment except the last is a
+    /// complete sentence by definition, and the last segment is complete
+    /// only when `segment_is_complete` says so. The incomplete remainder
+    /// stays buffered (and is emitted as a Preliminary for display).
     fn drain_completed(&mut self) -> Vec<SentenceEvent> {
-        let mut events = Vec::new();
-        while let Some(end) = self.buffer.char_indices().find_map(|(i, ch)| {
-            SENTENCE_FINAL_PUNCT
-                .contains(&ch)
-                .then_some(i + ch.len_utf8())
-        }) {
-            let sentence: String = self.buffer.drain(..end).collect();
-            events.push(SentenceEvent::Completed(sentence));
+        if self.buffer.is_empty() {
+            return Vec::new();
         }
-        if !self.buffer.is_empty() {
-            events.push(SentenceEvent::Preliminary(self.buffer.clone()));
+        let segments: Vec<String> = sentence_segments(&self.buffer)
+            .into_iter()
+            .map(|segment| segment.trim().to_string())
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        let mut events = Vec::new();
+        let last_idx = segments.len().saturating_sub(1);
+        let mut remainder = String::new();
+        for (idx, segment) in segments.into_iter().enumerate() {
+            if idx < last_idx || segment_is_complete(&segment) {
+                events.push(SentenceEvent::Completed(segment));
+            } else {
+                remainder = segment;
+            }
+        }
+        self.buffer = remainder.clone();
+        if !remainder.is_empty() {
+            events.push(SentenceEvent::Preliminary(remainder));
         }
         events
     }
@@ -879,6 +1133,250 @@ impl DisplayGroup {
     }
 }
 
+/// Whether a character is a CJK ideograph (Han). Chinese writes no spaces
+/// between words, so whitespace between two CJK clusters almost always
+/// marks a speaker change (or a line break OCR collapsed into one line).
+fn is_cjk(ch: char) -> bool {
+    matches!(ch,
+        '\u{3400}'..='\u{4DBF}'   // CJK Extension A
+        | '\u{4E00}'..='\u{9FFF}' // CJK Unified Ideographs
+        | '\u{F900}'..='\u{FAFF}' // Compatibility Ideographs
+        | '\u{20000}'..='\u{2A6DF}' // Extension B
+        | '\u{2A700}'..='\u{2B73F}' // Extension C
+        | '\u{2B740}'..='\u{2B81F}' // Extension D
+        | '\u{2B820}'..='\u{2CEAF}' // Extension E
+        | '\u{2CEB0}'..='\u{2EBEF}' // Extension F
+        | '\u{30000}'..='\u{3134F}' // Extension G
+        | '\u{31350}'..='\u{323AF}') // Extension H
+}
+
+/// Dash characters that mark a second speaker in subtitles: ASCII
+/// hyphen-minus, full-width hyphen-minus, en dash, em dash.
+fn is_speaker_dash(ch: char) -> bool {
+    matches!(ch, '-' | '\u{FF0D}' | '\u{2013}' | '\u{2014}')
+}
+
+/// CJK / ASCII punctuation ignored when looking for the CJK clusters on
+/// either side of a separator run — a comma or closing quote between the
+/// cluster and the separator does not hide the speaker change.
+fn is_split_context_punct(ch: char) -> bool {
+    matches!(
+        ch,
+        '，' | '。'
+            | '？'
+            | '！'
+            | '；'
+            | '：'
+            | '、'
+            | '‘'
+            | '’'
+            | '“'
+            | '”'
+            | '「'
+            | '」'
+            | '『'
+            | '』'
+            | '（'
+            | '）'
+            | '【'
+            | '】'
+            | '《'
+            | '》'
+            | '…'
+            | '·'
+            | ','
+            | '.'
+            | '?'
+            | '!'
+            | ';'
+            | ':'
+            | '\''
+            | '"'
+            | '('
+            | ')'
+            | '['
+            | ']'
+            | '{'
+            | '}'
+            | '<'
+            | '>'
+    )
+}
+
+/// Nearest char to the left (`left = true`, scanning back from `pos`) or
+/// right (`left = false`, scanning forward from `pos`) of a separator run,
+/// skipping punctuation and separator chars. Returns the char's index in
+/// `chars` plus the char itself.
+fn nearest_context_char(chars: &[(usize, char)], pos: usize, left: bool) -> Option<(usize, char)> {
+    if left {
+        let mut i = pos;
+        while i > 0 {
+            i -= 1;
+            let (_, ch) = chars[i];
+            if !(ch.is_whitespace() || is_speaker_dash(ch) || is_split_context_punct(ch)) {
+                return Some((i, ch));
+            }
+        }
+        None
+    } else {
+        let mut i = pos;
+        while i < chars.len() {
+            let (_, ch) = chars[i];
+            if !(ch.is_whitespace() || is_speaker_dash(ch) || is_split_context_punct(ch)) {
+                return Some((i, ch));
+            }
+            i += 1;
+        }
+        None
+    }
+}
+
+/// Length of the CJK run ending at (and including) the char at `pos`.
+/// Call only when that char is CJK.
+fn cjk_run_len_before(chars: &[(usize, char)], pos: usize) -> usize {
+    let mut len = 0;
+    let mut i = pos;
+    loop {
+        if !is_cjk(chars[i].1) {
+            break;
+        }
+        len += 1;
+        if i == 0 {
+            break;
+        }
+        i -= 1;
+    }
+    len
+}
+
+/// Length of the CJK run starting at (and including) the char at `pos`.
+/// Call only when that char is CJK.
+fn cjk_run_len_after(chars: &[(usize, char)], pos: usize) -> usize {
+    let mut len = 0;
+    let mut i = pos;
+    while i < chars.len() {
+        if !is_cjk(chars[i].1) {
+            break;
+        }
+        len += 1;
+        i += 1;
+    }
+    len
+}
+
+/// Strip leading speaker dashes (and spaces) from a piece — the dash that
+/// marks the second speaker (e.g. OCR `A -B` split on the space leaves
+/// `-B`). Applied to every piece except the first: a dash leading the
+/// whole line is kept verbatim (it may be OCR noise, not a speaker mark).
+fn strip_leading_speaker_dash(piece: &str) -> &str {
+    piece.trim_start_matches(|ch: char| ch.is_whitespace() || is_speaker_dash(ch))
+}
+
+/// Split one OCR line into speaker utterances (speaker layer, merge fix
+/// 2026-11-25 — sits ON TOP of the ICU4X sentence layer in
+/// `SentenceBuffer::drain_completed`).
+///
+/// Two speaker-change signals:
+/// (a) whitespace between two CJK clusters — Chinese uses no spaces
+///     between words, so this is almost always a speaker change or a
+///     line break OCR collapsed into one line;
+/// (b) a dash (`-`, `－`, `–`, `—`) between two CJK clusters, or at the
+///     start of the second piece.
+///
+/// Guardrails (do NOT split): the separator's neighbours are not both
+/// CJK (numbers/dates like `9 日` or `3.5`, CJK next to Latin/digits);
+/// either adjacent CJK cluster is shorter than 2 characters (a lone
+/// interjection such as `是 啊` stays one line); punctuation between the
+/// cluster and the separator is ignored when finding the neighbours.
+///
+/// Known limit, stated plainly: OCR sometimes misreads `-` or inserts
+/// spurious spaces (a single sentence split at a spurious space becomes
+/// two utterances — each still translates on its own), and two sentences
+/// stuck together with no signal at all cannot be split (the blind case,
+/// e.g. `大家就开心地享受吧好的好的那就再见了` stays one line).
+pub fn split_speakers(line: &str) -> Vec<String> {
+    let chars: Vec<(usize, char)> = line.char_indices().collect();
+    let mut pieces: Vec<String> = Vec::new();
+    let mut piece_start = 0usize;
+    let mut idx = 0usize;
+    while idx < chars.len() {
+        let (byte_idx, ch) = chars[idx];
+        if !(ch.is_whitespace() || is_speaker_dash(ch)) {
+            idx += 1;
+            continue;
+        }
+        // Maximal separator run (whitespace and/or dashes) starting here.
+        let run_start = byte_idx;
+        let mut run_end = byte_idx + ch.len_utf8();
+        let mut j = idx + 1;
+        while j < chars.len() {
+            let (b, c) = chars[j];
+            if c.is_whitespace() || is_speaker_dash(c) {
+                run_end = b + c.len_utf8();
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        let left = nearest_context_char(&chars, idx, true);
+        let right = nearest_context_char(&chars, j, false);
+        let split_here = match (left, right) {
+            (Some((li, lch)), Some((ri, rch))) if is_cjk(lch) && is_cjk(rch) => {
+                cjk_run_len_before(&chars, li) >= 2 && cjk_run_len_after(&chars, ri) >= 2
+            }
+            _ => false,
+        };
+        if split_here {
+            let piece = line[piece_start..run_start].trim();
+            if !piece.is_empty() {
+                pieces.push(piece.to_string());
+            }
+            piece_start = run_end;
+        }
+        idx = j;
+    }
+    let tail = line[piece_start..].trim();
+    if !tail.is_empty() {
+        pieces.push(tail.to_string());
+    }
+    // A dash leading a later piece marks its speaker; strip it (the first
+    // piece keeps a leading dash verbatim — see `strip_leading_speaker_dash`).
+    for piece in pieces.iter_mut().skip(1) {
+        let stripped = strip_leading_speaker_dash(piece);
+        if !stripped.is_empty() {
+            *piece = stripped.to_string();
+        }
+    }
+    pieces.retain(|piece| !piece.is_empty());
+    if pieces.is_empty() {
+        pieces.push(line.trim().to_string());
+    }
+    pieces
+}
+
+/// Split one OCR line into the utterances it would become after the
+/// speaker rules (this layer) and sentence segmentation (ICU4X, in
+/// `SentenceBuffer::drain_completed`): speaker pieces, each further split
+/// at sentence boundaries, with the trailing incomplete segment kept as
+/// its own utterance (it flushes as one line on blank/timeout). Used by
+/// the log-counting example and by tests; the live pipeline applies the
+/// same two layers in sequence.
+pub fn split_line_into_utterances(line: &str) -> Vec<String> {
+    let mut utterances = Vec::new();
+    for piece in split_speakers(line) {
+        for segment in sentence_segments(&piece) {
+            let segment = segment.trim();
+            if !segment.is_empty() {
+                utterances.push(segment.to_string());
+            }
+        }
+    }
+    if utterances.is_empty() {
+        utterances.push(line.trim().to_string());
+    }
+    utterances
+}
+
 /// Split a held frame text (lines joined with "\n") into visual lines,
 /// feed each to the `SentenceBuffer`, and emit the resulting events. A new
 /// line in the same frame is a separate utterance, so the buffer completes
@@ -899,7 +1397,22 @@ fn emit_held_lines(
         let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
         state.display_group = None;
     }
-    let lines: Vec<&str> = joined.split('\n').filter(|line| !line.is_empty()).collect();
+    // Speaker layer (merge fix, 2026-11-25): each visual line is first
+    // split into speaker utterances (`split_speakers`); every piece is a
+    // separate utterance exactly like a visual line from the same frame
+    // (first piece continues the buffer via `push`, the rest flush first
+    // via `push_new_line`). The display group below is built from the
+    // pieces, so the overlay shows every speaker's line.
+    let mut lines: Vec<String> = Vec::new();
+    for line in joined.split('\n').filter(|line| !line.is_empty()) {
+        let pieces = split_speakers(line);
+        if pieces.len() > 1 {
+            if let Some(dbg) = &deps.ocr_debug_logger {
+                let _ = dbg.log_speaker_split(line, &pieces);
+            }
+        }
+        lines.extend(pieces);
+    }
     let mut first_line = true;
     for line in &lines {
         let events = if first_line {
@@ -907,6 +1420,25 @@ fn emit_held_lines(
         } else {
             sentence_buffer.push_new_line(line.to_string(), Instant::now())
         };
+        // Buffer decision for the debug log: what the buffer did with
+        // this piece, which sentences completed, and what stays buffered.
+        if let Some(dbg) = &deps.ocr_debug_logger {
+            let completed: Vec<String> = events
+                .iter()
+                .filter_map(|event| match event {
+                    SentenceEvent::Completed(text) => Some(text.clone()),
+                    SentenceEvent::Preliminary(_) => None,
+                })
+                .collect();
+            let _ = dbg.log_buffer_decision(
+                sentence_buffer
+                    .last_decision()
+                    .map_or("Started", |decision| decision.as_str()),
+                line,
+                &completed,
+                sentence_buffer.buffered_text(),
+            );
+        }
         first_line = false;
         if !emit_sentence_events(events, shared, deps, semaphore, inflight) {
             return false;
@@ -919,9 +1451,7 @@ fn emit_held_lines(
     // register the group so the per-line translations land in line order.
     if lines.len() > 1 {
         let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
-        state.display_group = Some(DisplayGroup::new(
-            lines.iter().map(|line| line.to_string()).collect(),
-        ));
+        state.display_group = Some(DisplayGroup::new(lines.clone()));
         state.snapshot.chinese_line = lines.join("\n");
         state.snapshot.vietnamese_line.clear();
         state.publish();
@@ -948,9 +1478,16 @@ async fn run_orchestrator_loop(
     let mut deduper = FuzzyDeduplicator::new(initial.dedupe_threshold, initial.blank_reset_frames);
     let mut hold = SubtitleHold::new(initial.hold_delay);
     // SentenceBuffer (A2 / gh #1) sits downstream of the hold: the hold
-    // emits stable lines, the buffer accumulates them into sentences.
+    // emits stable lines, the buffer assembles them into sentences. Its
+    // re-read threshold tracks the dedupe threshold (merge fix,
+    // 2026-11-25), so both agree on what counts as "the same subtitle".
     let mut sentence_buffer =
         SentenceBuffer::new(DEFAULT_SENTENCE_TIMEOUT, DEFAULT_SENTENCE_BLANK_FRAMES);
+    sentence_buffer.set_similarity_threshold(initial.dedupe_threshold);
+    // Consecutive frames skipped by the pixel-diff gate (merge fix,
+    // 2026-11-25): logged as one aggregate line when OCR runs again, so
+    // the debug log does not flood while the subtitle is static.
+    let mut pixel_skip_run: u32 = 0;
 
     let mut ticker = tokio::time::interval(fps_to_interval(active_fps));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -982,6 +1519,9 @@ async fn run_orchestrator_loop(
         // Complete a buffered sentence that received no new fragment for
         // the sentence timeout (A2 / gh #1).
         if let Some(completed) = sentence_buffer.flush_if_timed_out(Instant::now()) {
+            if let Some(dbg) = &deps.ocr_debug_logger {
+                let _ = dbg.log_buffer_flush("timeout", &completed);
+            }
             if !emit_subtitle(
                 completed,
                 SubtitleKind::Completed,
@@ -1019,6 +1559,7 @@ async fn run_orchestrator_loop(
                 }
                 deduper.set_threshold(latest.dedupe_threshold);
                 deduper.set_blank_reset_frames(latest.blank_reset_frames);
+                sentence_buffer.set_similarity_threshold(latest.dedupe_threshold);
                 hold.set_hold_delay(latest.hold_delay);
             }
             _ = ticker.tick() => {
@@ -1073,7 +1614,17 @@ async fn run_orchestrator_loop(
                     // still on screen: keep the SentenceBuffer timeout from
                     // firing mid-display (A2 / gh #1).
                     sentence_buffer.touch(Instant::now());
+                    pixel_skip_run = pixel_skip_run.saturating_add(1);
                     continue;
+                }
+
+                // The frame changed: report the skipped run (if any) as one
+                // aggregate debug line, then reset the counter.
+                if pixel_skip_run > 0 {
+                    if let Some(dbg) = &deps.ocr_debug_logger {
+                        let _ = dbg.log_pixel_diff_skipped(pixel_skip_run);
+                    }
+                    pixel_skip_run = 0;
                 }
 
                 let ocr_engine = Arc::clone(&deps.ocr);
@@ -1110,7 +1661,25 @@ async fn run_orchestrator_loop(
 
                 // Extract one filtered line per visual line (top-to-bottom,
                 // A2 / gh #1). An empty list means the frame has no CJK text.
-                let lines = extract_chinese_subtitle_lines(&ocr_result.ocr_response);
+                let (lines, geo_decisions) =
+                    extract_chinese_subtitle_lines_with_decisions(&ocr_result.ocr_response);
+                // Raw-OCR debug log (merge fix, 2026-11-25): one line per
+                // OCR call with the raw blocks, before dedupe/hold/buffer,
+                // so the next real run can prove whether a missed sentence
+                // was an OCR miss (blocks=0), a filter drop (blocks but no
+                // lines), or a buffer swallow (blocks + lines present).
+                // Best-effort: a logging failure must never break the
+                // pipeline. No line is written when OCR did not run at all
+                // (pixel-diff skip), so the log stays silent while idle.
+                if let Some(dbg) = &deps.ocr_debug_logger {
+                    let _ = dbg.log_blocks(&ocr_result.ocr_response, &lines);
+                    // Geometric split/join decisions (gap, threshold, boxes)
+                    // so a later run can show why a line was split — or
+                    // kept whole — by the OCR-box geometry.
+                    for decision in &geo_decisions {
+                        let _ = dbg.log_geometric_split(decision);
+                    }
+                }
                 if lines.is_empty() {
                     // Blank / non-CJK frame: keep the dedupe blank counting
                     // and tell the SentenceBuffer the subtitle may have
@@ -1118,6 +1687,9 @@ async fn run_orchestrator_loop(
                     // buffered sentence.
                     let _ = deduper.process(None);
                     if let Some(completed) = sentence_buffer.note_blank(Instant::now()) {
+                        if let Some(dbg) = &deps.ocr_debug_logger {
+                            let _ = dbg.log_buffer_flush("blank", &completed);
+                        }
                         if !emit_subtitle(
                             completed,
                             SubtitleKind::Completed,
@@ -1138,6 +1710,12 @@ async fn run_orchestrator_loop(
                 // joined text; the loop top splits it back into lines.
                 let joined = lines.join("\n");
                 let Some(chinese) = deduper.process(Some(&joined)) else {
+                    // Dedupe dropped a re-read of the previous line: log
+                    // it (with its similarity) so the debug log shows
+                    // which lines the dedupe swallowed.
+                    if let Some(dbg) = &deps.ocr_debug_logger {
+                        let _ = dbg.log_dedupe_dropped(&joined, deduper.last_similarity());
+                    }
                     let state = shared.lock().unwrap_or_else(|e| e.into_inner());
                     state.publish();
                     // The OCR text duplicates the previous line, so the
@@ -1152,6 +1730,13 @@ async fn run_orchestrator_loop(
                 // replaces it, so only the final (stable) line is emitted.
                 // A zero hold delay emits immediately.
                 if hold.push(chinese, Instant::now()) {
+                    if let Some(dbg) = &deps.ocr_debug_logger {
+                        if let (Some(old), Some(new)) =
+                            (hold.last_replaced(), hold.pending_text())
+                        {
+                            let _ = dbg.log_hold_replaced(old, new);
+                        }
+                    }
                     let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
                     state.snapshot.metrics.held_lines_replaced += 1;
                     state.publish();
@@ -1407,10 +1992,11 @@ async fn process_emitted_subtitle(
 #[cfg(test)]
 mod tests {
     use super::{
-        map_translate_error_banner, DisplayGroup, Duration, GroupContribution, Instant,
-        PipelineError, PipelineErrorBanner, PipelineErrorKind, PipelineSettings, SentenceBuffer,
-        SentenceEvent, SubtitleHold, DEFAULT_HOLD_DELAY, DEFAULT_SENTENCE_BLANK_FRAMES,
-        ERR_BANNER_ENGINE_UNAVAILABLE, ERR_BANNER_TRANSLATE_NETWORK, MAX_SENTENCE_BUFFER_AGE,
+        map_translate_error_banner, split_line_into_utterances, split_speakers, BufferDecision,
+        DisplayGroup, Duration, GroupContribution, Instant, PipelineError, PipelineErrorBanner,
+        PipelineErrorKind, PipelineSettings, SentenceBuffer, SentenceEvent, SubtitleHold,
+        DEFAULT_HOLD_DELAY, DEFAULT_SENTENCE_BLANK_FRAMES, ERR_BANNER_ENGINE_UNAVAILABLE,
+        ERR_BANNER_TRANSLATE_NETWORK, MAX_SENTENCE_BUFFER_AGE,
     };
     use crate::api::TranslateError;
     use crate::config::{AppConfig, CaptureRegion};
@@ -1507,9 +2093,16 @@ mod tests {
             buf.push("明天".to_string(), t0),
             vec![SentenceEvent::Preliminary("明天".to_string())]
         );
-        // Second fragment completes the sentence → re-translate the whole.
+        // A re-read that EXTENDS the buffered sentence (progressive
+        // reveal) replaces the buffer with the longer reading, which then
+        // completes on its punctuation.
+        // (Merge fix, 2026-11-25: the old test pushed only the new part,
+        // "早上见。", which the fix now treats as a new subtitle — a bare
+        // continuation with no shared prefix is indistinguishable from a
+        // hard cut to the next subtitle, so the buffer flushes first.
+        // See `sentence_buffer_splits_merged_subtitles_from_real_log`.)
         assert_eq!(
-            buf.push("早上见。".to_string(), t0 + Duration::from_millis(200)),
+            buf.push("明天早上见。".to_string(), t0 + Duration::from_millis(200)),
             vec![SentenceEvent::Completed("明天早上见。".to_string())]
         );
         assert!(buf.is_empty());
@@ -1615,10 +2208,17 @@ mod tests {
             buf.flush_if_timed_out(t0 + Duration::from_millis(1200)),
             None
         );
-        // A continuation arriving later still joins the same sentence.
+        // A later fragment with no shared prefix and low similarity is a
+        // NEW subtitle (merge fix, 2026-11-25): the buffered fragment
+        // completes on its own first instead of being appended to. (The
+        // old expectation, Completed("你好，我是小明。"), was the
+        // append-always behavior that merged consecutive subtitles.)
         assert_eq!(
             buf.push("小明。".to_string(), t0 + Duration::from_millis(2000)),
-            vec![SentenceEvent::Completed("你好，我是小明。".to_string())]
+            vec![
+                SentenceEvent::Completed("你好，我是".to_string()),
+                SentenceEvent::Completed("小明。".to_string()),
+            ]
         );
         assert!(buf.is_empty());
 
@@ -1666,12 +2266,406 @@ mod tests {
         );
         assert_eq!(buf.note_blank(t0), None);
         // A new fragment resets the blank run, so one more blank is not enough.
+        // (Merge fix, 2026-11-25: "，好吗" shares no prefix with "等一下"
+        // and is not similar to it, so it is a new subtitle — the buffered
+        // fragment completes first instead of being appended to.)
         assert_eq!(
             buf.push("，好吗".to_string(), t0),
-            vec![SentenceEvent::Preliminary("等一下，好吗".to_string())]
+            vec![
+                SentenceEvent::Completed("等一下".to_string()),
+                SentenceEvent::Preliminary("，好吗".to_string()),
+            ]
         );
         assert_eq!(buf.note_blank(t0), None);
-        assert_eq!(buf.note_blank(t0), Some("等一下，好吗".to_string()));
+        assert_eq!(buf.note_blank(t0), Some("，好吗".to_string()));
+    }
+
+    #[test]
+    fn sentence_buffer_replaces_on_progressive_reveal_and_similar_reread() {
+        // Merge fix, 2026-11-25: the buffer's re-read threshold tracks
+        // Danh's configured dedupe threshold (0.84), so these tests run
+        // at the live value.
+        let t0 = Instant::now();
+        let mut buf =
+            SentenceBuffer::new(Duration::from_millis(1200), DEFAULT_SENTENCE_BLANK_FRAMES);
+        buf.set_similarity_threshold(0.84);
+
+        // Progressive reveal: each re-read extends the buffer; the longer
+        // reading replaces it, never appends.
+        assert_eq!(
+            buf.push("明天".to_string(), t0),
+            vec![SentenceEvent::Preliminary("明天".to_string())]
+        );
+        assert_eq!(
+            buf.push("明天早上见".to_string(), t0 + Duration::from_millis(200)),
+            vec![SentenceEvent::Preliminary("明天早上见".to_string())]
+        );
+        assert_eq!(
+            buf.push("明天早上见。".to_string(), t0 + Duration::from_millis(400)),
+            vec![SentenceEvent::Completed("明天早上见。".to_string())]
+        );
+        assert!(buf.is_empty());
+
+        // Truncated re-read: the buffer keeps the longer reading.
+        assert_eq!(
+            buf.push("你好，我是小明".to_string(), t0),
+            vec![SentenceEvent::Preliminary("你好，我是小明".to_string())]
+        );
+        assert_eq!(
+            buf.push("你好，我是".to_string(), t0 + Duration::from_millis(200)),
+            vec![SentenceEvent::Preliminary("你好，我是小明".to_string())]
+        );
+        assert_eq!(buf.buffered_text(), "你好，我是小明");
+
+        // Similar re-read (one OCR misread in 10 chars, similarity 0.90):
+        // the freshest reading replaces the buffer.
+        let mut buf2 =
+            SentenceBuffer::new(Duration::from_millis(1200), DEFAULT_SENTENCE_BLANK_FRAMES);
+        buf2.set_similarity_threshold(0.84);
+        assert_eq!(
+            buf2.push("今天晚上我们一起吃饭".to_string(), t0),
+            vec![SentenceEvent::Preliminary(
+                "今天晚上我们一起吃饭".to_string()
+            )]
+        );
+        assert_eq!(
+            buf2.push(
+                "今天晚上我们一起吃反".to_string(),
+                t0 + Duration::from_millis(200)
+            ),
+            vec![SentenceEvent::Preliminary(
+                "今天晚上我们一起吃反".to_string()
+            )]
+        );
+        assert_eq!(buf2.buffered_text(), "今天晚上我们一起吃反");
+    }
+
+    #[test]
+    fn sentence_buffer_splits_merged_subtitles_from_real_log() {
+        // Real merged lines from Danh's run, subtitles-2026-11-25.log
+        // (merge fix, 2026-11-25): consecutive subtitles with no terminal
+        // punctuation and no blank gap used to append into one long line.
+        // Each case below must now come out as separate lines (or, for a
+        // re-read, a single collapsed line) instead of one merged line.
+        let t0 = Instant::now();
+        let new_buf = || {
+            let mut buf =
+                SentenceBuffer::new(Duration::from_millis(1200), DEFAULT_SENTENCE_BLANK_FRAMES);
+            buf.set_similarity_threshold(0.84);
+            buf
+        };
+
+        // L14: two subtitles merged into one 30-char line.
+        let mut buf = new_buf();
+        assert_eq!(
+            buf.push("啊 下个月啊到金泽住一晚吗".to_string(), t0),
+            vec![SentenceEvent::Preliminary(
+                "啊 下个月啊到金泽住一晚吗".to_string()
+            )]
+        );
+        assert_eq!(
+            buf.push("哦 挺好的嘛".to_string(), t0 + Duration::from_millis(200)),
+            vec![
+                SentenceEvent::Completed("啊 下个月啊到金泽住一晚吗".to_string()),
+                SentenceEvent::Preliminary("哦 挺好的嘛".to_string()),
+            ]
+        );
+        assert_eq!(
+            buf.push(
+                "是 是呀虽然我也很想去 但有点难呢".to_string(),
+                t0 + Duration::from_millis(400)
+            ),
+            vec![
+                SentenceEvent::Completed("哦 挺好的嘛".to_string()),
+                SentenceEvent::Preliminary("是 是呀虽然我也很想去 但有点难呢".to_string()),
+            ]
+        );
+
+        // L73: a second subtitle appended to the first.
+        let mut buf = new_buf();
+        assert_eq!(
+            buf.push("美花小姐请让我再干你一次吧".to_string(), t0),
+            vec![SentenceEvent::Preliminary(
+                "美花小姐请让我再干你一次吧".to_string()
+            )]
+        );
+        assert_eq!(
+            buf.push(
+                "请吧美花小姐 我喜欢你 我爱你".to_string(),
+                t0 + Duration::from_millis(200)
+            ),
+            vec![
+                SentenceEvent::Completed("美花小姐请让我再干你一次吧".to_string()),
+                SentenceEvent::Preliminary("请吧美花小姐 我喜欢你 我爱你".to_string()),
+            ]
+        );
+
+        // L116: the same sentence read twice (second read with a "--"
+        // artifact) must collapse to one line, not append into a doubled
+        // line. The exact on-screen mechanism for L116 is unconfirmed —
+        // the OCR debug log will show the raw blocks on the next run —
+        // but a normalized-identical re-read must never append.
+        let mut buf = new_buf();
+        assert_eq!(
+            buf.push("他很温柔 下次也让爸爸见见他".to_string(), t0),
+            vec![SentenceEvent::Preliminary(
+                "他很温柔 下次也让爸爸见见他".to_string()
+            )]
+        );
+        assert_eq!(
+            buf.push(
+                "他很温柔--下次也让爸爸见见他".to_string(),
+                t0 + Duration::from_millis(200)
+            ),
+            vec![SentenceEvent::Preliminary(
+                "他很温柔--下次也让爸爸见见他".to_string()
+            )]
+        );
+        assert_eq!(buf.buffered_text(), "他很温柔--下次也让爸爸见见他");
+
+        // L119: the same (A + B) pair repeated; each card must complete
+        // on its own instead of accumulating into one tripled line.
+        let mut buf = new_buf();
+        assert_eq!(
+            buf.push("一让你受苦了 对不起".to_string(), t0),
+            vec![SentenceEvent::Preliminary(
+                "一让你受苦了 对不起".to_string()
+            )]
+        );
+        assert_eq!(
+            buf.push("一太好了".to_string(), t0 + Duration::from_millis(200)),
+            vec![
+                SentenceEvent::Completed("一让你受苦了 对不起".to_string()),
+                SentenceEvent::Preliminary("一太好了".to_string()),
+            ]
+        );
+        assert_eq!(
+            buf.push(
+                "一让你受苦了 对不起".to_string(),
+                t0 + Duration::from_millis(400)
+            ),
+            vec![
+                SentenceEvent::Completed("一太好了".to_string()),
+                SentenceEvent::Preliminary("一让你受苦了 对不起".to_string()),
+            ]
+        );
+
+        // L126: the identical subtitle three times must stay one line.
+        let mut buf = new_buf();
+        assert_eq!(
+            buf.push("好厉害 智子 你又长大了不少嘛".to_string(), t0),
+            vec![SentenceEvent::Preliminary(
+                "好厉害 智子 你又长大了不少嘛".to_string()
+            )]
+        );
+        assert_eq!(
+            buf.push(
+                "好厉害 智子 你又长大了不少嘛".to_string(),
+                t0 + Duration::from_millis(200)
+            ),
+            vec![SentenceEvent::Preliminary(
+                "好厉害 智子 你又长大了不少嘛".to_string()
+            )]
+        );
+        assert_eq!(
+            buf.push(
+                "好厉害 智子 你又长大了不少嘛".to_string(),
+                t0 + Duration::from_millis(400)
+            ),
+            vec![SentenceEvent::Preliminary(
+                "好厉害 智子 你又长大了不少嘛".to_string()
+            )]
+        );
+        assert_eq!(buf.buffered_text(), "好厉害 智子 你又长大了不少嘛");
+
+        // 00:16:01: OCR misread variants BELOW the 0.84 threshold
+        // (similarity 0.80) are no longer merged into one line — but they
+        // still emit as separate lines. The threshold itself is unchanged
+        // by this fix; a lower buffer threshold is a possible follow-up
+        // if the repeats prove noisy in practice.
+        let mut buf = new_buf();
+        assert_eq!(
+            buf.push("要咆早饭吗".to_string(), t0),
+            vec![SentenceEvent::Preliminary("要咆早饭吗".to_string())]
+        );
+        assert_eq!(
+            buf.push("要唣早饭吗".to_string(), t0 + Duration::from_millis(200)),
+            vec![
+                SentenceEvent::Completed("要咆早饭吗".to_string()),
+                SentenceEvent::Preliminary("要唣早饭吗".to_string()),
+            ]
+        );
+        assert_eq!(
+            buf.push("要唣且饭吗".to_string(), t0 + Duration::from_millis(400)),
+            vec![
+                SentenceEvent::Completed("要唣早饭吗".to_string()),
+                SentenceEvent::Preliminary("要唣且饭吗".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn sentence_buffer_icu4x_splits_closing_quote_ellipsis_and_ascii() {
+        // UAX #29 cases the old 7-character punctuation list could not
+        // express (merge fix, 2026-11-25 — ICU4X layer).
+        let t0 = Instant::now();
+        let new_buf =
+            || SentenceBuffer::new(Duration::from_millis(1200), DEFAULT_SENTENCE_BLANK_FRAMES);
+
+        // Closing quote after terminal punctuation belongs to the
+        // sentence: the old list stranded a lone `"` as a preliminary.
+        let mut buf = new_buf();
+        assert_eq!(
+            buf.push("他说\"你好。\"".to_string(), t0),
+            vec![SentenceEvent::Completed("他说\"你好。\"".to_string())]
+        );
+        assert!(buf.is_empty());
+
+        // A doubled ellipsis is one sentence, not two: the old list
+        // drained at the first `…` and emitted a bare `…` completion.
+        let mut buf = new_buf();
+        assert_eq!(
+            buf.push("等一下……".to_string(), t0),
+            vec![SentenceEvent::Completed("等一下……".to_string())]
+        );
+        assert!(buf.is_empty());
+
+        // A decimal point is NOT a sentence break: the old list split
+        // `3.5元` into Completed("3.") + Preliminary("5元").
+        let mut buf = new_buf();
+        assert_eq!(
+            buf.push("3.5元".to_string(), t0),
+            vec![SentenceEvent::Preliminary("3.5元".to_string())]
+        );
+        assert_eq!(buf.buffered_text(), "3.5元");
+
+        // ASCII terminal punctuation still splits sentences.
+        let mut buf = new_buf();
+        assert_eq!(
+            buf.push("Hello. World".to_string(), t0),
+            vec![
+                SentenceEvent::Completed("Hello.".to_string()),
+                SentenceEvent::Preliminary("World".to_string()),
+            ]
+        );
+        assert_eq!(buf.buffered_text(), "World");
+
+        // Three sentences in one fragment: every segment completes.
+        let mut buf = new_buf();
+        assert_eq!(
+            buf.push("你好。我很好。你呢？".to_string(), t0),
+            vec![
+                SentenceEvent::Completed("你好。".to_string()),
+                SentenceEvent::Completed("我很好。".to_string()),
+                SentenceEvent::Completed("你呢？".to_string()),
+            ]
+        );
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn split_speakers_splits_two_speakers_and_keeps_guardrails() {
+        // (a) Whitespace between two CJK clusters: a speaker change.
+        assert_eq!(
+            split_speakers("你先睡吧 不用等我吃饭了"),
+            vec!["你先睡吧".to_string(), "不用等我吃饭了".to_string()]
+        );
+        // (b) Dash between two CJK clusters: ASCII, full-width, em dash.
+        assert_eq!(
+            split_speakers("你好吗 - 我很好"),
+            vec!["你好吗".to_string(), "我很好".to_string()]
+        );
+        assert_eq!(
+            split_speakers("你好吗－我很好"),
+            vec!["你好吗".to_string(), "我很好".to_string()]
+        );
+        assert_eq!(
+            split_speakers("你好吗—我很好"),
+            vec!["你好吗".to_string(), "我很好".to_string()]
+        );
+        // A comma before the separator does not hide the speaker change.
+        assert_eq!(
+            split_speakers("你好吗，我很好 你先睡吧"),
+            vec!["你好吗，我很好".to_string(), "你先睡吧".to_string()]
+        );
+        // Real log L116 (both variants): the space and the "--" artifact
+        // are both speaker separators.
+        assert_eq!(
+            split_speakers("他很温柔 下次也让爸爸见见他"),
+            vec!["他很温柔".to_string(), "下次也让爸爸见见他".to_string()]
+        );
+        assert_eq!(
+            split_speakers("他很温柔--下次也让爸爸见见他"),
+            vec!["他很温柔".to_string(), "下次也让爸爸见见他".to_string()]
+        );
+
+        // Guardrails: no split when a neighbour is not CJK (numbers,
+        // dates, CJK next to Latin/digits) or when either adjacent CJK
+        // cluster is shorter than 2 characters.
+        assert_eq!(split_speakers("9 日"), vec!["9 日".to_string()]);
+        assert_eq!(split_speakers("3.5 元"), vec!["3.5 元".to_string()]);
+        assert_eq!(split_speakers("是 啊"), vec!["是 啊".to_string()]);
+        assert_eq!(split_speakers("Hello 你好"), vec!["Hello 你好".to_string()]);
+        assert_eq!(split_speakers("你好 123"), vec!["你好 123".to_string()]);
+        assert_eq!(split_speakers("你好吗-我"), vec!["你好吗-我".to_string()]);
+        assert_eq!(split_speakers("你好"), vec!["你好".to_string()]);
+    }
+
+    #[test]
+    fn split_line_into_utterances_reports_the_blind_case() {
+        // The blind case (merge fix, 2026-11-25): two sentences stuck
+        // together with NO signal — no space, no dash, no punctuation.
+        // Neither layer can split it; it stays one line. This test pins
+        // that honest limit instead of hiding it.
+        assert_eq!(
+            split_line_into_utterances("大家就开心地享受吧好的好的那就再见了"),
+            vec!["大家就开心地享受吧好的好的那就再见了".to_string()]
+        );
+        // Speaker layer splits these; the sentence layer splits this one.
+        assert_eq!(
+            split_line_into_utterances("你先睡吧 不用等我吃饭了"),
+            vec!["你先睡吧".to_string(), "不用等我吃饭了".to_string()]
+        );
+        assert_eq!(
+            split_line_into_utterances("你好吗 - 我很好。"),
+            vec!["你好吗".to_string(), "我很好。".to_string()]
+        );
+        assert_eq!(
+            split_line_into_utterances("你好。我很好"),
+            vec!["你好。".to_string(), "我很好".to_string()]
+        );
+    }
+
+    #[test]
+    fn sentence_buffer_records_last_decision() {
+        let t0 = Instant::now();
+        let mut buf =
+            SentenceBuffer::new(Duration::from_millis(1200), DEFAULT_SENTENCE_BLANK_FRAMES);
+
+        // Empty buffer: the fragment just starts a sentence.
+        let _ = buf.push("明天".to_string(), t0);
+        assert_eq!(buf.last_decision(), None);
+        // Progressive reveal extends the buffer.
+        let _ = buf.push("明天早上见。".to_string(), t0 + Duration::from_millis(100));
+        assert_eq!(buf.last_decision(), Some(BufferDecision::Extended));
+
+        // A re-read identical after normalization replaces the buffer.
+        let _ = buf.push("你好吗".to_string(), t0 + Duration::from_millis(200));
+        assert_eq!(buf.last_decision(), None);
+        // An unrelated fragment is a new subtitle: flush first.
+        let _ = buf.push("再见".to_string(), t0 + Duration::from_millis(300));
+        assert_eq!(buf.last_decision(), Some(BufferDecision::NewSubtitle));
+        // A re-read of the fresh buffer replaces it (same normalized text).
+        let _ = buf.push("再见！".to_string(), t0 + Duration::from_millis(400));
+        assert_eq!(buf.last_decision(), Some(BufferDecision::ReplacedSimilar));
+
+        // A truncated re-read keeps the longer buffered reading.
+        let mut buf =
+            SentenceBuffer::new(Duration::from_millis(1200), DEFAULT_SENTENCE_BLANK_FRAMES);
+        let _ = buf.push("明天早上见".to_string(), t0);
+        let _ = buf.push("明天早上".to_string(), t0 + Duration::from_millis(100));
+        assert_eq!(buf.last_decision(), Some(BufferDecision::KeptLonger));
+        assert_eq!(buf.buffered_text(), "明天早上见");
     }
 
     #[test]

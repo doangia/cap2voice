@@ -47,6 +47,18 @@ fn is_retained_subtitle_char(c: char) -> bool {
 /// grouping blocks whose vertical centers fall within half a line height, and
 /// left-to-right within each line.
 pub fn sort_text_blocks(blocks: &[TextBlock]) -> Vec<&TextBlock> {
+    group_text_blocks_into_rows(blocks)
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// Group OCR `TextBlock`s into visual rows (top-to-bottom), each row sorted
+/// left-to-right. Two blocks share a row when their vertical centers fall
+/// within half a line height of the row's running average (same rule
+/// `sort_text_blocks` has always used — this is that grouping, factored out
+/// so the geometric speaker split can work row by row).
+pub fn group_text_blocks_into_rows(blocks: &[TextBlock]) -> Vec<Vec<&TextBlock>> {
     if blocks.is_empty() {
         return Vec::new();
     }
@@ -97,16 +109,16 @@ pub fn sort_text_blocks(blocks: &[TextBlock]) -> Vec<&TextBlock> {
         }
     }
 
-    let mut sorted = Vec::with_capacity(blocks.len());
+    let mut rows: Vec<Vec<&TextBlock>> = Vec::with_capacity(lines.len());
     for mut line in lines {
         line.blocks.sort_by(|a, b| {
             a.left
                 .total_cmp(&b.left)
                 .then_with(|| a.top.total_cmp(&b.top))
         });
-        sorted.extend(line.blocks);
+        rows.push(line.blocks);
     }
-    sorted
+    rows
 }
 
 /// Sort `blocks` into reading order and join non-empty trimmed block texts with spaces.
@@ -151,16 +163,344 @@ pub fn extract_chinese_subtitle(blocks: &[TextBlock]) -> Option<String> {
     filter_cjk_text(&joined)
 }
 
-/// Sort `blocks` in reading order and filter each block's text separately,
-/// returning one non-empty Chinese line per visual line (top-to-bottom).
-/// Two visual lines in one OCR frame stay separate here so the pipeline can
-/// treat them as two utterances (A2 / gh #1) instead of one merged line.
+/// Horizontal gap, in multiples of the row's median character width, above
+/// which two text pieces on the same visual row are different utterances
+/// (different speakers), and at or below which they are one sentence the
+/// OCR engine happened to return as two boxes.
+///
+/// Calibrated 2026-11-25 on the real WeChat OCR engine (probe image with a
+/// 36 px CJK font at 960x540; see `examples/ocr_gap_probe.rs`): normal
+/// inter-character gaps 0-5 px (0-0.16x char width); a same-sentence 12 px
+/// gap (0.33x) stayed one block; a 26 px block gap (0.79x) and an 82 px gap
+/// (2.3x) came back as separate blocks. 0.5x sits between the largest
+/// same-sentence gap measured (0.33x) and the smallest speaker gap (0.79x),
+/// with ~1.6x headroom on both sides. CJK glyphs are square, so the
+/// median character width is close to the line height; block height is the
+/// fallback estimate when no character width can be measured.
+pub const SPEAKER_GAP_CHAR_WIDTHS: f32 = 0.5;
+
+/// Whether a geometric decision split two pieces apart or joined them into
+/// one line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeometricSplitAction {
+    Split,
+    Joined,
+}
+
+/// Where a geometric decision was taken: between two blocks/pieces on one
+/// row, or between two character boxes inside a single block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeometricSplitKind {
+    BlockGap,
+    CharGap,
+}
+
+/// One geometric split/join decision, for the OCR debug log: the gap that
+/// was judged, the threshold it was judged against, the boxes on either
+/// side of the gap, and the texts that resulted. Recorded so a later run
+/// can show why a line was split — or why it was kept whole.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GeometricSplitDecision {
+    pub kind: GeometricSplitKind,
+    pub action: GeometricSplitAction,
+    pub gap_px: f32,
+    pub threshold_px: f32,
+    /// Bounding box of the piece left of the gap, as (left, top, right, bottom).
+    pub left_box: (f32, f32, f32, f32),
+    /// Bounding box of the piece right of the gap, as (left, top, right, bottom).
+    pub right_box: (f32, f32, f32, f32),
+    pub left_text: String,
+    pub right_text: String,
+}
+
+/// One piece of a visual row: the text of one block, or of part of a block
+/// cut at a large inter-character gap, with the box that text occupies.
+#[derive(Debug, Clone)]
+struct RowPiece {
+    text: String,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    /// Whether this piece starts at a character-gap cut inside its block.
+    /// The `CharGap` decision already explains such a boundary, so the
+    /// row-grouping step records no second `BlockGap` decision for it.
+    starts_at_char_cut: bool,
+}
+
+fn median_of(values: &mut [f32]) -> Option<f32> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(|a, b| a.total_cmp(b));
+    let mid = values.len() / 2;
+    if values.len() % 2 == 1 {
+        Some(values[mid])
+    } else {
+        Some((values[mid - 1] + values[mid]) * 0.5)
+    }
+}
+
+/// Estimate one block's character width in pixels: the median width of its
+/// CJK character boxes when the engine returned them (most accurate), else
+/// the block width divided by its CJK character count, else the block height
+/// (CJK glyphs are square). Returns `None` when nothing can be measured.
+fn block_char_width(block: &TextBlock) -> Option<f32> {
+    let mut widths: Vec<f32> = block
+        .details
+        .iter()
+        .filter(|d| d.chars.chars().any(is_cjk_ideograph))
+        .map(|d| d.right - d.left)
+        .filter(|w| *w > 0.0)
+        .collect();
+    if let Some(median) = median_of(&mut widths) {
+        return Some(median);
+    }
+    let cjk_count = block.text.chars().filter(|&c| is_cjk_ideograph(c)).count();
+    if cjk_count > 0 {
+        let width = block.right - block.left;
+        if width > 0.0 {
+            return Some(width / cjk_count as f32);
+        }
+    }
+    let height = block.bottom - block.top;
+    if height > 0.0 {
+        return Some(height);
+    }
+    None
+}
+
+/// Median character width of a row's blocks (pixels). `None` when no block
+/// in the row yields a measurement — the caller then keeps the old
+/// one-line-per-block behavior instead of guessing a threshold.
+fn row_median_char_width(blocks: &[&TextBlock]) -> Option<f32> {
+    let mut widths: Vec<f32> = blocks.iter().filter_map(|b| block_char_width(b)).collect();
+    median_of(&mut widths)
+}
+
+/// Whether the per-character boxes cover the block's text: the
+/// whitespace-stripped concatenation of the boxes' characters equals the
+/// block's whitespace-stripped text. The engine usually returns one box per
+/// character (verified on the real engine 2026-11-25, including a space box
+/// inside `明天早上 见。`); when it does not, the block is left whole and
+/// the character speaker rules downstream decide instead.
+fn details_cover_text(block: &TextBlock) -> bool {
+    if block.details.is_empty() {
+        return false;
+    }
+    let details_text: String = block.details.iter().flat_map(|d| d.chars.chars()).collect();
+    let strip = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    strip(&details_text) == strip(&block.text)
+}
+
+/// Split one block at large gaps between its character boxes (a block the
+/// engine returned whole can still hold two speakers). Whitespace-only
+/// boxes are excluded from the gap measurement (they sit inside the gap
+/// itself) and dropped from the piece text, so a sub-threshold space does
+/// not survive for the character speaker rules downstream to re-split on:
+/// geometry decides first, characters are the fallback. Returns the block
+/// whole (no decisions) when it has no usable character boxes, and records
+/// a `CharGap` decision for every split.
+fn split_block_by_char_gaps(
+    block: &TextBlock,
+    threshold_px: f32,
+    decisions: &mut Vec<GeometricSplitDecision>,
+) -> Vec<RowPiece> {
+    let whole = || {
+        vec![RowPiece {
+            text: block.text.clone(),
+            left: block.left,
+            top: block.top,
+            right: block.right,
+            bottom: block.bottom,
+            starts_at_char_cut: false,
+        }]
+    };
+    if !details_cover_text(block) {
+        return whole();
+    }
+    // Character boxes in reading order, whitespace-only boxes excluded:
+    // the gap that matters is CJK-to-CJK, and a space box would split one
+    // real gap into two small ones.
+    let mut chars: Vec<(String, f32, f32, f32, f32)> = block
+        .details
+        .iter()
+        .filter(|d| !d.chars.chars().all(|c| c.is_whitespace()))
+        .map(|d| (d.chars.clone(), d.left, d.top, d.right, d.bottom))
+        .collect();
+    chars.sort_by(|a, b| a.1.total_cmp(&b.1));
+    if chars.len() < 2 {
+        return whole();
+    }
+    // Cut points: indices where the gap to the previous character exceeds
+    // the threshold. Character boxes can overlap slightly (measured on the
+    // real engine), so a negative gap means "touching", never a split.
+    let cuts: Vec<usize> = (1..chars.len())
+        .filter(|&idx| (chars[idx].1 - chars[idx - 1].3).max(0.0) > threshold_px)
+        .collect();
+    let piece_text = |start: usize, end: usize| {
+        chars[start..end]
+            .iter()
+            .map(|(text, _, _, _, _)| text.as_str())
+            .collect::<Vec<_>>()
+            .concat()
+    };
+    // No cut: rebuild the text from the character boxes (whitespace-only
+    // entries dropped), so a sub-threshold space does not survive for the
+    // character speaker rules downstream to re-split on — geometry decides
+    // first, characters are the fallback.
+    if cuts.is_empty() {
+        let last = &chars[chars.len() - 1];
+        return vec![RowPiece {
+            text: piece_text(0, chars.len()),
+            left: chars[0].1,
+            top: chars[0].2,
+            right: last.3,
+            bottom: last.4,
+            starts_at_char_cut: false,
+        }];
+    }
+    let mut pieces: Vec<RowPiece> = Vec::new();
+    let mut start = 0usize;
+    for &cut in cuts.iter().chain(std::iter::once(&chars.len())) {
+        let last = &chars[cut - 1];
+        pieces.push(RowPiece {
+            text: piece_text(start, cut),
+            left: chars[start].1,
+            top: chars[start].2,
+            right: last.3,
+            bottom: last.4,
+            starts_at_char_cut: start != 0,
+        });
+        start = cut;
+    }
+    for (idx, &cut) in cuts.iter().enumerate() {
+        let prev = &chars[cut - 1];
+        let next = &chars[cut];
+        decisions.push(GeometricSplitDecision {
+            kind: GeometricSplitKind::CharGap,
+            action: GeometricSplitAction::Split,
+            gap_px: (next.1 - prev.3).max(0.0),
+            threshold_px,
+            left_box: (prev.1, prev.2, prev.3, prev.4),
+            right_box: (next.1, next.2, next.3, next.4),
+            left_text: pieces[idx].text.clone(),
+            right_text: pieces[idx + 1].text.clone(),
+        });
+    }
+    pieces
+}
+
+/// Sort `blocks` in reading order and filter each visual line to Chinese
+/// subtitle text, returning one non-empty Chinese line per utterance
+/// (top-to-bottom). Two visual lines in one OCR frame stay separate here
+/// so the pipeline can treat them as two utterances (A2 / gh #1) instead
+/// of one merged line.
+///
+/// Geometric speaker split (merge fix, 2026-11-25): within one visual row,
+/// blocks whose horizontal gap exceeds `SPEAKER_GAP_CHAR_WIDTHS` x the
+/// row's median character width stay separate lines, while blocks that
+/// nearly abut are joined into one line (one sentence the engine happened
+/// to return as two boxes). A single block is further split at large gaps
+/// between its character boxes. Priority is geometry first: a line geometry
+/// judged to be one sentence carries no space for the character speaker
+/// rules in `pipeline` to re-split on; blocks without usable character
+/// boxes keep their text as-is and the character rules decide instead.
 /// Returns an empty `Vec` when no block contains CJK text.
 pub fn extract_chinese_subtitle_lines(blocks: &[TextBlock]) -> Vec<String> {
-    sort_text_blocks(blocks)
-        .into_iter()
-        .filter_map(|block| filter_cjk_text(block.text.trim()))
-        .collect()
+    extract_chinese_subtitle_lines_with_decisions(blocks).0
+}
+
+/// Like `extract_chinese_subtitle_lines`, but also returns the geometric
+/// split/join decisions, for the OCR debug log.
+pub fn extract_chinese_subtitle_lines_with_decisions(
+    blocks: &[TextBlock],
+) -> (Vec<String>, Vec<GeometricSplitDecision>) {
+    let mut decisions = Vec::new();
+    let mut lines: Vec<String> = Vec::new();
+    for row in group_text_blocks_into_rows(blocks) {
+        let threshold_px = match row_median_char_width(&row) {
+            Some(median) => SPEAKER_GAP_CHAR_WIDTHS * median,
+            // No measurable character width in this row: fall back to the
+            // old one-line-per-block behavior rather than guessing.
+            None => {
+                for block in row {
+                    if let Some(line) = filter_cjk_text(block.text.trim()) {
+                        lines.push(line);
+                    }
+                }
+                continue;
+            }
+        };
+        // Split each block internally at large character gaps, then group
+        // the resulting pieces into lines by their horizontal gaps.
+        let mut pieces: Vec<RowPiece> = Vec::new();
+        for block in row {
+            pieces.extend(split_block_by_char_gaps(
+                block,
+                threshold_px,
+                &mut decisions,
+            ));
+        }
+        let mut groups: Vec<Vec<RowPiece>> = Vec::new();
+        let mut current: Vec<RowPiece> = Vec::new();
+        for piece in pieces {
+            if let Some(prev) = current.last() {
+                let gap = (piece.left - prev.right).max(0.0);
+                if gap > threshold_px {
+                    // A boundary at a character-gap cut is already covered
+                    // by its `CharGap` decision; do not log it twice.
+                    if !piece.starts_at_char_cut {
+                        decisions.push(GeometricSplitDecision {
+                            kind: GeometricSplitKind::BlockGap,
+                            action: GeometricSplitAction::Split,
+                            gap_px: gap,
+                            threshold_px,
+                            left_box: (prev.left, prev.top, prev.right, prev.bottom),
+                            right_box: (piece.left, piece.top, piece.right, piece.bottom),
+                            left_text: current
+                                .iter()
+                                .map(|p| p.text.trim())
+                                .collect::<Vec<_>>()
+                                .concat(),
+                            right_text: piece.text.trim().to_string(),
+                        });
+                    }
+                    groups.push(std::mem::take(&mut current));
+                } else if !piece.starts_at_char_cut {
+                    decisions.push(GeometricSplitDecision {
+                        kind: GeometricSplitKind::BlockGap,
+                        action: GeometricSplitAction::Joined,
+                        gap_px: gap,
+                        threshold_px,
+                        left_box: (prev.left, prev.top, prev.right, prev.bottom),
+                        right_box: (piece.left, piece.top, piece.right, piece.bottom),
+                        left_text: current
+                            .iter()
+                            .map(|p| p.text.trim())
+                            .collect::<Vec<_>>()
+                            .concat(),
+                        right_text: piece.text.trim().to_string(),
+                    });
+                }
+            }
+            current.push(piece);
+        }
+        if !current.is_empty() {
+            groups.push(current);
+        }
+        for group in groups {
+            let joined = group
+                .iter()
+                .map(|p| p.text.trim())
+                .collect::<Vec<_>>()
+                .concat();
+            if let Some(line) = filter_cjk_text(&joined) {
+                lines.push(line);
+            }
+        }
+    }
+    (lines, decisions)
 }
 
 /// Strip whitespace and punctuation, leaving only CJK ideographs and normalized digits
@@ -227,6 +567,11 @@ pub struct FuzzyDeduplicator {
     blank_reset_frames: u32,
     last_normalized: Option<String>,
     consecutive_blanks: u32,
+    /// Similarity of the most recent comparison against the previous
+    /// subtitle (`None` when nothing was compared yet, or after the
+    /// memory was cleared). Read by the OCR debug log so a dropped line
+    /// can show how close it was to the previous one (merge fix, 2026-11-25).
+    last_similarity: Option<f32>,
 }
 
 impl Default for FuzzyDeduplicator {
@@ -242,6 +587,7 @@ impl FuzzyDeduplicator {
             blank_reset_frames: blank_reset_frames.max(1),
             last_normalized: None,
             consecutive_blanks: 0,
+            last_similarity: None,
         }
     }
 
@@ -251,6 +597,12 @@ impl FuzzyDeduplicator {
 
     pub fn blank_reset_frames(&self) -> u32 {
         self.blank_reset_frames
+    }
+
+    /// Similarity of the most recent comparison against the previous
+    /// subtitle, if one was compared (merge fix, 2026-11-25).
+    pub fn last_similarity(&self) -> Option<f32> {
+        self.last_similarity
     }
 
     pub fn set_threshold(&mut self, threshold: f32) {
@@ -272,13 +624,21 @@ impl TextDeduplicator for FuzzyDeduplicator {
             self.consecutive_blanks = self.consecutive_blanks.saturating_add(1);
             if self.consecutive_blanks >= self.blank_reset_frames {
                 self.last_normalized = None;
+                self.last_similarity = None;
             }
             return None;
         };
 
         self.consecutive_blanks = 0;
-        if let Some(prev) = &self.last_normalized {
-            if normalized_similarity(&norm, prev) >= self.threshold {
+        // Record the comparison even when it passes: the debug log reads
+        // it for the lines the dedupe drops.
+        let prev_similarity = self
+            .last_normalized
+            .as_ref()
+            .map(|prev| normalized_similarity(&norm, prev));
+        self.last_similarity = prev_similarity;
+        if let Some(similarity) = prev_similarity {
+            if similarity >= self.threshold {
                 return None;
             }
         }
@@ -290,17 +650,19 @@ impl TextDeduplicator for FuzzyDeduplicator {
     fn reset(&mut self) {
         self.last_normalized = None;
         self.consecutive_blanks = 0;
+        self.last_similarity = None;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_chinese_subtitle_lines, filter_cjk_text, is_cjk_ideograph, join_sorted_blocks,
-        normalized_similarity, sort_text_blocks, FuzzyDeduplicator, TextDeduplicator,
-        DEFAULT_BLANK_RESET_FRAMES, DEFAULT_DEDUPE_THRESHOLD,
+        extract_chinese_subtitle_lines, extract_chinese_subtitle_lines_with_decisions,
+        filter_cjk_text, is_cjk_ideograph, join_sorted_blocks, normalized_similarity,
+        sort_text_blocks, FuzzyDeduplicator, GeometricSplitAction, GeometricSplitKind,
+        TextDeduplicator, DEFAULT_BLANK_RESET_FRAMES, DEFAULT_DEDUPE_THRESHOLD,
     };
-    use wcocr_rs::TextBlock;
+    use wcocr_rs::{CharDetail, TextBlock};
 
     fn block(left: f32, top: f32, right: f32, bottom: f32, text: &str) -> TextBlock {
         TextBlock {
@@ -311,6 +673,36 @@ mod tests {
             rate: 0.99,
             text: text.to_string(),
             details: Vec::new(),
+        }
+    }
+
+    /// A block with per-character boxes: `details` is a list of
+    /// (characters, left, top, right, bottom), in reading order.
+    fn block_with_details(
+        left: f32,
+        top: f32,
+        right: f32,
+        bottom: f32,
+        text: &str,
+        details: &[(&str, f32, f32, f32, f32)],
+    ) -> TextBlock {
+        TextBlock {
+            left,
+            top,
+            right,
+            bottom,
+            rate: 0.99,
+            text: text.to_string(),
+            details: details
+                .iter()
+                .map(|(chars, l, t, r, b)| CharDetail {
+                    chars: (*chars).to_string(),
+                    left: *l,
+                    top: *t,
+                    right: *r,
+                    bottom: *b,
+                })
+                .collect(),
         }
     }
 
@@ -345,6 +737,138 @@ mod tests {
             extract_chinese_subtitle_lines(&blocks),
             vec!["你好吗？".to_string(), "我很好。".to_string()]
         );
+    }
+
+    #[test]
+    fn extract_lines_splits_same_row_blocks_at_a_large_gap() {
+        // Two blocks on one row, 80 px apart (median char width 40 px, so
+        // the threshold is 20 px): two speakers, two lines. Mirrors the
+        // probe image row 1 (gap 82 px measured on the real engine).
+        let blocks = vec![
+            block(100.0, 100.0, 220.0, 140.0, "你好吗"),
+            block(300.0, 100.0, 420.0, 140.0, "我很好"),
+        ];
+        let (lines, decisions) = extract_chinese_subtitle_lines_with_decisions(&blocks);
+        assert_eq!(lines, vec!["你好吗".to_string(), "我很好".to_string()]);
+        assert_eq!(decisions.len(), 1);
+        let decision = &decisions[0];
+        assert_eq!(decision.kind, GeometricSplitKind::BlockGap);
+        assert_eq!(decision.action, GeometricSplitAction::Split);
+        assert!(
+            (decision.gap_px - 80.0).abs() < 1e-6,
+            "gap {}",
+            decision.gap_px
+        );
+        assert!(
+            (decision.threshold_px - 20.0).abs() < 1e-6,
+            "threshold {}",
+            decision.threshold_px
+        );
+        assert_eq!(decision.left_text, "你好吗");
+        assert_eq!(decision.right_text, "我很好");
+    }
+
+    #[test]
+    fn extract_lines_joins_same_row_blocks_at_a_character_sized_gap() {
+        // Two blocks on one row, 12 px apart (median char width 36 px, so
+        // the threshold is 18 px): one sentence the engine returned as two
+        // boxes — joined into one line, no space for the character speaker
+        // rules downstream to re-split on.
+        let blocks = vec![
+            block(100.0, 100.0, 208.0, 140.0, "你好吗"),
+            block(220.0, 100.0, 328.0, 140.0, "我很好"),
+        ];
+        let (lines, decisions) = extract_chinese_subtitle_lines_with_decisions(&blocks);
+        assert_eq!(lines, vec!["你好吗我很好".to_string()]);
+        assert_eq!(decisions.len(), 1);
+        let decision = &decisions[0];
+        assert_eq!(decision.kind, GeometricSplitKind::BlockGap);
+        assert_eq!(decision.action, GeometricSplitAction::Joined);
+        assert!(
+            (decision.gap_px - 12.0).abs() < 1e-6,
+            "gap {}",
+            decision.gap_px
+        );
+    }
+
+    #[test]
+    fn extract_lines_splits_one_block_at_a_large_character_gap() {
+        // One block whose character boxes hold two groups 91 px apart
+        // (median char width 38 px, threshold 19 px): two speakers inside
+        // a single block. Only the CharGap decision is recorded — the
+        // row-grouping step does not log the same boundary a second time.
+        let blocks = vec![block_with_details(
+            95.0,
+            85.0,
+            410.0,
+            129.0,
+            "你好吗我很好",
+            &[
+                ("你", 95.0, 85.0, 127.0, 127.0),
+                ("好", 127.0, 85.0, 165.0, 127.0),
+                ("吗", 165.0, 85.0, 203.0, 127.0),
+                ("我", 294.0, 86.0, 332.0, 128.0),
+                ("很", 326.0, 86.0, 364.0, 128.0),
+                ("好", 364.0, 86.0, 402.0, 128.0),
+            ],
+        )];
+        let (lines, decisions) = extract_chinese_subtitle_lines_with_decisions(&blocks);
+        assert_eq!(lines, vec!["你好吗".to_string(), "我很好".to_string()]);
+        assert_eq!(decisions.len(), 1);
+        let decision = &decisions[0];
+        assert_eq!(decision.kind, GeometricSplitKind::CharGap);
+        assert_eq!(decision.action, GeometricSplitAction::Split);
+        assert!(
+            (decision.gap_px - 91.0).abs() < 1e-6,
+            "gap {}",
+            decision.gap_px
+        );
+        assert!(
+            (decision.threshold_px - 19.0).abs() < 1e-6,
+            "threshold {}",
+            decision.threshold_px
+        );
+        assert_eq!(decision.left_text, "你好吗");
+        assert_eq!(decision.right_text, "我很好");
+    }
+
+    #[test]
+    fn extract_lines_keeps_one_block_whole_at_a_small_character_gap() {
+        // One block, `明天早上 见。` with a 10 px gap between 上 and 见
+        // (median CJK char width 37 px, threshold 18.5 px): one sentence —
+        // kept whole, and the sub-threshold space is dropped so the
+        // character speaker rules downstream cannot re-split it. Character
+        // boxes and text taken from the real engine probe (2026-11-25).
+        let blocks = vec![block_with_details(
+            96.0,
+            186.0,
+            306.0,
+            228.0,
+            "明天早上 见。",
+            &[
+                ("明", 96.0, 186.0, 128.0, 227.0),
+                ("天", 128.0, 186.0, 164.0, 227.0),
+                ("早", 164.0, 186.0, 201.0, 227.0),
+                ("上", 201.0, 186.0, 238.0, 227.0),
+                (" ", 238.0, 186.0, 254.0, 227.0),
+                ("见", 248.0, 186.0, 285.0, 227.0),
+                ("。", 280.0, 186.0, 306.0, 227.0),
+            ],
+        )];
+        let (lines, decisions) = extract_chinese_subtitle_lines_with_decisions(&blocks);
+        assert_eq!(lines, vec!["明天早上见。".to_string()]);
+        assert!(decisions.is_empty(), "unexpected decisions: {decisions:?}");
+    }
+
+    #[test]
+    fn extract_lines_falls_back_to_character_rules_without_details() {
+        // A block with no character boxes keeps its text as-is (space
+        // included): geometry cannot judge it, so the character speaker
+        // rules in the pipeline decide instead. No decisions recorded.
+        let blocks = vec![block(100.0, 100.0, 300.0, 140.0, "你好吗 我很好")];
+        let (lines, decisions) = extract_chinese_subtitle_lines_with_decisions(&blocks);
+        assert_eq!(lines, vec!["你好吗 我很好".to_string()]);
+        assert!(decisions.is_empty(), "unexpected decisions: {decisions:?}");
     }
 
     #[test]
@@ -449,6 +973,34 @@ mod tests {
             Some("夜深了，雨还在下。".to_string())
         );
         assert_eq!(deduper.process(Some("夜深了,雨还在下")), None);
+    }
+
+    #[test]
+    fn fuzzy_deduplicator_records_last_similarity_for_the_debug_log() {
+        let mut deduper = FuzzyDeduplicator::default();
+        assert_eq!(deduper.last_similarity(), None);
+        assert_eq!(
+            deduper.process(Some("一二三四五六七八九十甲乙丙丁戊")),
+            Some("一二三四五六七八九十甲乙丙丁戊".to_string())
+        );
+        // First line: nothing to compare against.
+        assert_eq!(deduper.last_similarity(), None);
+        // 1-of-15 substitution => 14/15 = 0.9333, suppressed.
+        assert_eq!(
+            deduper.process(Some("一二三四五六七八九十甲乙丙丁己")),
+            None
+        );
+        let sim = deduper.last_similarity().unwrap();
+        assert!((sim - 14.0 / 15.0).abs() < 1e-4, "got {sim}");
+        // A distinct line still records its (low) similarity.
+        assert_eq!(
+            deduper.process(Some("今天天气真不错我们出门吧")),
+            Some("今天天气真不错我们出门吧".to_string())
+        );
+        assert!(deduper.last_similarity().unwrap() < 0.5);
+        // Clearing the memory clears the similarity too.
+        deduper.reset();
+        assert_eq!(deduper.last_similarity(), None);
     }
 
     #[test]
