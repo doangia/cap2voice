@@ -296,11 +296,15 @@ fn details_cover_text(block: &TextBlock) -> bool {
 /// Split one block at large gaps between its character boxes (a block the
 /// engine returned whole can still hold two speakers). Whitespace-only
 /// boxes are excluded from the gap measurement (they sit inside the gap
-/// itself) and dropped from the piece text, so a sub-threshold space does
-/// not survive for the character speaker rules downstream to re-split on:
-/// geometry decides first, characters are the fallback. Returns the block
-/// whole (no decisions) when it has no usable character boxes, and records
-/// a `CharGap` decision for every split.
+/// itself), but their positions are kept as separators when the piece
+/// text is rebuilt, so a sub-threshold space survives for the character
+/// speaker rules downstream to judge: geometry decides first at large
+/// gaps, characters are the fallback for the rest (merge fix 2,
+/// 2026-11-26 — dropping the space used to defeat the whitespace
+/// speaker split for single-block reads: raw OCR had the space,
+/// `lines[]` did not, and the merged line won the buffer race).
+/// Returns the block whole (no decisions) when it has no usable
+/// character boxes, and records a `CharGap` decision for every split.
 fn split_block_by_char_gaps(
     block: &TextBlock,
     threshold_px: f32,
@@ -319,9 +323,9 @@ fn split_block_by_char_gaps(
     if !details_cover_text(block) {
         return whole();
     }
-    // Character boxes in reading order, whitespace-only boxes excluded:
-    // the gap that matters is CJK-to-CJK, and a space box would split one
-    // real gap into two small ones.
+    // Character boxes in reading order, whitespace-only boxes excluded
+    // from the gap measurement: the gap that matters is CJK-to-CJK, and
+    // a space box would split one real gap into two small ones.
     let mut chars: Vec<(String, f32, f32, f32, f32)> = block
         .details
         .iter()
@@ -332,6 +336,26 @@ fn split_block_by_char_gaps(
     if chars.len() < 2 {
         return whole();
     }
+    // Whether a whitespace box sits between this CJK box and the previous
+    // one (by centre x): the space the engine placed between two
+    // speakers. Only inter-glyph spaces count; a leading/trailing space
+    // is dropped with the trim at the line level.
+    let mut spaces: Vec<(f32, f32)> = block
+        .details
+        .iter()
+        .filter(|d| d.chars.chars().all(|c| c.is_whitespace()))
+        .map(|d| (d.left, d.right))
+        .collect();
+    spaces.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut space_before: Vec<bool> = vec![false; chars.len()];
+    for idx in 1..chars.len() {
+        let prev_right = chars[idx - 1].3;
+        let cur_left = chars[idx].1;
+        space_before[idx] = spaces.iter().any(|&(s_left, s_right)| {
+            let centre = (s_left + s_right) * 0.5;
+            centre > prev_right - 1.0 && centre < cur_left + 1.0
+        });
+    }
     // Cut points: indices where the gap to the previous character exceeds
     // the threshold. Character boxes can overlap slightly (measured on the
     // real engine), so a negative gap means "touching", never a split.
@@ -339,16 +363,21 @@ fn split_block_by_char_gaps(
         .filter(|&idx| (chars[idx].1 - chars[idx - 1].3).max(0.0) > threshold_px)
         .collect();
     let piece_text = |start: usize, end: usize| {
-        chars[start..end]
-            .iter()
-            .map(|(text, _, _, _, _)| text.as_str())
-            .collect::<Vec<_>>()
-            .concat()
+        let mut out = String::new();
+        for idx in start..end {
+            if idx > start && space_before[idx] {
+                out.push(' ');
+            }
+            out.push_str(&chars[idx].0);
+        }
+        out
     };
-    // No cut: rebuild the text from the character boxes (whitespace-only
-    // entries dropped), so a sub-threshold space does not survive for the
-    // character speaker rules downstream to re-split on — geometry decides
-    // first, characters are the fallback.
+    // No cut: rebuild the text from the character boxes, keeping a
+    // sub-threshold space where the engine placed one — the character
+    // speaker rules downstream judge it (their guardrails block splits
+    // inside numbers, dates, and one-character interjections), and
+    // `split_speakers` strips any space that does not split, so no stray
+    // space reaches the log or the translation.
     if cuts.is_empty() {
         let last = &chars[chars.len() - 1];
         return vec![RowPiece {
@@ -402,10 +431,11 @@ fn split_block_by_char_gaps(
 /// row's median character width stay separate lines, while blocks that
 /// nearly abut are joined into one line (one sentence the engine happened
 /// to return as two boxes). A single block is further split at large gaps
-/// between its character boxes. Priority is geometry first: a line geometry
-/// judged to be one sentence carries no space for the character speaker
-/// rules in `pipeline` to re-split on; blocks without usable character
-/// boxes keep their text as-is and the character rules decide instead.
+/// between its character boxes. Priority is geometry first at large gaps;
+/// a sub-threshold space the engine placed inside a block is preserved in
+/// the line so the character speaker rules in `pipeline` can judge it
+/// (merge fix 2, 2026-11-26); blocks without usable character boxes keep
+/// their text as-is and the character rules decide instead.
 /// Returns an empty `Vec` when no block contains CJK text.
 pub fn extract_chinese_subtitle_lines(blocks: &[TextBlock]) -> Vec<String> {
     extract_chinese_subtitle_lines_with_decisions(blocks).0
@@ -836,9 +866,12 @@ mod tests {
     fn extract_lines_keeps_one_block_whole_at_a_small_character_gap() {
         // One block, `明天早上 见。` with a 10 px gap between 上 and 见
         // (median CJK char width 37 px, threshold 18.5 px): one sentence —
-        // kept whole, and the sub-threshold space is dropped so the
-        // character speaker rules downstream cannot re-split it. Character
-        // boxes and text taken from the real engine probe (2026-11-25).
+        // kept whole as one line, and the sub-threshold space is now
+        // PRESERVED in the line (merge fix 2) so the character speaker
+        // rules downstream can judge it; they keep it whole (the right
+        // cluster 見 is one character, below the 2-character guardrail)
+        // and strip the space in the final piece. Character boxes and
+        // text taken from the real engine probe (2026-11-25).
         let blocks = vec![block_with_details(
             96.0,
             186.0,
@@ -856,8 +889,107 @@ mod tests {
             ],
         )];
         let (lines, decisions) = extract_chinese_subtitle_lines_with_decisions(&blocks);
-        assert_eq!(lines, vec!["明天早上见。".to_string()]);
+        assert_eq!(lines, vec!["明天早上 见。".to_string()]);
         assert!(decisions.is_empty(), "unexpected decisions: {decisions:?}");
+    }
+
+    #[test]
+    fn extract_lines_preserves_space_inside_one_block_for_speaker_rules() {
+        // Merge fix 2, real video 2026-11-26 segment #4: one block
+        // `走了哦 走好爸爸` whose CJK-to-CJK gap at the space (17 px)
+        // is below the 18 px threshold (median char width 36 px), so
+        // geometry does not split — but the space itself must survive in
+        // the line for the character speaker rules downstream, which
+        // split it into `走了哦` / `走好爸爸`. Previously the line came
+        // out spaceless and the merged line won the buffer race.
+        let blocks = vec![block_with_details(
+            141.0,
+            42.0,
+            415.0,
+            88.0,
+            "走了哦 走好爸爸",
+            &[
+                ("走", 141.0, 42.0, 177.0, 88.0),
+                ("了", 178.0, 42.0, 214.0, 88.0),
+                ("哦", 215.0, 42.0, 251.0, 88.0),
+                (" ", 252.0, 42.0, 267.0, 88.0),
+                ("走", 268.0, 42.0, 304.0, 88.0),
+                ("好", 305.0, 42.0, 341.0, 88.0),
+                ("爸", 342.0, 42.0, 378.0, 88.0),
+                ("爸", 379.0, 42.0, 415.0, 88.0),
+            ],
+        )];
+        let (lines, decisions) = extract_chinese_subtitle_lines_with_decisions(&blocks);
+        assert_eq!(lines, vec!["走了哦 走好爸爸".to_string()]);
+        assert!(decisions.is_empty(), "unexpected decisions: {decisions:?}");
+    }
+
+    #[test]
+    fn extract_lines_preserves_two_spaces_inside_one_block() {
+        // Merge fix 2, real video 2026-11-26 segment #21: one block
+        // `好吧 可能錢太多了 對吧` with two sub-threshold spaces
+        // (16 px each, threshold 18 px): both survive in the line, and
+        // the speaker rules split it into three utterances.
+        let blocks = vec![block_with_details(
+            100.0,
+            42.0,
+            499.0,
+            88.0,
+            "好吧 可能錢太多了 對吧",
+            &[
+                ("好", 100.0, 42.0, 136.0, 88.0),
+                ("吧", 137.0, 42.0, 173.0, 88.0),
+                (" ", 174.0, 42.0, 188.0, 88.0),
+                ("可", 189.0, 42.0, 225.0, 88.0),
+                ("能", 226.0, 42.0, 262.0, 88.0),
+                ("錢", 263.0, 42.0, 299.0, 88.0),
+                ("太", 300.0, 42.0, 336.0, 88.0),
+                ("多", 337.0, 42.0, 373.0, 88.0),
+                ("了", 374.0, 42.0, 410.0, 88.0),
+                (" ", 411.0, 42.0, 425.0, 88.0),
+                ("對", 426.0, 42.0, 462.0, 88.0),
+                ("吧", 463.0, 42.0, 499.0, 88.0),
+            ],
+        )];
+        let (lines, decisions) = extract_chinese_subtitle_lines_with_decisions(&blocks);
+        assert_eq!(lines, vec!["好吧 可能錢太多了 對吧".to_string()]);
+        assert!(decisions.is_empty(), "unexpected decisions: {decisions:?}");
+    }
+
+    #[test]
+    fn extract_lines_space_at_a_large_gap_cut_leaks_into_neither_piece() {
+        // One block with a space box sitting inside a 91 px character
+        // gap (threshold 19 px): geometry splits at the gap, and the
+        // space — which IS the gap — belongs to neither piece.
+        let blocks = vec![block_with_details(
+            95.0,
+            85.0,
+            410.0,
+            129.0,
+            "你好吗我很好",
+            &[
+                ("你", 95.0, 85.0, 127.0, 127.0),
+                ("好", 127.0, 85.0, 165.0, 127.0),
+                ("吗", 165.0, 85.0, 203.0, 127.0),
+                (" ", 204.0, 85.0, 250.0, 127.0),
+                ("我", 294.0, 86.0, 332.0, 128.0),
+                ("很", 326.0, 86.0, 364.0, 128.0),
+                ("好", 364.0, 86.0, 402.0, 128.0),
+            ],
+        )];
+        let (lines, decisions) = extract_chinese_subtitle_lines_with_decisions(&blocks);
+        assert_eq!(lines, vec!["你好吗".to_string(), "我很好".to_string()]);
+        assert_eq!(decisions.len(), 1);
+        let decision = &decisions[0];
+        assert_eq!(decision.kind, GeometricSplitKind::CharGap);
+        assert_eq!(decision.action, GeometricSplitAction::Split);
+        assert!(
+            (decision.gap_px - 91.0).abs() < 1e-6,
+            "gap {}",
+            decision.gap_px
+        );
+        assert_eq!(decision.left_text, "你好吗");
+        assert_eq!(decision.right_text, "我很好");
     }
 
     #[test]

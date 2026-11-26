@@ -1406,6 +1406,11 @@ fn strip_leading_speaker_dash(piece: &str) -> &str {
 /// two utterances — each still translates on its own), and two sentences
 /// stuck together with no signal at all cannot be split (the blind case,
 /// e.g. `大家就开心地享受吧好的好的那就再见了` stays one line).
+///
+/// Returned pieces contain no whitespace: a space is only a separator
+/// candidate, and any space that does not split is stripped (merge fix 2,
+/// 2026-11-26), so the final utterances keep the historical spaceless
+/// format and no stray space leaks into the translation or the log.
 pub fn split_speakers(line: &str) -> Vec<String> {
     let chars: Vec<(usize, char)> = line.char_indices().collect();
     let mut pieces: Vec<String> = Vec::new();
@@ -1459,9 +1464,23 @@ pub fn split_speakers(line: &str) -> Vec<String> {
             *piece = stripped.to_string();
         }
     }
+    // A space was only ever a separator candidate: once the split
+    // decisions are made, any space left inside a piece is intra-sentence
+    // noise (merge fix 2, 2026-11-26). Strip it so no stray space leaks
+    // into the translation or the log — the final utterances keep the
+    // historical spaceless format.
+    for piece in pieces.iter_mut() {
+        if piece.chars().any(char::is_whitespace) {
+            *piece = piece.chars().filter(|c| !c.is_whitespace()).collect();
+        }
+    }
     pieces.retain(|piece| !piece.is_empty());
     if pieces.is_empty() {
-        pieces.push(line.trim().to_string());
+        pieces.push(
+            line.chars()
+                .filter(|c| !c.is_whitespace())
+                .collect::<String>(),
+        );
     }
     pieces
 }
@@ -2739,14 +2758,43 @@ mod tests {
 
         // Guardrails: no split when a neighbour is not CJK (numbers,
         // dates, CJK next to Latin/digits) or when either adjacent CJK
-        // cluster is shorter than 2 characters.
-        assert_eq!(split_speakers("9 日"), vec!["9 日".to_string()]);
-        assert_eq!(split_speakers("3.5 元"), vec!["3.5 元".to_string()]);
-        assert_eq!(split_speakers("是 啊"), vec!["是 啊".to_string()]);
-        assert_eq!(split_speakers("Hello 你好"), vec!["Hello 你好".to_string()]);
-        assert_eq!(split_speakers("你好 123"), vec!["你好 123".to_string()]);
+        // cluster is shorter than 2 characters — and the unsplit piece
+        // is returned spaceless (merge fix 2): the space was only a
+        // separator candidate.
+        assert_eq!(split_speakers("9 日"), vec!["9日".to_string()]);
+        assert_eq!(split_speakers("3.5 元"), vec!["3.5元".to_string()]);
+        assert_eq!(split_speakers("是 啊"), vec!["是啊".to_string()]);
+        assert_eq!(split_speakers("Hello 你好"), vec!["Hello你好".to_string()]);
+        assert_eq!(split_speakers("你好 123"), vec!["你好123".to_string()]);
         assert_eq!(split_speakers("你好吗-我"), vec!["你好吗-我".to_string()]);
         assert_eq!(split_speakers("你好"), vec!["你好".to_string()]);
+    }
+
+    #[test]
+    fn split_speakers_splits_real_video_merges() {
+        // Merge fix 2, real video 2026-11-26: the four merged lines.
+        // Each raw line carries the space the OCR engine placed; the
+        // speaker rules split on it, and the pieces come out spaceless.
+        assert_eq!(
+            split_speakers("走了哦 走好爸爸"),
+            vec!["走了哦".to_string(), "走好爸爸".to_string()]
+        );
+        assert_eq!(
+            split_speakers("希望是個好孩子 你們都這麽好"),
+            vec!["希望是個好孩子".to_string(), "你們都這麽好".to_string()]
+        );
+        assert_eq!(
+            split_speakers("好吧 可能錢太多了 對吧"),
+            vec![
+                "好吧".to_string(),
+                "可能錢太多了".to_string(),
+                "對吧".to_string()
+            ]
+        );
+        assert_eq!(
+            split_speakers("夫人你還真來了呢 是吧"),
+            vec!["夫人你還真來了呢".to_string(), "是吧".to_string()]
+        );
     }
 
     #[test]
@@ -2763,6 +2811,12 @@ mod tests {
         assert_eq!(
             split_line_into_utterances("你先睡吧 不用等我吃饭了"),
             vec!["你先睡吧".to_string(), "不用等我吃饭了".to_string()]
+        );
+        // Merge fix 2, real video 2026-11-26 segment #4: the preserved
+        // space splits, and the utterances come out spaceless.
+        assert_eq!(
+            split_line_into_utterances("走了哦 走好爸爸"),
+            vec!["走了哦".to_string(), "走好爸爸".to_string()]
         );
         assert_eq!(
             split_line_into_utterances("你好吗 - 我很好。"),
